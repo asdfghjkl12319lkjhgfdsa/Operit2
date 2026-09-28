@@ -1,0 +1,48 @@
+name: Fork Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Actions run id to copy artifacts from"
+        required: true
+        default: "36413018665"
+      tag:
+        description: "Release tag name"
+        required: true
+        default: "fork-build-ede3509"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts from build run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dist-artifacts
+          merge-multiple: true
+
+      - name: List downloaded files
+        run: |
+          echo "=== downloaded files ==="
+          find dist-artifacts -type f -printf '%s\t%p\n' | sort -n
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: "Operit2 ${{ inputs.tag }}"
+          body: |
+            Operit2 fork build (Linux + Windows 11 amd64).
+            Source commit: ede3509b234b15c5b00495e4cc0fb8e947b32fc2
+            Built entirely on GitHub-hosted runners via GitHub Actions.
+          files: |
+            dist-artifacts/*
+            dist-artifacts/**/*
+          fail_on_unmatched_files: false
