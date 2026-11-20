@@ -1,15 +1,19 @@
+use super::ApiKeyProvider::KeyGetter;
+use super::ProviderHttp::KeyAuthentication;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
 
 use super::OpenAIProvider::{StreamingJsonXmlConverter, StreamingJsonXmlEvent};
-use super::StructuredToolCallBridge::StructuredToolCallBridge;
-use super::ThinkingConfiguration::ThinkingConfigurationApplier;
+use super::OpenAIResponsesProvider::strip_responses_protocol_markup;
+use super::StreamingResponseLines::SseDecoder;
+use super::StructuredToolCallBridge::{OpenToolCall, StructuredToolCallBridge};
+use super::ThinkingDialect::ThinkingDialect;
 use crate::chat::llmprovider::AIService::{
     response_stream_from_chunks, retry_error_text, retry_message, AIService, AiServiceError,
-    SendMessageRequest, TokenCounts,
+    SendMessageRequest, SharedAiResponseStream, TokenCounts,
 };
 use crate::chat::llmprovider::LlmRetryPolicy::delay_retry_ms;
 use crate::chat::llmprovider::MediaLinkParser::MediaLinkParser;
@@ -18,20 +22,25 @@ use operit_host_api::HostRuntimeTaskSchedulerHost;
 use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
 use operit_model::ToolPrompt::ToolPrompt;
 use operit_util::stream::RevisableTextStream::{
-    empty_revisable_event_channel, with_event_channel, RevisableTextStreamLike,
+    empty_revisable_event_channel, with_event_channel_and_failure, RevisableTextStream,
+    RevisableTextStreamLike, TerminalFailureState, TextStreamEvent, TextStreamEventType,
 };
 use operit_util::stream::Stream::FnStream;
 use operit_util::ChatMarkupRegex::ChatMarkupRegex;
+use operit_util::TokenCacheManager::TokenCacheManager;
 
 #[derive(Clone)]
 pub struct ClaudeProvider {
     pub api_endpoint: String,
-    pub api_key: String,
+    pub key_getter: KeyGetter,
+
     pub model_name: String,
     pub provider_type: String,
     pub enable_tool_call: bool,
     pub custom_headers: Vec<(String, String)>,
+    enable_claude_1h_prompt_cache: bool,
     state: Arc<Mutex<ClaudeProviderState>>,
+    cancel_signal: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -40,12 +49,13 @@ struct ClaudeProviderState {
     cachedInputTokenCount: i64,
     outputTokenCount: i64,
     cancelled: bool,
+    tokenCacheManager: TokenCacheManager,
 }
 
 impl ClaudeProvider {
     pub fn new(
         api_endpoint: String,
-        api_key: String,
+        key_getter: KeyGetter,
         model_name: String,
         provider_type: String,
         custom_headers: Vec<(String, String)>,
@@ -53,13 +63,21 @@ impl ClaudeProvider {
     ) -> Self {
         Self {
             api_endpoint,
-            api_key,
+            key_getter,
             model_name,
             provider_type,
             enable_tool_call,
             custom_headers,
+            enable_claude_1h_prompt_cache: false,
             state: Arc::new(Mutex::new(ClaudeProviderState::default())),
+            cancel_signal: tokio::sync::watch::channel(false).0,
         }
+    }
+
+    /// Matches Kotlin enableClaude1hPromptCache; existing callers keep the default TTL.
+    pub fn with_claude_1h_prompt_cache(mut self, enabled: bool) -> Self {
+        self.enable_claude_1h_prompt_cache = enabled;
+        self
     }
 
     fn set_cancelled(&self, cancelled: bool) {
@@ -67,6 +85,7 @@ impl ClaudeProvider {
             .lock()
             .expect("ClaudeProvider state mutex poisoned")
             .cancelled = cancelled;
+        self.cancel_signal.send_replace(cancelled);
     }
 
     fn is_cancelled(&self) -> bool {
@@ -81,55 +100,63 @@ impl ClaudeProvider {
             .state
             .lock()
             .expect("ClaudeProvider state mutex poisoned");
-        state.inputTokenCount = token_counts.input;
-        state.cachedInputTokenCount = token_counts.cached_input;
-        state.outputTokenCount = token_counts.output;
+        state
+            .tokenCacheManager
+            .update_actual_tokens(token_counts.input, token_counts.cached_input);
+        state
+            .tokenCacheManager
+            .set_output_tokens(token_counts.output);
+        state.inputTokenCount = state.tokenCacheManager.total_input_token_count();
+        state.cachedInputTokenCount = state.tokenCacheManager.cached_input_token_count();
+        state.outputTokenCount = state.tokenCacheManager.output_token_count();
     }
 
+    /// Wakes blocked header and body reads immediately when cancellation is requested.
     async fn waitUntilCancelled(self) {
-        loop {
-            if self.is_cancelled() {
+        let mut receiver = self.cancel_signal.subscribe();
+        while !*receiver.borrow_and_update() {
+            if receiver.changed().await.is_err() {
                 break;
             }
-            defaultHostRuntimeTaskSchedulerHost()
-                .waitForHostRuntimeDelay(50)
-                .await
-                .expect("provider cancellation polling delay must be provided by the Host");
         }
     }
 
     async fn sendHttpRequest(
         &self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, AiServiceError> {
+        request: super::ProviderHttp::RequestBuilder,
+    ) -> Result<super::ProviderHttp::Response, AiServiceError> {
+        let request = request.key_getter(self.key_getter.clone(), KeyAuthentication::Header("x-api-key".into()));
         if self.is_cancelled() {
             return Err(AiServiceError::RequestCancelled);
         }
         tokio::select! {
-            response = request.send() => response.map_err(|error| AiServiceError::ConnectionFailed(error.to_string())),
+            response = request.send() => response,
             _ = self.clone().waitUntilCancelled() => Err(AiServiceError::RequestCancelled),
         }
     }
 
     async fn readResponseText(
         &self,
-        response: reqwest::Response,
+        response: super::ProviderHttp::Response,
     ) -> Result<String, AiServiceError> {
         if self.is_cancelled() {
             return Err(AiServiceError::RequestCancelled);
         }
         tokio::select! {
-            text = response.text() => text.map_err(|error| AiServiceError::ConnectionFailed(error.to_string())),
+            text = response.text() => text,
             _ = self.clone().waitUntilCancelled() => Err(AiServiceError::RequestCancelled),
         }
     }
 
-    async fn readResponseJson(&self, response: reqwest::Response) -> Result<Value, AiServiceError> {
+    async fn readResponseJson(
+        &self,
+        response: super::ProviderHttp::Response,
+    ) -> Result<Value, AiServiceError> {
         if self.is_cancelled() {
             return Err(AiServiceError::RequestCancelled);
         }
         tokio::select! {
-            json = response.json() => json.map_err(|error| AiServiceError::RequestFailed(error.to_string())),
+            json = response.json() => json,
             _ = self.clone().waitUntilCancelled() => Err(AiServiceError::RequestCancelled),
         }
     }
@@ -149,7 +176,7 @@ impl ClaudeProvider {
         &self,
         request: &SendMessageRequest,
     ) -> Result<Value, AiServiceError> {
-        let (system, messages) = self.build_messages_and_count_tokens(&request.chat_history)?;
+        let (system, messages) = self.build_serialized_history(&request.chat_history)?;
         let mut object = Map::new();
         object.insert("model".to_string(), json!(self.model_name));
         object.insert("messages".to_string(), Value::Array(messages));
@@ -158,7 +185,7 @@ impl ClaudeProvider {
             object.insert("system".to_string(), system);
         }
         if !object.contains_key("max_tokens") {
-            object.insert("max_tokens".to_string(), json!(4096));
+            object.insert("max_tokens".to_string(), json!(DEFAULT_MAX_TOKENS));
         }
         if self.enable_tool_call && !request.available_tools.is_empty() {
             object.insert(
@@ -167,25 +194,36 @@ impl ClaudeProvider {
             );
         }
         let mut request_object = Value::Object(object);
-        ThinkingConfigurationApplier::apply(
-            &mut request_object,
-            &self.provider_type,
-            &self.model_name,
-            &self.api_endpoint,
-            request.enable_thinking,
-            request.thinking_quality_level,
-            &request.thinking_configurations,
-            &request.thinking_option_id,
-        )?;
+        ThinkingDialect::Anthropic.apply(&mut request_object, &request.thinking)?;
         let object = request_object
             .as_object_mut()
             .expect("thinking request remains an object");
         self.add_parameters(object, &request.model_parameters);
+        fit_max_tokens_to_thinking_budget(object, &request.model_parameters)?;
         self.apply_stable_cache_breakpoints(object);
+        self.calculate_and_store_input_tokens(object, true);
         Ok(request_object)
     }
 
     pub fn build_messages_and_count_tokens(
+        &self,
+        chat_history: &[PromptTurn],
+    ) -> Result<(Value, Vec<Value>), AiServiceError> {
+        let mut object = self.build_cache_request_parts(chat_history, &[])?;
+        self.calculate_and_store_input_tokens(&object, true);
+        let system = object.remove("system").unwrap_or(Value::Null);
+        let messages = object
+            .remove("messages")
+            .and_then(|value| match value {
+                Value::Array(messages) => Some(messages),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Ok((system, messages))
+    }
+
+    /// Serializes the history before adding any cache policy or counting tokens.
+    fn build_serialized_history(
         &self,
         chat_history: &[PromptTurn],
     ) -> Result<(Value, Vec<Value>), AiServiceError> {
@@ -196,12 +234,21 @@ impl ClaudeProvider {
             self.enable_tool_call,
         );
         let mut next_tool_use_ordinal = 0usize;
-        let mut open_tool_use_ids: Vec<String> = Vec::new();
+        let mut open_tool_calls: Vec<OpenToolCall> = Vec::new();
         for turn in provider_ready_history {
+            if turn.kind != PromptTurnKind::TOOL_RESULT && !open_tool_calls.is_empty() {
+                let content =
+                    Self::missing_tool_result_blocks(&mut open_tool_calls, "assistant_boundary");
+                messages.push(json!({"role": "user", "content": content}));
+            }
             match turn.kind {
-                PromptTurnKind::SYSTEM | PromptTurnKind::SUMMARY => {
-                    system_parts.push(turn.content.clone())
+                PromptTurnKind::SYSTEM => {
+                    system_parts.push(strip_responses_protocol_markup(&turn.content))
                 }
+                PromptTurnKind::SUMMARY => messages.push(json!({
+                    "role": "user",
+                    "content": self.build_content_array(&turn.content),
+                })),
                 PromptTurnKind::USER => messages.push(
                     json!({"role": "user", "content": self.build_content_array(&turn.content)}),
                 ),
@@ -210,7 +257,7 @@ impl ClaudeProvider {
                         self.build_assistant_content_blocks(
                             &turn.content,
                             &mut next_tool_use_ordinal,
-                            &mut open_tool_use_ids,
+                            &mut open_tool_calls,
                         )?
                     } else {
                         self.build_content_array(&turn.content)
@@ -219,7 +266,7 @@ impl ClaudeProvider {
                 }
                 PromptTurnKind::TOOL_RESULT => {
                     let content = if self.enable_tool_call {
-                        self.build_tool_result_blocks(&turn.content, &mut open_tool_use_ids)
+                        self.build_tool_result_blocks(&turn.content, &mut open_tool_calls)
                     } else {
                         self.build_content_array(&turn.content)
                     };
@@ -227,26 +274,129 @@ impl ClaudeProvider {
                 }
             }
         }
-        let system = if system_parts.is_empty() {
+        if !open_tool_calls.is_empty() {
+            let content = Self::missing_tool_result_blocks(&mut open_tool_calls, "history_end");
+            messages.push(json!({"role": "user", "content": content}));
+        }
+        let system_prompt = system_parts.join("\n\n");
+        let system = if system_prompt.trim().is_empty() {
             Value::Null
         } else {
-            Value::Array(
-                system_parts
-                    .into_iter()
-                    .map(|text| {
-                        json!({
-                            "type": "text",
-                            "text": text,
-                            "cache_control": {"type": "ephemeral"}
-                        })
-                    })
-                    .collect(),
-            )
+            json!([{"type": "text", "text": system_prompt}])
         };
         Ok((system, messages))
     }
 
-    pub fn apply_stable_cache_breakpoints(&self, _request_object: &mut Map<String, Value>) {}
+    fn cache_control_object(&self) -> Value {
+        if self.enable_claude_1h_prompt_cache {
+            json!({"type": "ephemeral", "ttl": "1h"})
+        } else {
+            json!({"type": "ephemeral"})
+        }
+    }
+
+    /// Adds the same three stable breakpoints as Kotlin, without replacing caller policies.
+    pub fn apply_stable_cache_breakpoints(&self, request_object: &mut Map<String, Value>) {
+        for field in ["tools", "system"] {
+            if let Some(block) = request_object
+                .get_mut(field)
+                .and_then(Value::as_array_mut)
+                .and_then(|blocks| blocks.last_mut())
+                .and_then(Value::as_object_mut)
+            {
+                block
+                    .entry("cache_control")
+                    .or_insert_with(|| self.cache_control_object());
+            }
+        }
+        if let Some(messages) = request_object
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+        {
+            for message in messages.iter_mut().rev() {
+                let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                if let Some(block) = content.iter_mut().rev().find_map(Value::as_object_mut) {
+                    block
+                        .entry("cache_control")
+                        .or_insert_with(|| self.cache_control_object());
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Uses identical serialized content for send-time estimates and read-only preflight.
+    fn build_cache_request_parts(
+        &self,
+        history: &[PromptTurn],
+        tools: &[ToolPrompt],
+    ) -> Result<Map<String, Value>, AiServiceError> {
+        let (system, messages) = self.build_serialized_history(history)?;
+        let mut object = Map::new();
+        if !system.is_null() {
+            object.insert("system".to_string(), system);
+        }
+        object.insert("messages".to_string(), Value::Array(messages));
+        if self.enable_tool_call && !tools.is_empty() {
+            object.insert(
+                "tools".to_string(),
+                self.build_tool_definitions_for_claude(tools)?,
+            );
+        }
+        self.apply_stable_cache_breakpoints(&mut object);
+        Ok(object)
+    }
+
+    fn calculate_and_store_input_tokens(
+        &self,
+        object: &Map<String, Value>,
+        update_state: bool,
+    ) -> i64 {
+        let mut history = Vec::new();
+        if let Some(system) = object
+            .get("system")
+            .filter(|value| value.as_array().is_some_and(|array| !array.is_empty()))
+        {
+            history.push(("system".to_string(), stable_json_value(system)));
+        }
+        if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                let Some(role) = message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .filter(|role| !role.is_empty())
+                else {
+                    continue;
+                };
+                let content = message
+                    .get("content")
+                    .filter(|value| value.is_array())
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                history.push((role.to_string(), stable_json_value(&content)));
+            }
+        }
+        let tools = object
+            .get("tools")
+            .filter(|value| value.as_array().is_some_and(|array| !array.is_empty()))
+            .map(stable_json_value);
+        let mut state = self
+            .state
+            .lock()
+            .expect("ClaudeProvider state mutex poisoned");
+        let count = state.tokenCacheManager.calculate_input_tokens(
+            &history,
+            tools.as_deref(),
+            update_state,
+        );
+        if update_state {
+            state.inputTokenCount = state.tokenCacheManager.total_input_token_count();
+            state.cachedInputTokenCount = state.tokenCacheManager.cached_input_token_count();
+        }
+        count
+    }
 
     fn build_tool_definitions_for_claude(
         &self,
@@ -269,12 +419,20 @@ impl ClaudeProvider {
 
     /// Builds Claude content blocks from text and registered image links.
     fn build_content_array(&self, text: &str) -> Value {
-        if !MediaLinkParser::has_image_links(text) {
-            return json!([{"type": "text", "text": text}]);
+        let text_after_media_removal = if MediaLinkParser::has_media_links(text) {
+            MediaLinkParser::remove_media_links(text).trim().to_string()
+        } else {
+            text.to_string()
+        };
+
+        if !MediaLinkParser::has_image_links(&text_after_media_removal) {
+            return json!([{"type": "text", "text": text_after_media_removal}]);
         }
 
-        let image_links = MediaLinkParser::extract_image_links(text);
-        let text_without_links = MediaLinkParser::remove_image_links(text).trim().to_string();
+        let image_links = MediaLinkParser::extract_image_links(&text_after_media_removal);
+        let text_without_links = MediaLinkParser::remove_image_links(&text_after_media_removal)
+            .trim()
+            .to_string();
         let mut content_blocks = Vec::new();
         for link in image_links {
             content_blocks.push(json!({
@@ -299,73 +457,71 @@ impl ClaudeProvider {
         &self,
         content: &str,
         next_tool_use_ordinal: &mut usize,
-        open_tool_use_ids: &mut Vec<String>,
+        open_tool_calls: &mut Vec<OpenToolCall>,
     ) -> Result<Value, AiServiceError> {
-        let matches = ChatMarkupRegex::tool_call_matches(content);
-        if matches.is_empty() {
+        let (text_content, calls) = StructuredToolCallBridge::parseXmlToolCalls(content);
+        let Some(calls) = calls.filter(|calls| !calls.is_empty()) else {
             return Ok(self.build_content_array(content));
-        }
-        let mut text_content = content.to_string();
+        };
         let mut blocks = Vec::new();
-        for tool_match in matches.iter() {
-            text_content = text_content.replace(
-                &format!(
-                    "<{} name=\"{}\">{}</{}>",
-                    tool_match.tag_name, tool_match.name, tool_match.body, tool_match.tag_name
-                ),
-                "",
+        if !text_content.trim().is_empty() {
+            blocks.extend(
+                self.build_content_array(&text_content)
+                    .as_array()
+                    .unwrap()
+                    .clone(),
             );
-            let mut input = Map::new();
-            for (start, end) in operit_util::ChatMarkupRegex::tag_ranges(&tool_match.body, "param")
-            {
-                let raw = &tool_match.body[start..end];
-                let name =
-                    operit_util::ChatMarkupRegex::attr_value(raw, "name").unwrap_or_default();
-                let value = raw
-                    .split_once('>')
-                    .and_then(|(_, tail)| {
-                        tail.rsplit_once("</").map(|(body, _)| xml_unescape(body))
-                    })
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                input.insert(name, json!(value));
-            }
+        }
+        for call in calls {
+            let function = &call["function"];
+            let input: Value = serde_json::from_str(function["arguments"].as_str().unwrap_or("{}"))
+                .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?;
             let call_id = generated_tool_use_id(*next_tool_use_ordinal);
             *next_tool_use_ordinal += 1;
-            open_tool_use_ids.push(call_id.clone());
+            open_tool_calls.push(OpenToolCall {
+                id: call_id.clone(),
+                function_name: function["name"].as_str().unwrap_or_default().to_string(),
+                matching_name: StructuredToolCallBridge::toolCallName(&call),
+            });
             blocks.push(json!({
                 "type": "tool_use",
                 "id": call_id,
-                "name": tool_match.name,
-                "input": Value::Object(input),
+                "name": function["name"],
+                "input": input,
             }));
         }
-        let trimmed = text_content.trim();
-        let mut content_blocks = Vec::new();
-        if !trimmed.is_empty() {
-            content_blocks.push(json!({"type": "text", "text": trimmed}));
-        }
-        content_blocks.extend(blocks);
-        Ok(Value::Array(content_blocks))
+        Ok(Value::Array(blocks))
+    }
+
+    /// Keeps every missing tool response attached to its original invocation ID.
+    fn missing_tool_result_blocks(
+        open_tool_calls: &mut Vec<OpenToolCall>,
+        reason: &str,
+    ) -> Vec<Value> {
+        open_tool_calls.drain(..).map(|call| json!({
+            "type": "tool_result",
+            "tool_use_id": call.id,
+            "is_error": true,
+            "content": StructuredToolCallBridge::unmatchedToolResultContent(reason, &call.matching_name),
+        })).collect()
     }
 
     fn build_tool_result_blocks(
         &self,
         content: &str,
-        open_tool_use_ids: &mut Vec<String>,
+        open_tool_calls: &mut Vec<OpenToolCall>,
     ) -> Value {
         let blocks = ChatMarkupRegex::tool_result_blocks(content);
-        if blocks.is_empty() {
-            return self.build_content_array(content);
-        }
+        let result_names = blocks
+            .iter()
+            .map(|block| operit_util::ChatMarkupRegex::attr_value(&block.raw, "name"))
+            .collect::<Vec<_>>();
+        let matched =
+            StructuredToolCallBridge::consumeMatchingToolCalls(open_tool_calls, &result_names);
+        let mut text_content = content.to_string();
         let mut result_blocks = Vec::new();
-        for (index, block) in blocks.iter().enumerate() {
-            let tool_use_id = if !open_tool_use_ids.is_empty() {
-                open_tool_use_ids.remove(0)
-            } else {
-                generated_tool_use_id(index)
-            };
+        for matched_call in matched {
+            let block = &blocks[matched_call.result_index];
             let result_content = operit_util::ChatMarkupRegex::tag_ranges(&block.body, "content")
                 .into_iter()
                 .next()
@@ -379,9 +535,26 @@ impl ClaudeProvider {
                 .unwrap_or_else(|| block.body.trim().to_string());
             result_blocks.push(json!({
                 "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": result_content,
+                "tool_use_id": matched_call.call.id,
+                "content": self.build_content_array(&result_content),
             }));
+            // Unmatched markup remains text rather than becoming an orphan tool_result.
+            text_content = text_content.replacen(&block.raw, "", 1);
+        }
+        result_blocks.extend(Self::missing_tool_result_blocks(
+            open_tool_calls,
+            "tool_result_partial_batch",
+        ));
+        if !text_content.trim().is_empty() {
+            result_blocks.extend(
+                self.build_content_array(text_content.trim())
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        if result_blocks.is_empty() {
+            return self.build_content_array(content);
         }
         Value::Array(result_blocks)
     }
@@ -404,63 +577,10 @@ impl ClaudeProvider {
         }
     }
 
-    fn apply_thinking_format(
-        &self,
-        json_object: &mut Map<String, Value>,
-        request: &SendMessageRequest,
-    ) {
-        if !request.enable_thinking {
-            return;
-        }
-
-        let thinking = match self.thinking_format() {
-            ClaudeThinkingFormat::Adaptive => json!({
-                "type": "adaptive",
-                "display": "summarized"
-            }),
-            ClaudeThinkingFormat::Enabled => json!({
-                "type": "enabled",
-                "budget_tokens": self.thinking_budget_tokens(json_object)
-            }),
-        };
-        json_object.insert("thinking".to_string(), thinking);
-    }
-
-    fn thinking_format(&self) -> ClaudeThinkingFormat {
-        let model_name = normalize_claude_model_name(&self.model_name);
-        if has_claude_family(&model_name, "fable")
-            || has_claude_family(&model_name, "mythos")
-            || has_claude_family_at_least(&model_name, "opus", 4, 6)
-            || has_claude_family_at_least(&model_name, "sonnet", 4, 6)
-        {
-            ClaudeThinkingFormat::Adaptive
-        } else {
-            ClaudeThinkingFormat::Enabled
-        }
-    }
-
-    fn thinking_budget_tokens(&self, json_object: &Map<String, Value>) -> i64 {
-        let max_tokens = json_object
-            .get("max_tokens")
-            .and_then(Value::as_i64)
-            .filter(|value| *value > 0);
-        match max_tokens {
-            Some(value) => value.min(1024),
-            None => 1024,
-        }
-    }
-
     fn headers(&self) -> Result<HeaderMap, AiServiceError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        if !self.api_key.trim().is_empty() {
-            headers.insert(
-                "x-api-key",
-                HeaderValue::from_str(&self.api_key)
-                    .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?,
-            );
-        }
         for (name, value) in &self.custom_headers {
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes())
@@ -472,34 +592,131 @@ impl ClaudeProvider {
         Ok(headers)
     }
 
+    /// Streaming usage is a partial update: omitted fields retain prior values,
+    /// while explicitly reported zeroes replace them (KT ProviderUsageNormalizer).
+    fn apply_streaming_usage(&mut self, usage: &Value, accumulated: &mut Map<String, Value>) {
+        self.apply_streaming_usage_with_format(usage, accumulated, false);
+    }
+
+    fn apply_streaming_usage_with_format(
+        &mut self,
+        usage: &Value,
+        accumulated: &mut Map<String, Value>,
+        open_ai_compatible: bool,
+    ) {
+        if let Some(fields) = usage.as_object() {
+            accumulated.extend(fields.clone());
+            self.apply_usage_with_format(
+                Some(&Value::Object(accumulated.clone())),
+                open_ai_compatible,
+            );
+        }
+    }
+
     fn apply_usage(&mut self, usage: Option<&Value>) -> TokenCounts {
+        self.apply_usage_with_format(usage, false)
+    }
+
+    fn apply_usage_with_format(
+        &mut self,
+        usage: Option<&Value>,
+        open_ai_compatible: bool,
+    ) -> TokenCounts {
+        let has_usage = usage.is_some_and(|value| {
+            [
+                "input_tokens",
+                "prompt_tokens",
+                "cache_read_input_tokens",
+                "cached_tokens",
+                "cache_creation_input_tokens",
+                "cache_creation",
+                "output_tokens",
+                "completion_tokens",
+            ]
+            .iter()
+            .any(|field| value.get(*field).is_some())
+        });
+        if !has_usage {
+            let state = self
+                .state
+                .lock()
+                .expect("ClaudeProvider state mutex poisoned");
+            return TokenCounts {
+                input: state
+                    .inputTokenCount
+                    .saturating_sub(state.cachedInputTokenCount),
+                cached_input: state.cachedInputTokenCount,
+                output: state.outputTokenCount,
+            };
+        }
         let cached_input = usage
             .and_then(|value| {
                 value
                     .get("cache_read_input_tokens")
+                    .or_else(|| value.pointer("/prompt_tokens_details/cached_tokens"))
                     .or_else(|| value.pointer("/input_tokens_details/cached_tokens"))
                     .or_else(|| value.get("cached_tokens"))
             })
             .and_then(Value::as_i64)
             .unwrap_or(0)
-            .max(0) as i64;
+            .max(0);
         let cache_creation = usage
-            .and_then(|value| value.get("cache_creation_input_tokens"))
-            .and_then(Value::as_i64)
+            .and_then(|value| {
+                value
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_i64)
+                    .or_else(|| {
+                        value
+                            .get("cache_creation")
+                            .and_then(Value::as_object)
+                            .map(|fields| {
+                                fields
+                                    .values()
+                                    .filter_map(Value::as_i64)
+                                    .fold(0i64, i64::saturating_add)
+                            })
+                    })
+            })
             .unwrap_or(0)
-            .max(0) as i64;
+            .max(0);
+        // Anthropic input_tokens excludes cache reads/creation; OpenAI's
+        // prompt_tokens includes cached tokens. Match KT's two usage parsers.
         let input_base = usage
-            .and_then(|value| value.get("input_tokens"))
+            .and_then(|value| {
+                if open_ai_compatible {
+                    return value
+                        .get("prompt_tokens")
+                        .or_else(|| value.get("input_tokens"))
+                        .and_then(Value::as_i64)
+                        .map(|total| total.saturating_sub(cached_input));
+                }
+                value
+                    .get("input_tokens")
+                    .and_then(Value::as_i64)
+                    .or_else(|| {
+                        value
+                            .get("prompt_tokens")
+                            .and_then(Value::as_i64)
+                            .map(|total| total.saturating_sub(cached_input))
+                    })
+            })
+            .unwrap_or(0)
+            .max(0);
+        let output = usage
+            .and_then(|value| {
+                value
+                    .get("output_tokens")
+                    .or_else(|| value.get("completion_tokens"))
+            })
             .and_then(Value::as_i64)
             .unwrap_or(0)
-            .max(0) as i64;
-        let input = input_base + cache_creation;
-        let output = usage
-            .and_then(|value| value.get("output_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0) as i64;
+            .max(0);
         let token_counts = TokenCounts {
-            input,
+            input: input_base.saturating_add(if open_ai_compatible {
+                0
+            } else {
+                cache_creation
+            }),
             cached_input,
             output,
         };
@@ -533,16 +750,20 @@ impl AIService for ClaudeProvider {
         format!("{}:{}", self.provider_type, self.model_name)
     }
     fn reset_token_counts(&mut self) {
-        self.set_token_counts(TokenCounts {
-            input: 0,
-            cached_input: 0,
-            output: 0,
-        });
+        let mut state = self
+            .state
+            .lock()
+            .expect("ClaudeProvider state mutex poisoned");
+        state.tokenCacheManager.reset_token_counts();
+        state.inputTokenCount = 0;
+        state.cachedInputTokenCount = 0;
+        state.outputTokenCount = 0;
     }
     fn cancel_streaming(&mut self) {
         self.set_cancelled(true);
     }
 
+    /// Sends a Claude request while preserving producer failures through the cold wrapper.
     async fn send_message(
         &mut self,
         request: SendMessageRequest,
@@ -550,29 +771,32 @@ impl AIService for ClaudeProvider {
         self.set_cancelled(false);
         self.reset_token_counts();
         if request.stream {
-            let event_channel = empty_revisable_event_channel();
-            let streamEventChannel = event_channel.clone();
-            let mut ownedProvider = Some(self.clone());
-            let mut ownedRequest = Some(request);
-            let coldStream = FnStream::new(move |emit| {
-                let request = ownedRequest
-                    .take()
-                    .expect("ClaudeProvider stream must only be collected once");
-                let mut provider = ownedProvider
-                    .take()
-                    .expect("ClaudeProvider stream must only be collected once");
-                let eventChannel = streamEventChannel.clone();
-                Box::pin(async move {
-                    if let Ok(mut responseStream) = provider.send_streaming_message(request).await {
-                        responseStream.collect(emit).await;
-                    }
-                    eventChannel.close();
-                })
-            });
-            return Ok(Box::new(with_event_channel(coldStream, event_channel)));
+            let output = SharedAiResponseStream::new_ordered(
+                operit_util::stream::HotStream::mutable_shared_stream(usize::MAX),
+                operit_util::stream::HotStream::mutable_shared_stream(usize::MAX),
+            );
+            let producer = output.clone();
+            let mut provider = self.clone();
+            defaultHostRuntimeTaskSchedulerHost()
+                .scheduleHostRuntimeAsyncTask(
+                    "claude-response-stream",
+                    Box::new(move || {
+                        Box::pin(async move {
+                            match provider.send_streaming_message(request, &producer).await {
+                                Ok(()) | Err(AiServiceError::RequestCancelled) => {}
+                                Err(error) => producer.set_terminal_failure(error.to_string()),
+                            }
+                            producer.close();
+                        })
+                    }),
+                )
+                .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?;
+            return Ok(Box::new(output));
         }
         let event_channel = empty_revisable_event_channel();
         let streamEventChannel = event_channel.clone();
+        let terminalFailure = TerminalFailureState::new();
+        let producerTerminalFailure = terminalFailure.clone();
         let mut ownedProvider = Some(self.clone());
         let mut ownedRequest = Some(request);
         let coldStream = FnStream::new(move |emit| {
@@ -583,14 +807,26 @@ impl AIService for ClaudeProvider {
                 .take()
                 .expect("ClaudeProvider non-stream request must only be collected once");
             let eventChannel = streamEventChannel.clone();
+            let producerTerminalFailure = producerTerminalFailure.clone();
             Box::pin(async move {
-                if let Ok(mut responseStream) = provider.send_non_streaming_message(request).await {
-                    responseStream.collect(emit).await;
+                match provider.send_non_streaming_message(request).await {
+                    Ok(mut responseStream) => {
+                        responseStream.collect(emit).await;
+                        if let Some(error) = responseStream.terminal_failure() {
+                            producerTerminalFailure.set(error);
+                        }
+                    }
+                    Err(AiServiceError::RequestCancelled) => {}
+                    Err(error) => producerTerminalFailure.set(error.to_string()),
                 }
                 eventChannel.close();
             })
         });
-        Ok(Box::new(with_event_channel(coldStream, event_channel)))
+        Ok(Box::new(with_event_channel_and_failure(
+            coldStream,
+            event_channel,
+            terminalFailure,
+        )))
     }
 
     async fn calculate_input_tokens(
@@ -598,93 +834,65 @@ impl AIService for ClaudeProvider {
         chat_history: &[PromptTurn],
         available_tools: &[ToolPrompt],
     ) -> Result<i64, AiServiceError> {
-        let history_chars: usize = chat_history.iter().map(|turn| turn.content.len()).sum();
-        let tool_chars: usize = available_tools
-            .iter()
-            .map(|tool| tool.name.len() + tool.description.len())
-            .sum();
-        Ok(((history_chars + tool_chars + 3) / 4) as i64)
+        let object = self.build_cache_request_parts(chat_history, available_tools)?;
+        Ok(self.calculate_and_store_input_tokens(&object, false))
     }
 }
 
 impl ClaudeProvider {
+    /// Publishes each event immediately and rolls back only when another attempt is accepted.
     async fn send_streaming_message(
         &mut self,
         request: SendMessageRequest,
-    ) -> Result<Box<dyn RevisableTextStreamLike>, AiServiceError> {
-        let maxRetries = super::LlmRetryPolicy::LlmRetryPolicy::MAX_RETRY_ATTEMPTS;
-        let mut retryCount = 0;
+        output: &SharedAiResponseStream,
+    ) -> Result<(), AiServiceError> {
+        let savepoint = uuid::Uuid::new_v4().to_string();
+        output.emit_revision(TextStreamEvent {
+            event_type: TextStreamEventType::Savepoint,
+            id: savepoint.clone(),
+        });
+        let mut retry_count = 0;
         loop {
             let request_body = self.create_request_body(&request)?;
-            let response = match self
-                .sendHttpRequest(
-                    reqwest::Client::new()
-                        .post(&self.api_endpoint)
-                        .headers(self.headers()?)
-                        .json(&request_body),
-                )
-                .await
-            {
-                Ok(response) => response,
-                Err(AiServiceError::RequestCancelled) => {
-                    return Err(AiServiceError::RequestCancelled);
+            let result = async {
+                let response = self
+                    .sendHttpRequest(
+                        super::ProviderHttp::post(&self.api_endpoint)
+                            .headers(self.headers()?)
+                            .json(&request_body),
+                    )
+                    .await?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    return Err(AiServiceError::RequestFailed(format!(
+                        "{status}: {}",
+                        self.readResponseText(response).await?
+                    )));
                 }
-                Err(error) => {
-                    let errorText = retry_error_text(&error);
-                    if !request.enable_retry {
-                        return Err(error);
-                    }
-                    let newRetryCount = retryCount + 1;
-                    if newRetryCount > maxRetries {
-                        return Err(error);
-                    }
-                    if let Some(on_non_fatal_error) = request.on_non_fatal_error.as_ref() {
-                        on_non_fatal_error(retry_message(&errorText, newRetryCount));
-                    }
-                    self.delayRetryOrCancel(newRetryCount).await?;
-                    retryCount = newRetryCount;
-                    continue;
-                }
-            };
-            let status = response.status();
-            if !status.is_success() {
-                let text = self.readResponseText(response).await?;
-                let error = AiServiceError::RequestFailed(format!("{status}: {text}"));
-                let errorText = retry_error_text(&error);
-                if !request.enable_retry {
-                    return Err(error);
-                }
-                let newRetryCount = retryCount + 1;
-                if newRetryCount > maxRetries {
-                    return Err(error);
-                }
-                if let Some(on_non_fatal_error) = request.on_non_fatal_error.as_ref() {
-                    on_non_fatal_error(retry_message(&errorText, newRetryCount));
-                }
-                self.delayRetryOrCancel(newRetryCount).await?;
-                retryCount = newRetryCount;
-                continue;
+                self.process_streaming_response(response, output).await
             }
-            match self.process_streaming_response(response).await {
-                Ok(responseStream) => return Ok(responseStream),
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
                 Err(AiServiceError::RequestCancelled) => {
-                    return Err(AiServiceError::RequestCancelled);
+                    return Err(AiServiceError::RequestCancelled)
                 }
                 Err(error) => {
-                    let errorText = retry_error_text(&error);
-                    if !request.enable_retry {
+                    if !request.enable_retry
+                        || retry_count >= super::LlmRetryPolicy::LlmRetryPolicy::MAX_RETRY_ATTEMPTS
+                    {
                         return Err(error);
                     }
-                    let newRetryCount = retryCount + 1;
-                    if newRetryCount > maxRetries {
-                        return Err(error);
+                    retry_count += 1;
+                    output.emit_revision(TextStreamEvent {
+                        event_type: TextStreamEventType::Rollback,
+                        id: savepoint.clone(),
+                    });
+                    self.reset_token_counts();
+                    if let Some(callback) = &request.on_non_fatal_error {
+                        callback(retry_message(&retry_error_text(&error), retry_count));
                     }
-                    if let Some(on_non_fatal_error) = request.on_non_fatal_error.as_ref() {
-                        on_non_fatal_error(retry_message(&errorText, newRetryCount));
-                    }
-                    self.delayRetryOrCancel(newRetryCount).await?;
-                    retryCount = newRetryCount;
-                    continue;
+                    self.delayRetryOrCancel(retry_count).await?;
                 }
             }
         }
@@ -700,8 +908,7 @@ impl ClaudeProvider {
             let request_body = self.create_request_body(&request)?;
             let response = match self
                 .sendHttpRequest(
-                    reqwest::Client::new()
-                        .post(&self.api_endpoint)
+                    super::ProviderHttp::post(&self.api_endpoint)
                         .headers(self.headers()?)
                         .json(&request_body),
                 )
@@ -749,152 +956,133 @@ impl ClaudeProvider {
             }
 
             let json_response = self.readResponseJson(response).await?;
-            let token_counts = self.apply_usage(json_response.get("usage"));
-            let mut chunks = Vec::new();
-            if let Some(content) = json_response.get("content").and_then(Value::as_array) {
-                for part in content {
-                    match part.get("type").and_then(Value::as_str).unwrap_or_default() {
-                        "text" => {
-                            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                chunks.push(StructuredToolCallBridge::convertToolCallPayloadToXml(
-                                    text,
-                                ));
-                            }
-                        }
-                        "tool_use" => {
-                            chunks.push(StructuredToolCallBridge::convertToolCallPayloadToXml(
-                                &part.to_string(),
-                            ))
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            let token_counts = if json_response.get("choices").is_some() {
+                self.apply_usage_with_format(json_response.get("usage"), true)
+            } else {
+                self.apply_usage(json_response.get("usage"))
+            };
             let _ = token_counts;
-            return Ok(response_stream_from_chunks(chunks));
+            let content = self.parse_anthropic_non_streaming(&json_response);
+            return Ok(response_stream_from_chunks(vec![content]));
         }
     }
 
-    async fn process_streaming_response(
+    /// Emits complete SSE events while preserving an interrupted response as a failure.
+    pub(super) async fn process_streaming_response(
         &mut self,
-        response: reqwest::Response,
-    ) -> Result<Box<dyn RevisableTextStreamLike>, AiServiceError> {
+        response: super::ProviderHttp::Response,
+        output: &SharedAiResponseStream,
+    ) -> Result<(), AiServiceError> {
+        if response
+            .media_type()
+            .eq_ignore_ascii_case("application/json")
+        {
+            let json: Value = self.readResponseJson(response).await?;
+            if let Some(error) = json.get("error") {
+                return Err(AiServiceError::RequestFailed(error.to_string()));
+            }
+            self.apply_usage_with_format(json.get("usage"), json.get("choices").is_some());
+            output.emit_chunk(self.parse_anthropic_non_streaming(&json));
+            return Ok(());
+        }
         let mut chunks = Vec::new();
-        let mut token_counts = TokenCounts {
-            input: 0,
-            cached_input: 0,
-            output: 0,
-        };
-        let mut pending_line = String::new();
+        let mut accumulated_usage = Map::new();
+        let mut decoder = SseDecoder::default();
         let mut bytes_stream = response.bytes_stream();
-        let mut current_tool_parser: Option<StreamingJsonXmlConverter> = None;
-        let mut current_tool_tag_name: Option<String> = None;
+        let mut current_tool_parser = None;
+        let mut current_tool_tag_name = None;
         let mut is_in_tool_call = false;
         let mut is_in_thinking_block = false;
-        let mut non_sse_json_lines_buffer = String::new();
-        let mut emitted_any = false;
-
-        while let Some(item) = bytes_stream.next().await {
+        let mut completed = false;
+        let cancelled = self.clone().waitUntilCancelled();
+        tokio::pin!(cancelled);
+        loop {
             if self.is_cancelled() {
-                break;
+                return Err(AiServiceError::RequestCancelled);
             }
-            let bytes =
-                item.map_err(|error| AiServiceError::ConnectionFailed(error.to_string()))?;
-            pending_line.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(newline_index) = pending_line.find('\n') {
-                let line = pending_line[..newline_index].trim().to_string();
-                pending_line = pending_line[newline_index + 1..].to_string();
-                self.process_streaming_line(
-                    &line,
+            let item = tokio::select! {
+                item = bytes_stream.next() => item,
+                _ = &mut cancelled => return Err(AiServiceError::RequestCancelled),
+            };
+            let Some(item) = item else {
+                break;
+            };
+            for data in decoder.push(&item?)? {
+                self.process_streaming_event(
+                    &data,
                     &mut chunks,
-                    &mut token_counts,
+                    &mut accumulated_usage,
                     &mut current_tool_parser,
                     &mut current_tool_tag_name,
                     &mut is_in_tool_call,
                     &mut is_in_thinking_block,
-                    &mut non_sse_json_lines_buffer,
-                    &mut emitted_any,
+                    &mut completed,
                 )?;
-            }
-        }
-        let pending = pending_line.trim().to_string();
-        if !pending.is_empty() {
-            self.process_streaming_line(
-                &pending,
-                &mut chunks,
-                &mut token_counts,
-                &mut current_tool_parser,
-                &mut current_tool_tag_name,
-                &mut is_in_tool_call,
-                &mut is_in_thinking_block,
-                &mut non_sse_json_lines_buffer,
-                &mut emitted_any,
-            )?;
-        }
-        if !emitted_any && !non_sse_json_lines_buffer.trim().is_empty() {
-            if let Ok(json_response) =
-                serde_json::from_str::<Value>(non_sse_json_lines_buffer.trim())
-            {
-                let text = self.parse_anthropic_non_streaming(&json_response);
-                if !text.is_empty() {
-                    chunks.push(text);
+                for chunk in chunks.drain(..) {
+                    output.emit_chunk(chunk);
                 }
-                token_counts = self.apply_usage(json_response.get("usage"));
+                if completed {
+                    if let Some(mut parser) = current_tool_parser.take() {
+                        append_converter_events(&mut chunks, parser.flush());
+                    }
+                    if let Some(tag) = current_tool_tag_name.take() {
+                        chunks.push(format!("\n</{tag}>\n"));
+                    }
+                    if is_in_thinking_block {
+                        chunks.push("</think>\n".to_string());
+                    }
+                    for chunk in chunks.drain(..) {
+                        output.emit_chunk(chunk);
+                    }
+                    return Ok(());
+                }
             }
         }
-        if is_in_tool_call {
-            if let Some(mut parser) = current_tool_parser {
-                append_converter_events(&mut chunks, parser.flush());
-            }
-            if let Some(tag) = current_tool_tag_name {
-                chunks.push(format!("\n</{tag}>\n"));
-            }
-        }
-        if is_in_thinking_block {
-            chunks.push("</think>\n".to_string());
-        }
-        self.set_token_counts(token_counts);
-        Ok(response_stream_from_chunks(chunks))
+        decoder.finish()?;
+        Err(AiServiceError::ConnectionFailed(
+            "Claude response stream ended before completion".to_string(),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn process_streaming_line(
+    /// Interprets one fully framed event and reports protocol completion explicitly.
+    fn process_streaming_event(
         &mut self,
-        line: &str,
+        data: &str,
         chunks: &mut Vec<String>,
-        token_counts: &mut TokenCounts,
+        accumulated_usage: &mut Map<String, Value>,
         current_tool_parser: &mut Option<StreamingJsonXmlConverter>,
         current_tool_tag_name: &mut Option<String>,
         is_in_tool_call: &mut bool,
         is_in_thinking_block: &mut bool,
-        non_sse_json_lines_buffer: &mut String,
-        emitted_any: &mut bool,
+        completed: &mut bool,
     ) -> Result<(), AiServiceError> {
-        if !line.starts_with("data:") {
-            if line.starts_with('{') || line.starts_with('[') {
-                non_sse_json_lines_buffer.push_str(line);
-                non_sse_json_lines_buffer.push('\n');
-            }
+        if data.trim() == "[DONE]" {
+            *completed = true;
             return Ok(());
         }
-        let data = line.trim_start_matches("data:").trim_start();
-        if data == "[DONE]" || data.is_empty() {
+        if data.trim().is_empty() {
             return Ok(());
         }
         let json_response: Value = serde_json::from_str(data)
             .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?;
+        if let Some(error) = json_response.get("error") {
+            return Err(AiServiceError::RequestFailed(error.to_string()));
+        }
         let event_type = json_response
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("");
         if event_type.is_empty() {
+            if let Some(usage) = json_response.get("usage") {
+                self.apply_streaming_usage_with_format(usage, accumulated_usage, true);
+            }
             if let Some(content) = json_response
                 .pointer("/choices/0/delta/content")
                 .and_then(Value::as_str)
             {
                 if !content.is_empty() {
                     chunks.push(content.to_string());
-                    *emitted_any = true;
                 }
             }
             return Ok(());
@@ -902,7 +1090,7 @@ impl ClaudeProvider {
         match event_type {
             "message_start" => {
                 if let Some(usage) = json_response.pointer("/message/usage") {
-                    *token_counts = self.apply_usage(Some(usage));
+                    self.apply_streaming_usage(usage, accumulated_usage);
                 }
             }
             "content_block_start" => {
@@ -923,7 +1111,6 @@ impl ClaudeProvider {
                             chunks.push(format!("\n<{tag} name=\"{tool_name}\">"));
                             *current_tool_parser = Some(StreamingJsonXmlConverter::new());
                             *is_in_tool_call = true;
-                            *emitted_any = true;
                             if let Some(input) = content_block.get("input") {
                                 if let Some(parser) = current_tool_parser.as_mut() {
                                     append_converter_events(
@@ -937,7 +1124,6 @@ impl ClaudeProvider {
                     "thinking" => {
                         chunks.push("\n<think>".to_string());
                         *is_in_thinking_block = true;
-                        *emitted_any = true;
                         if let Some(thinking) =
                             content_block.get("thinking").and_then(Value::as_str)
                         {
@@ -956,7 +1142,6 @@ impl ClaudeProvider {
                     if let Some(content) = delta.get("text").and_then(Value::as_str) {
                         if !content.is_empty() {
                             chunks.push(content.to_string());
-                            *emitted_any = true;
                         }
                     }
                 } else if *is_in_thinking_block
@@ -965,7 +1150,6 @@ impl ClaudeProvider {
                     if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
                         if !thinking.is_empty() {
                             chunks.push(thinking.to_string());
-                            *emitted_any = true;
                         }
                     }
                 } else if self.enable_tool_call
@@ -996,10 +1180,12 @@ impl ClaudeProvider {
             }
             "message_delta" => {
                 if let Some(usage) = json_response.get("usage") {
-                    *token_counts = self.apply_usage(Some(usage));
+                    self.apply_streaming_usage(usage, accumulated_usage);
                 }
             }
-            "message_stop" => {}
+            "message_stop" => {
+                *completed = true;
+            }
             _ => {}
         }
         Ok(())
@@ -1060,135 +1246,39 @@ impl ClaudeProvider {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ClaudeThinkingFormat {
-    Adaptive,
-    Enabled,
-}
+/// `max_tokens` a request gets when the user sets none; a thinking budget comes on top.
+const DEFAULT_MAX_TOKENS: i64 = 4096;
 
-fn normalize_claude_model_name(value: &str) -> String {
-    let mut normalized = String::new();
-    let mut previous_was_separator = false;
-    let mut previous_kind = ModelNameCharKind::Separator;
-
-    for ch in value.trim().chars().flat_map(char::to_lowercase) {
-        let current_kind = ModelNameCharKind::from_char(ch);
-        if current_kind == ModelNameCharKind::Separator {
-            if !previous_was_separator && !normalized.is_empty() {
-                normalized.push('-');
-                previous_was_separator = true;
-            }
-            previous_kind = ModelNameCharKind::Separator;
-            continue;
-        }
-
-        if should_split_model_name_part(previous_kind, current_kind, previous_was_separator) {
-            normalized.push('-');
-        }
-        normalized.push(ch);
-        previous_was_separator = false;
-        previous_kind = current_kind;
-    }
-
-    normalized.trim_matches('-').to_string()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModelNameCharKind {
-    Letter,
-    Digit,
-    Separator,
-}
-
-impl ModelNameCharKind {
-    fn from_char(ch: char) -> Self {
-        if ch.is_ascii_alphabetic() {
-            Self::Letter
-        } else if ch.is_ascii_digit() {
-            Self::Digit
-        } else {
-            Self::Separator
-        }
-    }
-}
-
-fn should_split_model_name_part(
-    previous_kind: ModelNameCharKind,
-    current_kind: ModelNameCharKind,
-    previous_was_separator: bool,
-) -> bool {
-    !previous_was_separator
-        && matches!(
-            (previous_kind, current_kind),
-            (ModelNameCharKind::Letter, ModelNameCharKind::Digit)
-                | (ModelNameCharKind::Digit, ModelNameCharKind::Letter)
-        )
-}
-
-fn has_claude_family(normalized_model_name: &str, family: &str) -> bool {
-    normalized_model_name.split('-').any(|part| part == family)
-}
-
-fn has_claude_family_at_least(
-    normalized_model_name: &str,
-    family: &str,
-    min_major: i32,
-    min_minor: i32,
-) -> bool {
-    match claude_family_version(normalized_model_name, family) {
-        Some((major, minor)) => major > min_major || major == min_major && minor >= min_minor,
-        None => false,
-    }
-}
-
-fn claude_family_version(normalized_model_name: &str, family: &str) -> Option<(i32, i32)> {
-    let parts = normalized_model_name
-        .split('-')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    let family_index = parts.iter().position(|part| *part == family)?;
-
-    let before_family = take_last_version_parts(&parts[..family_index]);
-    if let Some(version) = numeric_version(&before_family) {
-        return Some(version);
-    }
-
-    let after_family = take_first_version_parts(&parts[family_index + 1..]);
-    numeric_version(&after_family)
-}
-
-fn take_last_version_parts(parts: &[&str]) -> Vec<String> {
-    let mut version_parts = parts
-        .iter()
-        .rev()
-        .take_while(|part| is_version_part(part))
-        .map(|part| (*part).to_string())
-        .collect::<Vec<_>>();
-    version_parts.reverse();
-    let start = version_parts.len().saturating_sub(2);
-    version_parts[start..].to_vec()
-}
-
-fn take_first_version_parts(parts: &[&str]) -> Vec<String> {
-    parts
-        .iter()
-        .take_while(|part| is_version_part(part))
-        .take(2)
-        .map(|part| (*part).to_string())
-        .collect()
-}
-
-fn is_version_part(value: &str) -> bool {
-    value.len() < 8 && value.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn numeric_version(parts: &[String]) -> Option<(i32, i32)> {
-    let major = parts.first()?.parse::<i32>().ok()?;
-    let minor = match parts.get(1) {
-        Some(value) => value.parse::<i32>().ok()?,
-        None => 0,
+/// Makes room for a thinking budget, which Anthropic counts inside `max_tokens` and which must
+/// stay below it. The default grows to hold the budget; a `max_tokens` the user set does not.
+fn fit_max_tokens_to_thinking_budget(
+    object: &mut Map<String, Value>,
+    parameters: &[operit_model::ModelParameter::ModelParameter<Value>],
+) -> Result<(), AiServiceError> {
+    let Some(budget) = object
+        .get("thinking")
+        .and_then(|thinking| thinking.get("budget_tokens"))
+        .and_then(Value::as_i64)
+    else {
+        return Ok(());
     };
-    Some((major, minor))
+    let Some(max_tokens) = object.get("max_tokens").and_then(Value::as_i64) else {
+        return Ok(());
+    };
+    if max_tokens > budget {
+        return Ok(());
+    }
+    let user_set = parameters
+        .iter()
+        .any(|parameter| parameter.isEnabled && parameter.apiName == "max_tokens");
+    if user_set {
+        return Err(AiServiceError::RequestFailed(format!(
+            "max_tokens ({max_tokens}) must be larger than the thinking budget ({budget}); \
+             lower the thinking level or raise max_tokens"
+        )));
+    }
+    object.insert("max_tokens".to_string(), json!(budget + DEFAULT_MAX_TOKENS));
+    Ok(())
 }
 
 fn append_converter_events(chunks: &mut Vec<String>, events: Vec<StreamingJsonXmlEvent>) {
@@ -1280,54 +1370,40 @@ fn stable_id_hash_part(raw: &str) -> String {
     chars.iter().rev().collect()
 }
 
-fn xml_unescape(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+#[cfg(test)]
+#[path = "../../../../tests/ClaudeProviderTests.rs"]
+mod tests;
+
+/// Canonicalizes object keys while preserving array/content block order.
+fn stable_json_value(value: &Value) -> String {
+    match value {
+        Value::Object(object) => {
+            let mut keys: Vec<_> = object.keys().collect();
+            keys.sort();
+            let fields: Vec<_> = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("JSON key"),
+                        stable_json_value(&object[key])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(stable_json_value)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        _ => value.to_string(),
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::ClaudeProvider;
-    use crate::chat::llmprovider::MediaLinkBuilder::MediaLinkBuilder;
-    use operit_util::ImagePoolManager::ImagePoolManager;
-
-    /// Creates a Claude provider for content-block conversion tests.
-    fn test_provider() -> ClaudeProvider {
-        ClaudeProvider::new(
-            "http://localhost".to_string(),
-            String::new(),
-            "claude-test".to_string(),
-            "CLAUDE".to_string(),
-            Vec::new(),
-            true,
-        )
-    }
-
-    /// Verifies image media links become Claude base64 image blocks.
-    #[test]
-    fn imageLinksBecomeClaudeImageBlocks() {
-        ImagePoolManager::clear();
-        let image_id = ImagePoolManager::add_image_bytes(
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01",
-            Some("image/png"),
-            None,
-        );
-        let prompt = format!("look {}", MediaLinkBuilder::image(&image_id));
-        let provider = test_provider();
-
-        let content = provider.build_content_array(&prompt);
-        let blocks = content.as_array().expect("Claude content must be an array");
-
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["type"], "image");
-        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
-        assert!(!blocks[0]["source"]["data"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty());
-        assert_eq!(blocks[1]["text"], "look");
-    }
-}
+#[path = "../../../../tests/ClaudeProviderCacheTests.rs"]
+mod cache_tests;

@@ -1,7 +1,8 @@
+use crate::process::background_command;
+
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 use globset::GlobBuilder;
@@ -25,6 +26,11 @@ impl WindowsFileSystemHost {
 }
 
 impl FileSystemHost for WindowsFileSystemHost {
+    /// Keeps the descriptor open for repeated log appends.
+    fn openAppendFile(&self, path: &str) -> HostResult<Box<dyn operit_host_api::FileAppendHandle>> {
+        self.validatePath(path, "path")?;
+        operit_host_native_common::NativeFileAppendHandle::open(path)
+    }
     fn envLabel(&self) -> &str {
         "windows"
     }
@@ -91,6 +97,26 @@ impl FileSystemHost for WindowsFileSystemHost {
         fs::read(path).map_err(HostError::from)
     }
 
+    fn readFileBytesRange(&self, path: &str, offset: u64, length: usize) -> HostResult<Vec<u8>> {
+        self.validateReadableFile(path)?;
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buffer = vec![0u8; length];
+        let mut read = 0;
+        loop {
+            let readCount = file.read(&mut buffer[read..])?;
+            if readCount == 0 {
+                break;
+            }
+            read += readCount;
+            if read == buffer.len() {
+                break;
+            }
+        }
+        buffer.truncate(read);
+        Ok(buffer)
+    }
+
     fn writeFile(&self, path: &str, content: &str, append: bool) -> HostResult<()> {
         self.validatePath(path, "path")?;
         ensure_parent_directory(path)?;
@@ -110,6 +136,14 @@ impl FileSystemHost for WindowsFileSystemHost {
         self.validatePath(path, "path")?;
         ensure_parent_directory(path)?;
         fs::write(path, content).map_err(HostError::from)
+    }
+
+    fn appendFileBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        self.validatePath(path, "path")?;
+        ensure_parent_directory(path)?;
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(content)?;
+        Ok(())
     }
 
     fn deleteFile(&self, path: &str, recursive: bool) -> HostResult<()> {
@@ -414,17 +448,52 @@ impl FileSystemHost for WindowsFileSystemHost {
         Ok(())
     }
 
+    /// Opens one file on Host-owned isolated COM capacity.
     fn openFile(&self, path: &str) -> HostResult<()> {
         self.validateReadableFile(path)?;
-        let status = Command::new("cmd")
-            .args(["/C", "start", "", path])
-            .status()?;
-        if !status.success() {
-            return Err(HostError::new(format!(
-                "Failed to open file with system default application: {path}"
-            )));
+        // The filename is data, not a cmd.exe command (spaces, %, &, and Unicode are valid).
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::System::Com::{
+                CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+            };
+            use windows_sys::Win32::UI::Shell::ShellExecuteW;
+            use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+            let path = path.to_string();
+            // Shell extensions can require STA; do not change a runtime worker's COM apartment.
+            operit_host_native_common::NativeHostRuntimeTaskSchedulerHost::new().runPlatformTask("windows-file-open", move || {
+                let initialized = unsafe {
+                    CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32)
+                };
+                if initialized < 0 {
+                    return Err(HostError::new(format!("Failed to initialize file opener COM apartment: {initialized}")));
+                }
+                struct Apartment;
+                impl Drop for Apartment {
+                    /// Releases COM state before the shared platform worker is reused.
+                    fn drop(&mut self) { unsafe { CoUninitialize() }; }
+                }
+                let _apartment = Apartment;
+                let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+                let filename: Vec<u16> = std::ffi::OsStr::new(&path)
+                    .encode_wide().chain(Some(0)).collect();
+                let result = unsafe {
+                    ShellExecuteW(std::ptr::null_mut(), operation.as_ptr(), filename.as_ptr(),
+                        std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+                } as isize;
+                if result <= 32 {
+                    return Err(HostError::new(format!(
+                        "Failed to open file with system default application (ShellExecute error {result}): {path}"
+                    )));
+                }
+                Ok(())
+            })
         }
-        Ok(())
+        #[cfg(not(target_os = "windows"))]
+        Err(HostError::new(
+            "Windows file opening is only available on Windows",
+        ))
     }
 
     fn shareFile(&self, path: &str, _title: &str) -> HostResult<()> {
@@ -456,7 +525,7 @@ $item.InvokeVerb("share")
             folder = powershell_string_literal(&parent.display().to_string()),
             file_name = powershell_string_literal(fileName),
         );
-        let output = Command::new("powershell.exe")
+        let output = background_command("powershell.exe")
             .arg("-NoProfile")
             .arg("-Command")
             .arg(script)

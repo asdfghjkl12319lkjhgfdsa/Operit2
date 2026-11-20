@@ -77,9 +77,14 @@ fn buildOperit2CharacterCards(
             preferences,
             &format!("character_card_{id}_chat_model_binding_mode"),
         )?;
-        let chatModelId = resolveOperit1CharacterChatModelId(parsed, preferences, &id)?;
+        let (chatProviderId, chatModelId) =
+            match resolveOperit1CharacterChatModelBinding(parsed, preferences, &id)? {
+                Some((provider, model)) => (Some(provider), Some(model)),
+                None => (None, None),
+            };
         let memoryBinding = resolveOperit1CharacterMemoryBinding(parsed, preferences, &id)?;
         cards.push(CharacterCard {
+            chatProviderId,
             id: id.clone(),
             name: name.to_string(),
             description: optionalPreferenceString(
@@ -144,7 +149,7 @@ fn buildOperit2CharacterCards(
                 preferences,
                 &format!("character_card_{id}_is_default"),
             )?
-            .unwrap_or(id == CharacterCardManager::DEFAULT_CHARACTER_CARD_ID),
+            .unwrap_or(id == OPERIT1_SOURCE_DEFAULT_CHARACTER_CARD_ID),
             createdAt: optionalPreferenceI64(
                 preferences,
                 &format!("character_card_{id}_created_at"),
@@ -176,7 +181,7 @@ fn buildOperit1CharacterCardAvatarUris(
         if value.trim().is_empty() {
             continue;
         }
-        if cardId == CharacterCardManager::DEFAULT_CHARACTER_CARD_ID
+        if cardId == OPERIT1_SOURCE_DEFAULT_CHARACTER_CARD_ID
             && value.trim() == OPERIT1_DEFAULT_AI_AVATAR_URI
         {
             continue;
@@ -298,7 +303,7 @@ mod tests {
     /// Leaves Operit1's built-in default avatar unassigned for the Operit2 default avatar component.
     #[test]
     fn leaves_operit1_builtin_default_avatar_unassigned() {
-        let cardId = CharacterCardManager::DEFAULT_CHARACTER_CARD_ID;
+        let cardId = OPERIT1_SOURCE_DEFAULT_CHARACTER_CARD_ID;
         let cardIds = vec![cardId.to_string()];
         let mut preferences = HashMap::new();
         preferences.insert(
@@ -326,24 +331,19 @@ struct Operit1CharacterMemoryBinding {
 
 #[derive(Clone, Debug, Deserialize)]
 #[allow(non_snake_case)]
-struct Operit1UserPreferenceProfile {
+struct Operit1MemorySpace {
     id: String,
     name: String,
+    #[serde(default = "enabledProfileUpdates")]
+    profileAutoUpdateEnabled: bool,
     #[serde(default)]
-    birthDate: i64,
-    #[serde(default)]
-    gender: String,
-    #[serde(default)]
-    personality: String,
-    #[serde(default)]
-    identity: String,
-    #[serde(default)]
-    occupation: String,
-    #[serde(default)]
-    aiStyle: String,
-    #[serde(default)]
-    isInitialized: bool,
+    profileAutoUpdateLocked: bool,
+    #[serde(skip)]
+    userMarkdownEntry: Option<String>,
 }
+
+/// Matches the released memory-space schema's initial profile update setting.
+fn enabledProfileUpdates() -> bool { true }
 
 #[allow(non_snake_case)]
 fn resolveOperit1CharacterMemoryBinding(
@@ -407,41 +407,6 @@ fn collectOperit1CharacterMemoryProfileBindings(
 }
 
 #[allow(non_snake_case)]
-fn collectOperit1MemoryProfileIds(
-    parsed: &ParsedOperit1Snapshot,
-) -> Result<BTreeSet<String>, String> {
-    let mut ids = BTreeSet::new();
-    ids.insert(OPERIT1_DEFAULT_PROFILE_ID.to_string());
-    ids.extend(collectOperit1ObjectBoxProfileIds(parsed)?);
-    for profileId in collectOperit1CharacterMemoryProfileBindings(parsed)?.values() {
-        ids.insert(profileId.clone());
-    }
-    Ok(ids)
-}
-
-#[allow(non_snake_case)]
-fn collectOperit1ObjectBoxProfileIds(
-    parsed: &ParsedOperit1Snapshot,
-) -> Result<BTreeSet<String>, String> {
-    let mut ids = BTreeSet::new();
-    for entry in parsed.archive.entries.keys() {
-        if entry == ENTRY_OBJECTBOX_DEFAULT_DATA {
-            ids.insert(OPERIT1_DEFAULT_PROFILE_ID.to_string());
-            continue;
-        }
-        let Some(rest) = entry.strip_prefix("payload/files/objectbox_") else {
-            continue;
-        };
-        let Some(profileId) = rest.strip_suffix("/data.mdb") else {
-            continue;
-        };
-        validateOperit1ProfileId(profileId)?;
-        ids.insert(profileId.to_string());
-    }
-    Ok(ids)
-}
-
-#[allow(non_snake_case)]
 fn operit1ObjectBoxEntryForProfile(profileId: &str) -> String {
     if profileId == OPERIT1_DEFAULT_PROFILE_ID {
         ENTRY_OBJECTBOX_DEFAULT_DATA.to_string()
@@ -472,22 +437,6 @@ fn operit1SharedMemoryStoreId(profileId: &str) -> String {
 }
 
 #[allow(non_snake_case)]
-fn operit1SharedMemoryStoreName(
-    parsed: &ParsedOperit1Snapshot,
-    profileId: &str,
-) -> Result<String, String> {
-    let profiles = buildOperit1UserPreferenceProfiles(parsed)?;
-    let profile = profiles
-        .get(profileId)
-        .ok_or_else(|| format!("Operit1 用户偏好缺少记忆库名称来源：{profileId}"))?;
-    let profileName = profile.name.trim();
-    if profileName.is_empty() {
-        return Err(format!("Operit1 用户偏好名称为空：{profileId}"));
-    }
-    Ok(format!("Operit1 记忆库 - {profileName}"))
-}
-
-#[allow(non_snake_case)]
 /// Reads the selected Operit1 memory-space identifier from the user preferences payload.
 fn operit1ActiveProfileId(parsed: &ParsedOperit1Snapshot) -> Result<String, String> {
     let preferences = parsed
@@ -498,7 +447,7 @@ fn operit1ActiveProfileId(parsed: &ParsedOperit1Snapshot) -> Result<String, Stri
     let value = requiredPreferenceString(
         preferences,
         KEY_ACTIVE_MEMORY_SPACE_ID,
-        "Operit1 用户偏好缺少当前记忆库 ID",
+        "快照缺少当前记忆库 ID，请使用最新版 Operit1 完成升级后重新导出快照",
     )?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -509,21 +458,19 @@ fn operit1ActiveProfileId(parsed: &ParsedOperit1Snapshot) -> Result<String, Stri
 }
 
 #[allow(non_snake_case)]
-/// Builds Operit1 user preference profiles from the released memory-space schema.
-fn buildOperit1UserPreferenceProfiles(
+/// Adopts registered spaces and live database bindings, matching Kotlin's direct ObjectBox access by ID.
+fn buildOperit1MemorySpaces(
     parsed: &ParsedOperit1Snapshot,
-) -> Result<BTreeMap<String, Operit1UserPreferenceProfile>, String> {
-    let Some(preferences) = parsed
+) -> Result<BTreeMap<String, Operit1MemorySpace>, String> {
+    let preferences = parsed
         .archive
         .datastorePreferences
         .get(ENTRY_USER_PREFERENCES)
-    else {
-        return Ok(BTreeMap::new());
-    };
+        .ok_or_else(|| "快照缺少用户偏好，请使用最新版 Operit1 重新导出快照".to_string())?;
     let profileIds = requiredPreferenceStringList(
         preferences,
         KEY_MEMORY_SPACE_LIST,
-        "Operit1 用户偏好缺少记忆库列表",
+        "快照缺少记忆库列表，请使用最新版 Operit1 完成升级后重新导出快照",
     )?;
     let mut profiles = BTreeMap::new();
     for profileId in profileIds {
@@ -534,7 +481,7 @@ fn buildOperit1UserPreferenceProfiles(
             &key,
             &format!("Operit1 用户偏好缺少记忆库配置：{profileId}"),
         )?;
-        let profile: Operit1UserPreferenceProfile = serde_json::from_str(raw)
+        let mut profile: Operit1MemorySpace = serde_json::from_str(raw)
             .map_err(|error| format!("Operit1 记忆库配置格式不正确：{profileId}: {error}"))?;
         if profile.id != profileId {
             return Err(format!(
@@ -542,75 +489,80 @@ fn buildOperit1UserPreferenceProfiles(
                 profile.id
             ));
         }
-        profiles.insert(profile.id.clone(), profile);
+        if profile.name.trim().is_empty() {
+            return Err(format!("Operit1 记忆库名称为空：{profileId}"));
+        }
+        profile.userMarkdownEntry = Some(operit1UserMarkdownEntry(&profileId));
+        if profiles.insert(profile.id.clone(), profile).is_some() {
+            return Err(format!("Operit1 记忆库 ID 重复：{profileId}"));
+        }
+    }
+    let bindings = collectOperit1CharacterMemoryProfileBindings(parsed)?;
+    for profileId in std::iter::once(operit1ActiveProfileId(parsed)?)
+        .chain(bindings.into_values())
+    {
+        validateOperit1ProfileId(&profileId)?;
+        if profiles.contains_key(&profileId) {
+            continue;
+        }
+        let databaseEntry = operit1ObjectBoxEntryForProfile(&profileId);
+        if !parsed.archive.hasEntry(&databaseEntry) {
+            return Err(format!("Operit1 引用的记忆库缺少注册信息和数据库：{profileId}"));
+        }
+        let documentEntry = operit1UserMarkdownEntry(&profileId);
+        // The database identity survives even when its registry metadata and profile document do not.
+        profiles.insert(profileId.clone(), Operit1MemorySpace {
+            id: profileId.clone(),
+            name: profileId.clone(),
+            profileAutoUpdateEnabled: enabledProfileUpdates(),
+            profileAutoUpdateLocked: false,
+            userMarkdownEntry: parsed.archive.hasEntry(&documentEntry).then_some(documentEntry),
+        });
+        AppLogger::i("Operit1SnapshotImport", &format!(
+            "Adopting referenced ObjectBox database without registry metadata: {profileId}"
+        ));
     }
     Ok(profiles)
 }
 
 #[allow(non_snake_case)]
-/// Builds a Markdown memory document from one Operit1 profile record.
-fn buildOperit2UserMarkdown(profile: &Operit1UserPreferenceProfile) -> Result<String, String> {
-    let mut lines = Vec::new();
-    lines.push(format!("## Operit1 用户偏好 - {}", profile.name.trim()));
-    lines.push(String::new());
-    pushMarkdownField(&mut lines, "配置 ID", &profile.id);
-    if profile.birthDate > 0 {
-        lines.push(format!(
-            "- 出生日期：{}",
-            epochMillisToLocalDateString(profile.birthDate)?
-        ));
-    }
-    pushMarkdownField(&mut lines, "性别", &profile.gender);
-    pushMarkdownField(&mut lines, "性格特点", &profile.personality);
-    pushMarkdownField(&mut lines, "身份认同", &profile.identity);
-    pushMarkdownField(&mut lines, "职业", &profile.occupation);
-    pushMarkdownField(&mut lines, "期待的 AI 风格", &profile.aiStyle);
-    Ok(lines.join("\n"))
+/// Returns the current per-memory-space profile document entry.
+fn operit1UserMarkdownEntry(profileId: &str) -> String {
+    format!("payload/files/memory-space-profiles/{profileId}/user.md")
 }
 
-#[allow(non_snake_case)]
-fn pushMarkdownField(lines: &mut Vec<String>, label: &str, value: &str) {
-    let trimmed = value.trim();
-    if !trimmed.is_empty() {
-        lines.push(format!("- {label}：{trimmed}"));
+/// Validates documents for adopted spaces; registered spaces must retain their declared document.
+fn validateOperit1MemorySpaces(parsed: &ParsedOperit1Snapshot) -> Result<(), String> {
+    let spaces = buildOperit1MemorySpaces(parsed)?;
+    for entry in spaces.values().filter_map(|space| space.userMarkdownEntry.as_ref()) {
+        let metadata = parsed.archive.entries.get(entry).ok_or_else(|| {
+            format!("快照缺少记忆库用户文档：{entry}，请使用最新版 Operit1 完成升级后重新导出快照")
+        })?;
+        // Operit1 limits each document to 12,000 UTF-16 code units.
+        if metadata.uncompressedSize > 48_000 {
+            return Err(format!("Operit1 记忆库用户文档超过大小限制：{entry}"));
+        }
+        let mut bytes = Vec::new();
+        parsed.copyEntryTo(entry, &mut bytes)?;
+        let markdown = std::str::from_utf8(&bytes)
+            .map_err(|error| format!("Operit1 记忆库用户文档不是 UTF-8：{entry}: {error}"))?;
+        if markdown.encode_utf16().count() > 12_000 {
+            return Err(format!("Operit1 记忆库用户文档超过字符限制：{entry}"));
+        }
     }
+    Ok(())
 }
 
-#[allow(non_snake_case)]
-fn appendSharedUserMarkdown(
-    storageHost: &dyn RuntimeStorageHost,
-    profileId: &str,
-    importedMarkdown: &str,
-) -> Result<(), String> {
-    let storeId = operit1SharedMemoryStoreId(profileId);
-    let path = format!(
-        "{}/{}/USER.md",
-        DATA_MEMORY_SHARED_DIR_PATH.trim_end_matches('/'),
-        sanitizeMemoryOwnerId(&storeId)
-    );
-    let current = if storageHost
-        .exists(&path)
-        .map_err(|error| error.to_string())?
-    {
-        String::from_utf8(
-            storageHost
-                .readBytes(&path)
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?
-    } else {
-        "# USER\n\n".to_string()
-    };
-    let mut next = current.trim().to_string();
-    let imported = importedMarkdown.trim();
-    if !next.is_empty() {
-        next.push_str("\n\n");
+/// Reads a space's source document, including the absent document of an unregistered database.
+fn readOperit1UserMarkdown(
+    parsed: &ParsedOperit1Snapshot,
+    profile: &Operit1MemorySpace,
+) -> Result<Vec<u8>, String> {
+    let mut document = Vec::new();
+    if let Some(entry) = &profile.userMarkdownEntry {
+        parsed.copyEntryTo(entry, &mut document)?;
     }
-    next.push_str(imported);
-    next.push('\n');
-    storageHost
-        .writeBytes(&path, next.as_bytes())
-        .map_err(|error| error.to_string())
+    Ok(document)
 }
 
 #[allow(non_snake_case)]
@@ -653,7 +605,20 @@ fn buildOperit2CharacterGroups(
     Ok(groups)
 }
 
+/// Identifies the source that owns a legacy speech configuration field.
+enum Operit1TtsConfigSource {
+    Preferences,
+    ProviderCatalog,
+}
+
+/// Describes how a legacy voice identifier maps to the target provider contract.
+enum Operit1TtsVoiceFormat {
+    Literal,
+    ModelQualified,
+}
+
 #[allow(non_snake_case)]
+/// Migrates each legacy speech service using its provider's request contract.
 fn buildOperit2TtsConfig(parsed: &ParsedOperit1Snapshot) -> Result<Option<TtsConfig>, String> {
     let Some(preferences) = parsed
         .archive
@@ -688,17 +653,39 @@ fn buildOperit2TtsConfig(parsed: &ParsedOperit1Snapshot) -> Result<Option<TtsCon
             updatedAt: now,
         }));
     }
-    let httpConfigRaw = requiredPreferenceString(
-        preferences,
-        "tts_http_config",
-        &format!("Operit1 TTS 服务缺少 HTTP 配置：{serviceType}"),
-    )?;
-    let httpConfig: Operit1TtsHttpConfig = serde_json::from_str(httpConfigRaw)
+    let httpConfigRaw = match optionalPreferenceString(preferences, "tts_http_config")? {
+        Some(raw) => raw,
+        // Kotlin's absent HTTP preset has an empty URL and represents an unconfigured service.
+        None if serviceType == "HTTP_TTS" => return Ok(None),
+        None => return Err(format!("Operit1 TTS 服务缺少 HTTP 配置：{serviceType}")),
+    };
+    let httpConfig: Operit1TtsHttpConfig = serde_json::from_str(&httpConfigRaw)
         .map_err(|error| format!("Operit1 TTS HTTP 配置格式不正确：{error}"))?;
-    Ok(Some(TtsConfig {
+    // Kotlin permits saving an empty HTTP URL and validates it only when speech initializes.
+    // It is not a usable provider to adopt, so leave the target speech selection untouched.
+    if serviceType == "HTTP_TTS" && httpConfig.urlTemplate.trim().is_empty() {
+        AppLogger::i(
+            "Operit1SnapshotImport",
+            "Source HTTP TTS is unconfigured; no speech configuration to import",
+        );
+        return Ok(None);
+    }
+    use Operit1TtsConfigSource::{Preferences, ProviderCatalog};
+    use Operit1TtsVoiceFormat::{Literal, ModelQualified};
+    // Declare source-field ownership once; the conversion below follows these contracts uniformly.
+    let (providerType, requestSource, endpointSource, voiceFormat) = match serviceType {
+        "HTTP_TTS" => (TtsProviderType::HTTP_TTS, Preferences, Preferences, Literal),
+        "OPENAI_TTS" => ("OPENAI_COMPATIBLE", ProviderCatalog, Preferences, Literal),
+        "SILICONFLOW_TTS" => (serviceType, ProviderCatalog, ProviderCatalog, ModelQualified),
+        "MINIMAX_TTS" | "MIMO_TTS" | "DOUBAO_TTS" => {
+            (serviceType, ProviderCatalog, Preferences, Literal)
+        }
+        other => return Err(format!("不支持迁移的 Operit1 TTS 服务类型：{other}")),
+    };
+    let mut config = TtsConfig {
         id: String::new(),
         name: format!("Operit1 {serviceType}"),
-        providerType: TtsProviderType::HTTP_TTS.to_string(),
+        providerType: providerType.to_string(),
         endpoint: httpConfig.urlTemplate,
         apiKey: httpConfig.apiKey,
         model: httpConfig.modelName,
@@ -728,10 +715,40 @@ fn buildOperit2TtsConfig(parsed: &ParsedOperit1Snapshot) -> Result<Option<TtsCon
             .collect(),
         createdAt: now,
         updatedAt: now,
-    }))
+    };
+    if matches!(requestSource, ProviderCatalog) {
+        let catalog = TtsCatalog::provider(providerType)?;
+        config.endpoint = match endpointSource {
+            Preferences => config.endpoint,
+            ProviderCatalog => catalog.defaultEndpoint,
+        };
+        config.responseFormat = catalog.defaultResponseFormat;
+        config.httpMethod = catalog.defaultHttpMethod;
+        config.requestBody = catalog.defaultRequestBody;
+        config.contentType = catalog.defaultContentType;
+        config.responsePipeline = catalog.defaultResponsePipeline;
+        for header in catalog.defaultHeaders {
+            config
+                .headers
+                .retain(|existing| !existing.name.eq_ignore_ascii_case(&header.name));
+            config.headers.push(header);
+        }
+    }
+    // Resolve the same canonical fields used by storage before matching an existing import.
+    let mut config = normalizeTtsConfig(config)
+        .map_err(|error| format!("导入 Operit1 TTS 配置失败：{error}"))?;
+    config.voice = match voiceFormat {
+        Literal => config.voice,
+        ModelQualified => match config.voice.split_once(':') {
+            Some(_) => config.voice,
+            None => format!("{}:{}", config.model, config.voice),
+        },
+    };
+    Ok(Some(config))
 }
 
 #[allow(non_snake_case)]
+/// Persists the migrated provider configuration and selects it for speech playback.
 fn importOperit1TtsConfig(manager: &TtsConfigManager, config: TtsConfig) -> Result<(), String> {
     let existing = manager
         .getAllTtsConfigs()
@@ -789,12 +806,12 @@ struct Operit1TtsHttpResponsePipelineStep {
 }
 
 #[allow(non_snake_case)]
-/// Resolves one character card fixed chat-model binding into a current model id.
-fn resolveOperit1CharacterChatModelId(
+/// Resolves fixed character models with the same missing-binding policy as function models.
+fn resolveOperit1CharacterChatModelBinding(
     parsed: &ParsedOperit1Snapshot,
     preferences: &HashMap<String, Operit1PreferenceValue>,
     cardId: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, String)>, String> {
     let bindingMode = optionalPreferenceString(
         preferences,
         &format!("character_card_{cardId}_chat_model_binding_mode"),
@@ -802,24 +819,22 @@ fn resolveOperit1CharacterChatModelId(
     if bindingMode.as_deref() != Some("FIXED_CONFIG") {
         return Ok(None);
     }
-    let configId = requiredPreferenceString(
+    let configId = optionalPreferenceString(
         preferences,
         &format!("character_card_{cardId}_chat_model_config_id"),
-        &format!("Operit1 角色卡固定模型缺少配置 ID：{cardId}"),
-    )?;
+    )?.unwrap_or_default();
     let modelIndex = optionalPreferenceI32(
         preferences,
         &format!("character_card_{cardId}_chat_model_index"),
     )?
-    .unwrap_or(0)
-    .max(0);
-    let config = parsed.configById(configId)?;
+    .unwrap_or(0);
+    let (config, modelIndex) = parsed.resolveModelBinding(&configId, modelIndex)?;
     let modelIds = splitModelIds(&config.modelName);
     modelIds
         .get(modelIndex as usize)
         .cloned()
-        .map(Some)
-        .ok_or_else(|| format!("Operit1 角色卡模型索引越界：{cardId}/{modelIndex}"))
+        .map(|modelId| Some((operit1ProviderId(&config.id), modelId)))
+        .ok_or_else(|| format!("Operit1 角色卡绑定的配置没有模型：{cardId}/{configId}"))
 }
 
 #[allow(non_snake_case)]

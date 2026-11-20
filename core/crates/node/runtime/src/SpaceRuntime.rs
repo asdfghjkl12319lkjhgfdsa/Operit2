@@ -1,8 +1,4 @@
-use operit_link::{
-    CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream, CoreLinkError,
-    CoreStreamAttachment, CoreStreamSource, CoreValue, CoreWatchRequest,
-    CORE_STREAM_TARGET,
-};
+use operit_link::{CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream, CoreLinkError, CoreStreamAttachment, CoreStreamSource, CoreValue, CoreWatchRequest, CORE_STREAM_TARGET};
 use operit_runtime::core::chat::ChatRuntimeHolder::ChatRuntimeHolder;
 use operit_runtime::core::chat::ChatRuntimeSlot::ChatRuntimeSlot;
 use serde::de::DeserializeOwned;
@@ -35,7 +31,7 @@ impl SpaceStreamPool {
         let mut sources = self
             .sources
             .lock()
-            .expect("Space stream pool mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !sources.contains_key(&attachment.streamId) {
             sources.insert(attachment.streamId, attachment.source);
         }
@@ -66,6 +62,20 @@ impl SpaceRuntime {
         let (result, attachments) = operit_link::withCoreStreamCapture({
             let holder = self.chatRuntimeHolder.clone();
             async move {
+                if matches!(request.methodName.as_str(), "callToolPkgRoute" | "watchToolPkgRoute" | "pushToolPkgRoute") {
+                    let handler = {
+                        let mut holder = holder.lock().await;
+                        holder.getCore(ChatRuntimeSlot::MAIN).toolPkgRouteHost()
+                    };
+                    return operit_tools::tools::packTool::ToolPkgRouteRuntime::dispatch(handler, &request.methodName, request.args).await;
+                }
+                if crate::generated_space_call_is_owned(&request.methodName) {
+                    let pending = {
+                        let mut holder = holder.lock().await;
+                        crate::generated_space_capture_call(holder.getCore(ChatRuntimeSlot::MAIN), request)
+                    };
+                    return pending.await;
+                }
                 let mut holder = holder.lock().await;
                 let core = holder.getCore(ChatRuntimeSlot::MAIN);
                 crate::generated_space_call_on_chat_core(core, request).await
@@ -170,7 +180,7 @@ impl SpaceRuntime {
             .streamPool
             .sources
             .lock()
-            .expect("Space stream pool mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&streamId)
             .cloned()
             .ok_or_else(|| CoreLinkError::watchNotFound(&request.registryKey()))?;
@@ -185,4 +195,55 @@ fn decodeArgument<T: DeserializeOwned>(
 ) -> Result<T, CoreLinkError> {
     operit_link::fromCoreValue(args.remove(name).unwrap_or(CoreValue::Null))
         .map_err(|error| CoreLinkError::new("INVALID_ARGS", format!("{name}: {error}")))
+}
+
+/// Full Core supplies chat execution through the existing Link service boundary.
+/// The shared router does not need to know or construct ChatRuntimeHolder.
+#[async_trait::async_trait(?Send)]
+impl operit_link::CoreLinkSharedClient for SpaceRuntime {
+    async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
+        SpaceRuntime::call(self, request).await
+    }
+
+    async fn watchSnapshot(&self, request: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
+        SpaceRuntime::watchSnapshot(self, request).await
+    }
+
+    async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+        SpaceRuntime::watch(self, request).await
+    }
+
+    /// Opens an annotated plugin consumer after the router has authorized its Binding.
+    async fn openPush(
+        &self,
+        request: operit_link::CorePushRequest,
+    ) -> Result<Box<dyn operit_link::CoreLinkPushSession>, operit_link::CoreLinkError> {
+        let route = crate::generated_space_push_route(&request)
+            .ok_or_else(|| CoreLinkError::methodNotFound(&format!("{}::{}", request.target, request.methodName)))?;
+        if route.methodName != "pushToolPkgRoute" {
+            return crate::generated_space_push_on_chat_core(self.chatRuntimeHolder.clone(), request);
+        }
+        let args = operit_tools::tools::packTool::ToolPkgRouteRuntime::decode(request.args)?;
+        operit_tools::tools::packTool::ToolPkgRouteRuntime::requireSpacePackage(&args.package_name).map_err(CoreLinkError::internal)?;
+        let input = args.input_index.ok_or_else(|| CoreLinkError::new("INVALID_ARGS", "Push input index is required"))?;
+        let handler = {
+            let mut holder = self.chatRuntimeHolder.lock().await;
+            holder.getCore(ChatRuntimeSlot::MAIN).toolPkgRouteHost()
+        };
+        let (sender, values) = operit_rslink_runtime::core_reverse_stream_channel::<serde_json::Value>();
+        let (mut completion, result) = tokio::sync::oneshot::channel();
+        let payload = serde_json::json!({ "op":"pushOpen", "bindingKey":args.binding_key, "methodName":args.method_name, "arguments":args.arguments, "inputIndex":input });
+        operit_host_api::HostRuntimeTaskSchedulerHost::scheduleHostRuntimeAsyncTask(
+            operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost().as_ref(),
+            "operit-plugin-reverse-stream", Box::new(move || Box::pin(async move {
+                let outcome = tokio::select! {
+                    biased;
+                    _ = completion.closed() => return,
+                    outcome = operit_tools::tools::packTool::ToolPkgRouteRuntime::consume(handler, args.package_name, payload, values) => outcome.map_err(CoreLinkError::internal),
+                };
+                let _ = completion.send(outcome);
+            })),
+        ).map_err(|error| CoreLinkError::internal(error.to_string()))?;
+        Ok(Box::new(operit_rslink_runtime::CoreReverseStreamSession::new(sender, result)))
+    }
 }

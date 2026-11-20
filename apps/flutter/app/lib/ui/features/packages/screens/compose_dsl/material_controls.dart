@@ -3,7 +3,7 @@
 part of '../ToolPkgUiLauncherScreen.dart';
 
 /// Renders material controls for Compose DSL nodes.
-extension _ComposeMaterialControls on _ComposeDslRenderer {
+extension _ComposeMaterialControls on _ComposeProgramExecutorState {
   /// Builds button for the Compose DSL renderer.
   Widget _button(BuildContext context, String type) {
     final contentChildren = _slotChildren(
@@ -14,12 +14,12 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
     final child = contentChildren.isNotEmpty
         ? Row(mainAxisSize: MainAxisSize.min, children: contentChildren)
         : Text(
-            _string(node.props['text']).isEmpty
+            _string(props['text']).isEmpty
                 ? type
-                : _string(node.props['text']),
+                : _string(props['text']),
           );
     final onPressed = _enabled()
-        ? () => _invokeAction(node.props['onClick'])
+        ? () => _invokeAction(props['onClick'])
         : null;
     final style = _buttonStyle(context);
     switch (type) {
@@ -41,9 +41,9 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
   /// Builds card for the Compose DSL renderer.
   Widget _card(BuildContext context, String type) {
     final defaultRadius = type == 'Card' ? BorderRadius.circular(12) : null;
-    final radius = _borderRadius(node.props['shape']) ?? defaultRadius;
+    final radius = _borderRadius(props['shape']) ?? defaultRadius;
     final borderSide =
-        _borderSide(context, node.props['border']) ??
+        _borderSide(context, props['border']) ??
         (type == 'OutlinedCard'
             ? BorderSide(color: Theme.of(context).colorScheme.outlineVariant)
             : null);
@@ -51,20 +51,47 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
       context,
       contentColor: _colorWithAlpha(
         context,
-        node.props['contentColor'],
-        node.props['contentAlpha'],
+        props['contentColor'],
+        props['contentAlpha'],
       ),
-      contentPadding: node.props['contentPadding'],
+      contentPadding: props['contentPadding'],
     );
+    final themeSurface = props['themeSurface'];
+    if (themeSurface != null) {
+      final layer = switch (themeSurface) {
+        'panel' => OperitGlassSurfaceLayer.panel,
+        'card' => OperitGlassSurfaceLayer.card,
+        'control' => OperitGlassSurfaceLayer.control,
+        _ => throw FormatException(
+          'Unknown theme surface layer: $themeSurface',
+        ),
+      };
+      final color = _colorWithAlpha(
+        context,
+        props['containerColor'],
+        props['containerAlpha'] ?? props['alpha'],
+      );
+      if (color == null) {
+        throw const FormatException('Themed cards require a containerColor');
+      }
+      return OperitGlassSurface(
+        color: color,
+        layer: layer,
+        borderRadius: radius ?? BorderRadius.zero,
+        border: borderSide == null ? null : Border.fromBorderSide(borderSide),
+        material: props['material'] as bool? ?? true,
+        child: child,
+      );
+    }
     return Card(
       margin: EdgeInsets.zero,
       color: _colorWithAlpha(
         context,
-        node.props['containerColor'],
-        node.props['containerAlpha'] ?? node.props['alpha'],
+        props['containerColor'],
+        props['containerAlpha'] ?? props['alpha'],
       ),
       elevation:
-          _number(node.props['elevation']) ?? (type == 'ElevatedCard' ? 3 : 1),
+          _number(props['elevation']) ?? (type == 'ElevatedCard' ? 3 : 1),
       shape: RoundedRectangleBorder(
         borderRadius: radius ?? BorderRadius.zero,
         side: borderSide ?? BorderSide.none,
@@ -75,26 +102,37 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
 
   /// Builds surface for the Compose DSL renderer.
   Widget _surface(BuildContext context) {
-    final radius = _borderRadius(node.props['shape']);
-    final borderSide = _borderSide(context, node.props['border']);
-    final shape = borderSide == null && radius == null
-        ? null
-        : RoundedRectangleBorder(
-            borderRadius: radius ?? BorderRadius.zero,
-            side: borderSide ?? BorderSide.none,
-          );
+    final radius = _borderRadius(props['shape']);
+    final borderSide = _borderSide(context, props['border']);
+    final rawShape = props['shape'];
+    final kind = _normalizeToken(
+      _string(
+        rawShape is Map ? rawShape['type'] ?? rawShape['kind'] : rawShape,
+      ),
+    );
+    final ShapeBorder? shape = switch (kind) {
+      'pill' => StadiumBorder(side: borderSide ?? BorderSide.none),
+      'circle' => CircleBorder(side: borderSide ?? BorderSide.none),
+      _ =>
+        borderSide == null && radius == null
+            ? null
+            : RoundedRectangleBorder(
+                borderRadius: radius ?? BorderRadius.zero,
+                side: borderSide ?? BorderSide.none,
+              ),
+    };
     final child = _surfaceContent(
       context,
-      contentColor: _color(context, node.props['contentColor']),
-      contentPadding: node.props['contentPadding'] ?? node.props['padding'],
+      contentColor: _color(context, props['contentColor']),
+      contentPadding: props['contentPadding'] ?? props['padding'],
     );
-    final actionId = _actionId(node.props['onClick']);
+    final actionId = _actionId(props['onClick']);
     final surfaceChild = actionId == null
         ? child
         : InkWell(
             borderRadius: radius,
             onTap: _enabled()
-                ? () => _invokeAction(node.props['onClick'])
+                ? () => _invokeAction(props['onClick'])
                 : null,
             child: child,
           );
@@ -102,16 +140,17 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
       color:
           _colorWithAlpha(
             context,
-            node.props['color'] ?? node.props['containerColor'],
-            node.props['alpha'],
+            props['color'] ?? props['containerColor'],
+            props['alpha'],
           ) ??
           Colors.transparent,
       elevation:
-          _number(node.props['shadowElevation']) ??
-          _number(node.props['tonalElevation']) ??
+          _number(props['shadowElevation']) ??
+          _number(props['tonalElevation']) ??
           0,
       shape: shape,
       borderRadius: shape == null ? radius : null,
+      clipBehavior: shape == null ? Clip.none : Clip.antiAlias,
       child: surfaceChild,
     );
   }
@@ -122,7 +161,24 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
     required Color? contentColor,
     required Object? contentPadding,
   }) {
-    Widget child = _slotOrChildren('content');
+    final content = _slotNodes('content', useChildren: true);
+    final single = content.length == 1 &&
+            content.single.type == 'Row' &&
+            content.single.props['mainAxisSize'] == 'max'
+        ? content.single
+        : null;
+    final weightArgs = single == null
+        ? null
+        : _modifierOpByToken(single.props['modifier'], 'weight')?['args']
+              as List<Object?>?;
+    final weight = single == null
+        ? null
+        : _number(single.props['weight'] ?? weightArgs?.firstOrNull);
+    // Legacy full-size rows need the card's height for cross-axis alignment.
+    // Keep the implicit Column for ordinary content and weighted children.
+    Widget child = single != null && (weight == null || weight <= 0)
+        ? _buildNodeWidgets(content, pathPrefix: '$nodePath:content').single
+        : _slotOrChildren('content');
     if (contentPadding != null) {
       child = Padding(
         padding: _edgeInsetsFromValue(contentPadding),
@@ -155,29 +211,37 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
   }
 
   ButtonStyle? _buttonStyle(BuildContext context) {
-    final containerColor = _color(context, node.props['containerColor']);
-    final contentColor = _color(context, node.props['contentColor']);
+    final containerColor = _color(context, props['containerColor']);
+    final contentColor = _color(context, props['contentColor']);
     final disabledContainerColor = _color(
       context,
-      node.props['disabledContainerColor'],
+      props['disabledContainerColor'],
     );
     final disabledContentColor = _color(
       context,
-      node.props['disabledContentColor'],
+      props['disabledContentColor'],
     );
-    final radius = _borderRadius(node.props['shape']);
-    final padding = node.props['contentPadding'];
-    final borderSide = _borderSide(context, node.props['border']);
+    final radius = _borderRadius(props['shape']);
+    final padding = props['contentPadding'];
+    final borderSide = _borderSide(context, props['border']);
     if (containerColor == null &&
         contentColor == null &&
         disabledContainerColor == null &&
         disabledContentColor == null &&
         radius == null &&
         padding == null &&
-        borderSide == null) {
+        borderSide == null &&
+        !_bool(props['compact'])) {
       return null;
     }
     return ButtonStyle(
+      minimumSize: _bool(props['compact'])
+          ? const WidgetStatePropertyAll<Size>(Size.zero)
+          : null,
+      tapTargetSize: _bool(props['compact'])
+          ? MaterialTapTargetSize.shrinkWrap
+          : null,
+      visualDensity: _bool(props['compact']) ? VisualDensity.compact : null,
       backgroundColor: _buttonStateColor(
         enabled: containerColor,
         disabled: disabledContainerColor,
@@ -205,20 +269,20 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
   /// Builds chip for the Compose DSL renderer.
   Widget _chip(BuildContext context, String type) {
     final selected =
-        _bool(node.props['selected']) || _bool(node.props['checked']);
+        _bool(props['selected']) || _bool(props['checked']);
     final label = _chipLabel(type);
     final onPressed = _enabled()
-        ? () => _invokeAction(node.props['onClick'] ?? node.props['onSelected'])
+        ? () => _invokeAction(props['onClick'] ?? props['onSelected'])
         : null;
-    final backgroundColor = _color(context, node.props['containerColor']);
-    final selectedColor = _color(context, node.props['selectedContainerColor']);
-    final contentColor = _color(context, node.props['contentColor']);
-    final disabledColor = _color(context, node.props['disabledContainerColor']);
+    final backgroundColor = _color(context, props['containerColor']);
+    final selectedColor = _color(context, props['selectedContainerColor']);
+    final contentColor = _color(context, props['contentColor']);
+    final disabledColor = _color(context, props['disabledContainerColor']);
     final labelStyle = contentColor == null
         ? null
         : TextStyle(color: contentColor);
     final shape = _shapeBorder(
-      node.props['shape'],
+      props['shape'],
       defaultBorderRadius: BorderRadius.zero,
     );
     final elevation = type.startsWith('Elevated') ? 1.0 : 0.0;
@@ -234,13 +298,13 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
         elevation: elevation,
         onSelected: _enabled()
             ? (_) => _invokeAction(
-                node.props['onClick'] ?? node.props['onSelected'],
+                props['onClick'] ?? props['onSelected'],
               )
             : null,
       );
     }
     if (type == 'InputChip') {
-      final dismissAction = node.props['onDismiss'] ?? node.props['onDelete'];
+      final dismissAction = props['onDismiss'] ?? props['onDelete'];
       return InputChip(
         label: label,
         selected: selected,
@@ -296,14 +360,14 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
       _hasSlot('label')
           ? _chipSlotInline('label')
           : Text(
-              _string(node.props['label']).isEmpty
+              _string(props['label']).isEmpty
                   ? type.replaceAll('Elevated', '')
-                  : _string(node.props['label']),
+                  : _string(props['label']),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
     );
-    final dismissAction = node.props['onDismiss'] ?? node.props['onDelete'];
+    final dismissAction = props['onDismiss'] ?? props['onDelete'];
     if (type == 'InputChip' && _actionId(dismissAction) != null) {
       addSlot('trailingIcon', onTap: () => _invokeAction(dismissAction));
     } else {
@@ -331,7 +395,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
 
   /// Builds chip slot inline for the Compose DSL renderer.
   Widget _chipSlotInline(String name) {
-    final slot = node.slots[name] ?? const <_ComposeDslNode>[];
+    final slot = node.slots[name] ?? const <_ComposeProgramNode>[];
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: slot
@@ -346,7 +410,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
   }
 
   /// Builds chip inline child for the Compose DSL renderer.
-  Widget _chipInlineChild(_ComposeDslNode child, String childPath) {
+  Widget _chipInlineChild(_ComposeProgramNode child, String childPath) {
     if (child.type == 'Text') {
       return Text(
         _string(child.props['text']),
@@ -354,11 +418,13 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
         overflow: TextOverflow.ellipsis,
       );
     }
-    return _ComposeDslRenderer(
+    return _ComposeProgramExecutor(
       node: child,
       onAction: onAction,
+      onTextInput: onTextInput,
       webViewHostContext: webViewHostContext,
       splitMarkdownContent: splitMarkdownContent,
+      dispatchOnLoad: widget.dispatchOnLoad,
       nodePath: childPath,
     );
   }
@@ -366,14 +432,14 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
   /// Builds icon button for the Compose DSL renderer.
   Widget _iconButton(BuildContext context, String type) {
     final toggle = type.contains('Toggle');
-    final checked = _bool(node.props['checked']);
+    final checked = _bool(props['checked']);
     final icon = _slotNodes('content', useChildren: true).isNotEmpty
         ? _iconButtonSlot('content', useChildren: true)
         : Icon(
             _iconData(
-              _string(node.props['icon']).isEmpty
-                  ? _string(node.props['name'])
-                  : _string(node.props['icon']),
+              _string(props['icon']).isEmpty
+                  ? _string(props['name'])
+                  : _string(props['icon']),
             ),
           );
     final selectedIcon = _hasSlot('selectedIcon')
@@ -381,7 +447,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
         : null;
     final onPressed = _enabled()
         ? () => _invokeAction(
-            toggle ? node.props['onCheckedChange'] : node.props['onClick'],
+            toggle ? props['onCheckedChange'] : props['onClick'],
             toggle ? !checked : null,
           )
         : null;
@@ -391,6 +457,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
       case 'FilledIconToggleButton':
         return IconButton.filled(
           onPressed: onPressed,
+          tooltip: props['tooltip'] as String?,
           isSelected: toggle ? checked : null,
           selectedIcon: selectedIcon,
           style: style,
@@ -400,6 +467,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
       case 'FilledTonalIconToggleButton':
         return IconButton.filledTonal(
           onPressed: onPressed,
+          tooltip: props['tooltip'] as String?,
           isSelected: toggle ? checked : null,
           selectedIcon: selectedIcon,
           style: style,
@@ -409,6 +477,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
       case 'OutlinedIconToggleButton':
         return IconButton.outlined(
           onPressed: onPressed,
+          tooltip: props['tooltip'] as String?,
           isSelected: toggle ? checked : null,
           selectedIcon: selectedIcon,
           style: style,
@@ -417,6 +486,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
       default:
         return IconButton(
           onPressed: onPressed,
+          tooltip: props['tooltip'] as String?,
           isSelected: toggle ? checked : null,
           selectedIcon: selectedIcon,
           style: style,
@@ -427,21 +497,27 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
 
   ButtonStyle? _iconButtonStyle(String type) {
     final hasExplicitSize =
-        _number(node.props['width']) != null ||
-        _number(node.props['height']) != null;
+        _number(props['width']) != null ||
+        _number(props['height']) != null;
     final shape = _shapeBorder(
-      node.props['shape'],
+      props['shape'],
       defaultBorderRadius: type.contains('Outlined')
           ? BorderRadius.circular(12)
           : null,
     );
-    if (!hasExplicitSize && shape == null) {
+    if (!hasExplicitSize &&
+        shape == null &&
+        props['contentPadding'] == null) {
       return null;
     }
     return IconButton.styleFrom(
       shape: shape,
       minimumSize: hasExplicitSize ? Size.zero : null,
-      padding: hasExplicitSize ? EdgeInsets.zero : null,
+      padding: props['contentPadding'] != null
+          ? _edgeInsetsFromValue(props['contentPadding'])
+          : hasExplicitSize
+          ? EdgeInsets.zero
+          : null,
       tapTargetSize: hasExplicitSize ? MaterialTapTargetSize.shrinkWrap : null,
     );
   }
@@ -456,12 +532,12 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
   /// Builds floating action button for the Compose DSL renderer.
   Widget _floatingActionButton(BuildContext context, String type) {
     final onPressed = _enabled()
-        ? () => _invokeAction(node.props['onClick'])
+        ? () => _invokeAction(props['onClick'])
         : null;
-    final backgroundColor = _color(context, node.props['containerColor']);
-    final foregroundColor = _color(context, node.props['contentColor']);
+    final backgroundColor = _color(context, props['containerColor']);
+    final foregroundColor = _color(context, props['contentColor']);
     final shape = _shapeBorder(
-      node.props['shape'],
+      props['shape'],
       defaultBorderRadius: BorderRadius.zero,
     );
     if (type == 'ExtendedFloatingActionButton') {
@@ -477,7 +553,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
     }
     final child = _hasSlot('content')
         ? _slotColumn('content')
-        : Icon(_iconData(_string(node.props['icon'])));
+        : Icon(_iconData(_string(props['icon'])));
     if (type == 'SmallFloatingActionButton') {
       return FloatingActionButton.small(
         heroTag: null,
@@ -510,7 +586,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
 
   /// Builds badge for the Compose DSL renderer.
   Widget _badge(BuildContext context) {
-    final contentColor = _color(context, node.props['contentColor']);
+    final contentColor = _color(context, props['contentColor']);
     final label = _tintedSlotInline(
       context,
       'content',
@@ -518,7 +594,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
       color: contentColor,
     );
     return Badge(
-      backgroundColor: _color(context, node.props['containerColor']),
+      backgroundColor: _color(context, props['containerColor']),
       textColor: contentColor,
       label: label,
     );
@@ -535,13 +611,13 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
   /// Builds snackbar for the Compose DSL renderer.
   Widget _snackbar(BuildContext context) {
     final contentColor =
-        _color(context, node.props['contentColor']) ??
+        _color(context, props['contentColor']) ??
         Theme.of(context).colorScheme.onInverseSurface;
     final actionContentColor =
-        _color(context, node.props['actionContentColor']) ??
+        _color(context, props['actionContentColor']) ??
         Theme.of(context).colorScheme.inversePrimary;
     final dismissActionContentColor =
-        _color(context, node.props['dismissActionContentColor']) ??
+        _color(context, props['dismissActionContentColor']) ??
         actionContentColor;
     final content = _tintedSlotColumn(
       context,
@@ -559,10 +635,10 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
           color: dismissActionContentColor,
         ),
     ];
-    final actionOnNewLine = _bool(node.props['actionOnNewLine']);
+    final actionOnNewLine = _bool(props['actionOnNewLine']);
     final shape =
         _shapeBorder(
-              node.props['shape'],
+              props['shape'],
               defaultBorderRadius: BorderRadius.zero,
             )
             as RoundedRectangleBorder?;
@@ -595,9 +671,9 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
           );
     return Material(
       color:
-          _color(context, node.props['containerColor']) ??
+          _color(context, props['containerColor']) ??
           Theme.of(context).colorScheme.inverseSurface,
-      elevation: _number(node.props['elevation']) ?? 6,
+      elevation: _number(props['elevation']) ?? 6,
       shape: shape,
       borderRadius: shape == null ? BorderRadius.zero : null,
       child: Padding(
@@ -632,7 +708,7 @@ extension _ComposeMaterialControls on _ComposeDslRenderer {
     );
     return Material(
       color: Colors.transparent,
-      elevation: _number(node.props['shadowElevation']) ?? 0,
+      elevation: _number(props['shadowElevation']) ?? 0,
       surfaceTintColor: Theme.of(context).colorScheme.surfaceTint,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),

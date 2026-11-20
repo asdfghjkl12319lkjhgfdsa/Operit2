@@ -1,3 +1,4 @@
+import { readSdkScript } from "../runtime/compose_scripts.mjs";
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -14,6 +15,7 @@ function source(path) { return readFileSync(new URL(path, root), 'utf8'); }
 
 /** Extracts production JavaScript embedded in the first Rust raw string. */
 function embedded(path) {
+  if (path.endsWith('/ToolPkgRegistrationBridge.rs')) return readSdkScript('ToolPkgRegistrationBridge.rs');
   const text = source(path);
   const start = text.indexOf('r#"') + 3;
   return text.slice(start, text.indexOf('"#', start));
@@ -25,6 +27,7 @@ function plain(value) { return JSON.parse(JSON.stringify(value)); }
 /** Installs the public transport using its real active-call lifecycle contract. */
 function transport() {
   const calls = [];
+  const pending = [];
   let retained = 0;
   const context = vm.createContext({
     __operitCurrentCallId: 'caller',
@@ -39,13 +42,34 @@ function transport() {
     /** Restores the owner before delivering an asynchronous completion. */
     __operitActivateCall(id) { context.__operitCurrentCallId = id; },
     /** Captures the native ABI, which contains no caller identity argument. */
-    __operitNativeCallDependencyAsync(...args) { calls.push(args); },
+    __operitNativeCallDependency(...args) {
+      calls.push(args);
+      return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+    },
   });
   vm.runInContext(embedded('core/crates/plugin/sdk/src/toolpkg/ToolPkgApiRuntimeScript.rs'), context);
   vm.runInContext(embedded('core/crates/plugin/sdk/src/toolpkg/ToolPkgRegistrationBridge.rs')
     .replace('__OPERIT_TOOLPKG_REGISTRATION_ONLY__', 'true'), context);
-  return { context, calls, retained: () => retained };
+  return { context, calls, pending, retained: () => retained };
 }
+
+/** Keeps local directory lookup independent of shared config and rejects failed or malformed Host results. */
+test('local data directory resolves through the current owner without changing shared config',()=>{
+  const {context}=transport();
+  context.__operitGetCallState=()=>({params:{toolPkgId:'space_plugin',__operit_toolpkg_api_version:'2.0.0'}});
+  const owners=[];
+  context.__operitNativeGetScopedPluginConfigDir=(owner,target)=>`/operitapp/data/extensions/space/plugins/configs/${target}`;
+  context.__operitNativeGetPluginLocalDataDir=owner=>{owners.push(owner);return `/operitapp/data/plugin_data/device/${owner}`;};
+  context.__operitNativeGetPluginSpaceDataDir=owner=>`/operitapp/data/plugin_data/space/${owner}`;
+  assert.equal(context.ToolPkg.getConfigDir(),'/operitapp/data/extensions/space/plugins/configs/space_plugin');
+  assert.equal(context.ToolPkg.getLocalDataDir(),'/operitapp/data/plugin_data/device/space_plugin');
+  assert.deepEqual(owners,['space_plugin']);
+  assert.equal(context.ToolPkg.getSpaceDataDir(),'/operitapp/data/plugin_data/space/space_plugin');
+  context.__operitNativeGetPluginLocalDataDir=()=>{throw new Error('fixture local directory failure');};
+  assert.throws(()=>context.ToolPkg.getLocalDataDir(),/fixture local directory failure/);
+  context.__operitNativeGetPluginLocalDataDir=()=>'';
+  assert.throws(()=>context.ToolPkg.getLocalDataDir(),/absolute VFS path/);
+});
 
 /** Checks public methods are captured only as durable exported function references. */
 test('registerApi captures public names independently from implementation names', () => {
@@ -62,30 +86,30 @@ test('registerApi captures public names independently from implementation names'
   assert.throws(() => vm.runInContext("ToolPkg.registerApi({name: '', function: actualRun})", context), /name/);
 });
 
-/** Checks payload serialization and caller identity remain separate at the native boundary. */
+/** Checks structured payload and caller identity remain separate at the native boundary. */
 test('dependency call preserves application results and releases the owning call', async () => {
-  const { context, calls, retained } = transport();
+  const { context, calls, pending, retained } = transport();
   const result = context.ToolPkg.callDependency('provider', 'run', { callerPackage: 'forged', value: 1 });
   assert.equal(retained(), 1);
   assert.equal(calls[0].length, 4);
-  assert.deepEqual(calls[0].slice(1, 3), ['provider', 'run']);
-  assert.deepEqual(JSON.parse(calls[0][3]), { callerPackage: 'forged', value: 1 });
-  context[calls[0][0]](JSON.stringify({ success: true, value: { success: false, application: 'value' } }), false);
+  assert.deepEqual(calls[0].slice(0, 3), ['caller', 'provider', 'run']);
+  assert.deepEqual(plain(calls[0][3]), { callerPackage: 'forged', value: 1 });
+  pending[0].resolve({ success: true, value: { success: false, application: 'value' } });
   assert.deepEqual(plain(await result), { success: false, application: 'value' });
   await Promise.resolve();
   assert.equal(retained(), 0);
-  assert.equal(context[calls[0][0]], undefined);
+  assert.equal(Object.keys(context).some(key => key.startsWith('__operit_dependency_')), false);
 });
 
 /** Checks registration, remote failures, and submission errors never execute another route. */
 test('dependency call rejects forbidden phases and failures without retry', async () => {
-  const { context, calls, retained } = transport();
+  const { context, calls, pending, retained } = transport();
   const failed = context.ToolPkg.callDependency('provider', 'private', {});
-  context[calls[0][0]](JSON.stringify({ success: false, message: 'Public API not found' }), false);
+  pending[0].resolve({ success: false, message: 'Public API not found' });
   await assert.rejects(failed, /Public API not found/);
   await Promise.resolve();
   assert.equal(retained(), 0);
-  context.__operitNativeCallDependencyAsync = () => { throw new Error('transport stopped'); };
+  context.__operitNativeCallDependency = () => { throw new Error('transport stopped'); };
   await assert.rejects(context.ToolPkg.callDependency('provider', 'run', {}), /transport stopped/);
   await Promise.resolve();
   assert.equal(retained(), 0);

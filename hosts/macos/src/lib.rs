@@ -1,4 +1,14 @@
 #![allow(non_snake_case)]
+#[cfg(target_os = "macos")]
+#[path = "../../common/ui_automation.rs"]
+mod ui_automation;
+
+#[cfg(target_os = "macos")]
+pub use operit_host_apple_native::AppleServiceDiscoveryHost as MacosServiceDiscoveryHost;
+
+#[cfg(all(feature = "daemon", target_os = "macos"))]
+#[path = "../../unix/daemon.rs"]
+pub mod daemon;
 
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
@@ -41,12 +51,8 @@ pub fn createRuntimeHostManager(
     let archiveStagingHost = Arc::new(operit_host_native_common::NativeArchiveStagingHost::new(
         runtimeRoot.clone(),
     ));
-    let runtimeStorageWriteHost =
-        Arc::new(operit_host_native_common::NativeRuntimeStorageHost::new(
-            runtimeRoot.clone(),
-            workspaceRoot.clone(),
-        ));
     let runtimeStorageHost = Arc::new(MacosRuntimeStorageHost::new(runtimeRoot, workspaceRoot));
+    let runtimeStorageWriteHost = runtimeStorageHost.clone();
     let runtimeSqliteHost = runtimeStorageHost.clone();
     let hostSecretStore = runtimeStorageHost.clone();
     HostManager::withFileSystemWebVisitSystemOperationAndManagedRuntimeHosts(
@@ -58,15 +64,21 @@ pub fn createRuntimeHostManager(
         runtimeStorageHost,
         runtimeSqliteHost,
     )
+    .withLocalInferenceHost(Arc::new(operit_host_local_inference::NativeLocalInferenceHost::new()))
+    .withUiAutomationHost(Arc::new(ui_automation::ScriptUiAutomationHost::new(
+        "/usr/bin/osascript", &["-l", "JavaScript", "-e", include_str!("ui_automation.js")],
+    )))
     .withHostSecretStore(hostSecretStore)
     .withWebSocketHost(Arc::new(MacosHttpHost::new()))
+    .withHttpServerHost(Arc::new(operit_host_native_common::NativeHttpServerHost))
+    .withTcpHost(Arc::new(operit_host_native_common::NativeTcpHost))
     .withSerialPortHost(Arc::new(operit_host_native_common::NativeSerialPortHost))
     .withArchiveStagingHost(archiveStagingHost)
     .withRuntimeStorageWriteHost(runtimeStorageWriteHost)
     .withHostRuntimeEventHost(Arc::new(MacosHostRuntimeEventHost::new()))
     .withHostRuntimeEventSchedulerHost(Arc::new(MacosHostRuntimeEventSchedulerHost::new()))
     .withHostJavaScriptRuntimeHost(Arc::new(MacosHostJavaScriptRuntimeHost::new()))
-    .withServiceDiscoveryHost(Arc::new(operit_host_native_common::ServiceDiscovery::ServiceDiscoveryProvider::default()))
+    .withServiceDiscoveryHost(Arc::new(operit_host_apple_native::AppleServiceDiscoveryHost::default()))
     .withHostRuntimeTaskSchedulerHost(Arc::new(MacosHostRuntimeTaskSchedulerHost::new()))
     .withPluginSdkIpcHost(Arc::new(MacosPluginSdkIpcHost::new()))
 }

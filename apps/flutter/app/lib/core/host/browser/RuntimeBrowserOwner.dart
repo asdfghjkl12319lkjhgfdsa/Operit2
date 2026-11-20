@@ -50,7 +50,12 @@ class RuntimeBrowserOwner extends ChangeNotifier {
   RuntimeBrowserOwner._() {
     _sessionRegistry.setBrowserSessionOpener(
       openBrowserTab: ({url, userAgent, headers}) async {
-        await openTab(url: url, userAgent: userAgent, headers: headers);
+        final tab = await openTab(
+          url: url,
+          userAgent: userAgent,
+          headers: headers,
+        );
+        return tab.id;
       },
     );
     _sessionRegistry.setBrowserSessionUpdater(updateSessionMetadata);
@@ -82,7 +87,7 @@ class RuntimeBrowserOwner extends ChangeNotifier {
   final Map<String, RuntimeBrowserAutomationController> _automation =
       <String, RuntimeBrowserAutomationController>{};
   final Map<String, String> _defaultUserAgents = <String, String>{};
-  final Set<String> _workspaceSurfaceSessionIds = <String>{};
+  final Map<String, int> _workspaceSurfaceSessionClaims = <String, int>{};
   final RuntimeBrowserSessionRegistry _sessionRegistry =
       RuntimeBrowserSessionRegistry.instance;
 
@@ -119,20 +124,27 @@ class RuntimeBrowserOwner extends ChangeNotifier {
 
   /// Returns whether a session is currently mounted in the workspace tree.
   bool isWorkspaceSurfaceSession(String sessionId) {
-    return _workspaceSurfaceSessionIds.contains(sessionId);
+    return (_workspaceSurfaceSessionClaims[sessionId] ?? 0) > 0;
   }
 
   /// Marks one owner WebView as mounted by the workspace tree.
   void attachWorkspaceSurfaceSession(String sessionId) {
-    if (_workspaceSurfaceSessionIds.add(sessionId)) {
+    final current = _workspaceSurfaceSessionClaims[sessionId] ?? 0;
+    _workspaceSurfaceSessionClaims[sessionId] = current + 1;
+    if (current == 0) {
       notifyListeners();
     }
   }
 
   /// Marks one owner WebView as no longer mounted by the workspace tree.
   void detachWorkspaceSurfaceSession(String sessionId) {
-    if (_workspaceSurfaceSessionIds.remove(sessionId)) {
-      notifyListeners();
+    final current = _workspaceSurfaceSessionClaims[sessionId] ?? 0;
+    if (current <= 1) {
+      if (_workspaceSurfaceSessionClaims.remove(sessionId) != null) {
+        notifyListeners();
+      }
+    } else {
+      _workspaceSurfaceSessionClaims[sessionId] = current - 1;
     }
   }
 
@@ -256,9 +268,10 @@ class RuntimeBrowserOwner extends ChangeNotifier {
       await ensureLoaded();
       final normalizedUrl = normalizeWorkspaceBrowserUrl(nextUrl);
       final requestHeaders = headers ?? const <String, String>{};
-      ClientLogger.i(
+      ClientLogger.v(
         'openTab start url=$normalizedUrl headers=${requestHeaders.length} userAgentSet=${userAgent != null}',
         tag: _logTag,
+        verboseLevel: VerboseLevel.level2,
       );
       final tab = _createTab(
         normalizedUrl,
@@ -266,19 +279,15 @@ class RuntimeBrowserOwner extends ChangeNotifier {
         headers: requestHeaders,
         capabilities: _capabilitiesForUrl(normalizedUrl),
       );
-      _configureTab(tab);
-      await _applyUserAgentForTab(tab);
-      _tabs.add(tab);
-      _selectedIndex = _tabs.length - 1;
-      notifyListeners();
-      _syncSessionRegistry();
+      await _attachTab(tab);
       await tab.controller.loadRequest(
         Uri.parse(normalizedUrl),
         headers: requestHeaders,
       );
-      ClientLogger.i(
+      ClientLogger.v(
         'openTab done tab=${tab.id} elapsedMs=${stopwatch.elapsedMilliseconds}',
         tag: _logTag,
+        verboseLevel: VerboseLevel.level2,
       );
       return tab;
     } catch (error, stackTrace) {
@@ -303,12 +312,7 @@ class RuntimeBrowserOwner extends ChangeNotifier {
         localFilePath: absolutePath,
         capabilities: _capabilitiesForUrl('file://$absolutePath'),
       );
-      _configureTab(tab);
-      await _applyUserAgentForTab(tab);
-      _tabs.add(tab);
-      _selectedIndex = _tabs.length - 1;
-      notifyListeners();
-      _syncSessionRegistry();
+      await _attachTab(tab);
       await tab.controller.loadFile(absolutePath);
       return tab;
     } finally {
@@ -316,6 +320,23 @@ class RuntimeBrowserOwner extends ChangeNotifier {
     }
   }
 
+  /// Publishes a configured tab and releases it if setup fails before attachment.
+  Future<void> _attachTab(WorkspaceBrowserTabState tab) async {
+    try {
+      _configureTab(tab);
+      await _applyUserAgentForTab(tab);
+    } catch (_) {
+      unawaited(tab.controller.dispose());
+      _releaseTab(tab);
+      rethrow;
+    }
+    _tabs.add(tab);
+    _selectedIndex = _tabs.length - 1;
+    notifyListeners();
+    _syncSessionRegistry();
+  }
+
+  /// Opens a browser tab backed by the workspace HTML preview server.
   Future<WorkspaceBrowserTabState> openWorkspaceHtmlTab(
     String relativePath, {
     String? initialUrl,
@@ -370,12 +391,10 @@ class RuntimeBrowserOwner extends ChangeNotifier {
     _closeTabAt(index);
   }
 
+  /// Removes the tab from the owner and updates the selected session.
   void _closeTabAt(int index) {
     final removed = _tabs.removeAt(index);
-    _automation.remove(removed.id);
-    _defaultUserAgents.remove(removed.id);
-    _sessionRegistry.unregister(removed.id);
-    removed.dispose();
+    _releaseTab(removed);
     if (_tabs.isEmpty) {
       _selectedIndex = 0;
       notifyListeners();
@@ -388,6 +407,15 @@ class RuntimeBrowserOwner extends ChangeNotifier {
     }
     notifyListeners();
     _syncSessionRegistry();
+  }
+
+  /// Drops the registry and automation state before disposing the tab's browser.
+  void _releaseTab(WorkspaceBrowserTabState tab) {
+    _automation.remove(tab.id);
+    _defaultUserAgents.remove(tab.id);
+    _sessionRegistry.unregister(tab.id);
+    _workspaceSurfaceSessionClaims.remove(tab.id);
+    tab.dispose();
   }
 
   /// Navigates the current real owner WebView.
@@ -492,13 +520,14 @@ class RuntimeBrowserOwner extends ChangeNotifier {
         canGoForward: afterCanGoForward,
       );
       stopwatch.stop();
-      ClientLogger.i(
+      ClientLogger.v(
         'back native tab=${tab.id} beforeCanGoBack=$beforeCanGoBack '
         'beforeCanGoForward=$beforeCanGoForward '
         'afterCanGoBack=$afterCanGoBack afterCanGoForward=$afterCanGoForward '
         'beforeUrl=$beforeUrl afterUrl=$afterUrl '
         'elapsedMs=${stopwatch.elapsedMilliseconds}',
         tag: _logTag,
+        verboseLevel: VerboseLevel.level2,
       );
     } catch (error, stackTrace) {
       stopwatch.stop();
@@ -652,7 +681,7 @@ class RuntimeBrowserOwner extends ChangeNotifier {
     );
     _automation[tab.id] = automationController;
     tab.controller.getUserAgent().then((value) {
-      if (value != null) {
+      if (!tab.isDisposed && value != null) {
         _defaultUserAgents[tab.id] = value;
       }
     });
@@ -749,9 +778,10 @@ class RuntimeBrowserOwner extends ChangeNotifier {
             return;
           }
           final logicalUrl = _logicalUrl(url);
-          ClientLogger.d(
+          ClientLogger.v(
             'page started tab=${tab.id} url=$logicalUrl',
             tag: _logTag,
+            verboseLevel: VerboseLevel.level2,
           );
           final hasLogicalUrl = logicalUrl.isNotEmpty;
           tab.update(
@@ -783,9 +813,10 @@ class RuntimeBrowserOwner extends ChangeNotifier {
             return;
           }
           final logicalUrl = _logicalUrl(url);
-          ClientLogger.d(
+          ClientLogger.v(
             'page finished tab=${tab.id} url=$logicalUrl',
             tag: _logTag,
+            verboseLevel: VerboseLevel.level2,
           );
           if (tab.isDisposed) {
             return;
@@ -1250,7 +1281,6 @@ class RuntimeBrowserOwner extends ChangeNotifier {
       frameHeight: frame.height.round(),
     );
   }
-
 
   bool _isDownloadUrl(String url) {
     final lower = url.toLowerCase();

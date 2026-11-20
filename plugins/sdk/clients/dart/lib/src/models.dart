@@ -2,6 +2,59 @@
 
 import 'dart:typed_data';
 
+/// Generated SDK model for Rust type `operit_plugin_sdk::js_sdk::tool_display::ToolDisplayDeclaration`.
+class ToolDisplayDeclaration {
+  const ToolDisplayDeclaration({
+    required this.label,
+    required this.icon,
+    required this.target_parameter,
+    required this.result_renderer,
+  });
+
+  /// Decodes `operit_plugin_sdk::js_sdk::tool_display::ToolDisplayDeclaration` from a MessagePack value map.
+  factory ToolDisplayDeclaration.fromMessagePackValue(Map<String, Object?> value) => ToolDisplayDeclaration(
+    label: (value['label'] as Map).map((key, item) => MapEntry(key as String, item as String)),
+    icon: value['icon'] as String,
+    target_parameter: value['targetParameter'] == null ? null : value['targetParameter'] as String,
+    result_renderer: ToolResultRenderer.fromMessagePackValue(value['resultRenderer'] as Map<String, Object?>),
+  );
+
+  /// Encodes this model into a MessagePack-compatible value map.
+  Map<String, Object?> toMessagePackValue() => <String, Object?>{
+    'label': label.map((key, item) => MapEntry(key, item)),
+    'icon': icon,
+    'targetParameter': target_parameter == null ? null : target_parameter!,
+    'resultRenderer': result_renderer.toMessagePackValue(),
+  };
+
+  final Map<String, String> label;
+  final String icon;
+  final String? target_parameter;
+  final ToolResultRenderer result_renderer;
+}
+
+enum ToolResultRenderer {
+  Directory,
+  FileDiff,
+  Text,
+  ;
+
+  /// Decodes `operit_plugin_sdk::js_sdk::tool_display::ToolResultRenderer` from its MessagePack scalar value.
+  factory ToolResultRenderer.fromMessagePackValue(Object? value) => switch (value) {
+    'directory' => ToolResultRenderer.Directory,
+    'fileDiff' => ToolResultRenderer.FileDiff,
+    'text' => ToolResultRenderer.Text,
+    _ => throw ArgumentError('Unknown ToolResultRenderer: $value'),
+  };
+
+  /// Encodes this enum into a MessagePack scalar value.
+  String toMessagePackValue() => switch (this) {
+    ToolResultRenderer.Directory => 'directory',
+    ToolResultRenderer.FileDiff => 'fileDiff',
+    ToolResultRenderer.Text => 'text',
+  };
+}
+
 /// Generated SDK model for Rust type `operit_plugin_sdk::package::EnvVar`.
 class EnvVar {
   const EnvVar({
@@ -55,6 +108,7 @@ class LocalizedText {
 /// Generated SDK model for Rust type `operit_plugin_sdk::package::PackageTool`.
 class PackageTool {
   const PackageTool({
+    required this.display,
     required this.name,
     required this.description,
     required this.parameters,
@@ -64,6 +118,7 @@ class PackageTool {
 
   /// Decodes `operit_plugin_sdk::package::PackageTool` from a MessagePack value map.
   factory PackageTool.fromMessagePackValue(Map<String, Object?> value) => PackageTool(
+    display: value['display'] == null ? null : ToolDisplayDeclaration.fromMessagePackValue(value['display'] as Map<String, Object?>),
     name: value['name'] as String,
     description: LocalizedText.fromMessagePackValue(value['description'] as Map<String, Object?>),
     parameters: (value['parameters'] as List<Object?>).map((item) => PackageToolParameter.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
@@ -73,6 +128,7 @@ class PackageTool {
 
   /// Encodes this model into a MessagePack-compatible value map.
   Map<String, Object?> toMessagePackValue() => <String, Object?>{
+    'display': display == null ? null : display!.toMessagePackValue(),
     'name': name,
     'description': description.toMessagePackValue(),
     'parameters': parameters.map((item) => item.toMessagePackValue()).toList(growable: false),
@@ -80,6 +136,7 @@ class PackageTool {
     'advice': advice,
   };
 
+  final ToolDisplayDeclaration? display;
   final String name;
   final LocalizedText description;
   final List<PackageToolParameter> parameters;
@@ -122,6 +179,7 @@ class PackageToolParameter {
 class ToolPackage {
   const ToolPackage({
     required this.name,
+    required this.api_version,
     required this.description,
     required this.tools,
     required this.states,
@@ -136,6 +194,7 @@ class ToolPackage {
   /// Decodes `operit_plugin_sdk::package::ToolPackage` from a MessagePack value map.
   factory ToolPackage.fromMessagePackValue(Map<String, Object?> value) => ToolPackage(
     name: value['name'] as String,
+    api_version: value['api_version'] as String,
     description: LocalizedText.fromMessagePackValue(value['description'] as Map<String, Object?>),
     tools: (value['tools'] as List<Object?>).map((item) => PackageTool.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     states: (value['states'] as List<Object?>).map((item) => ToolPackageState.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
@@ -150,6 +209,7 @@ class ToolPackage {
   /// Encodes this model into a MessagePack-compatible value map.
   Map<String, Object?> toMessagePackValue() => <String, Object?>{
     'name': name,
+    'api_version': api_version,
     'description': description.toMessagePackValue(),
     'tools': tools.map((item) => item.toMessagePackValue()).toList(growable: false),
     'states': states.map((item) => item.toMessagePackValue()).toList(growable: false),
@@ -162,6 +222,7 @@ class ToolPackage {
   };
 
   final String name;
+  final String api_version;
   final LocalizedText description;
   final List<PackageTool> tools;
   final List<ToolPackageState> states;
@@ -558,6 +619,7 @@ class ToolPkgChatComposerSlotRuntime {
     required this.id,
     required this.slot,
     required this.screen,
+    required this.screenExport,
     required this.order,
     required this.keepAlive,
   });
@@ -567,6 +629,7 @@ class ToolPkgChatComposerSlotRuntime {
     id: value['id'] as String,
     slot: value['slot'] as String,
     screen: value['screen'] as String,
+    screenExport: value['screenExport'] == null ? null : value['screenExport'] as String,
     order: (value['order'] as num).toInt(),
     keepAlive: value['keepAlive'] as bool,
   );
@@ -576,6 +639,7 @@ class ToolPkgChatComposerSlotRuntime {
     'id': id,
     'slot': slot,
     'screen': screen,
+    'screenExport': screenExport == null ? null : screenExport!,
     'order': order,
     'keepAlive': keepAlive,
   };
@@ -583,6 +647,7 @@ class ToolPkgChatComposerSlotRuntime {
   final String id;
   final String slot;
   final String screen;
+  final String? screenExport;
   final int order;
   final bool keepAlive;
 }
@@ -591,22 +656,26 @@ class ToolPkgChatComposerSlotRuntime {
 class ToolPkgChatMessageMenuDialogRuntime {
   const ToolPkgChatMessageMenuDialogRuntime({
     required this.screen,
+    required this.screenExport,
     required this.title,
   });
 
   /// Decodes `operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgChatMessageMenuDialogRuntime` from a MessagePack value map.
   factory ToolPkgChatMessageMenuDialogRuntime.fromMessagePackValue(Map<String, Object?> value) => ToolPkgChatMessageMenuDialogRuntime(
     screen: value['screen'] as String,
+    screenExport: value['screenExport'] == null ? null : value['screenExport'] as String,
     title: LocalizedText.fromMessagePackValue(value['title'] as Map<String, Object?>),
   );
 
   /// Encodes this model into a MessagePack-compatible value map.
   Map<String, Object?> toMessagePackValue() => <String, Object?>{
     'screen': screen,
+    'screenExport': screenExport == null ? null : screenExport!,
     'title': title.toMessagePackValue(),
   };
 
   final String screen;
+  final String? screenExport;
   final LocalizedText title;
 }
 
@@ -665,11 +734,16 @@ class ToolPkgContainerRuntime {
     required this.description,
     required this.version,
     required this.apiVersion,
+    required this.publicApi,
+    required this.publicApis,
     required this.requires,
+    required this.optionalRequires,
     required this.dependencyIssues,
     required this.manifestExtensions,
     required this.author,
     required this.mainEntry,
+    required this.themes,
+    required this.license,
     required this.sourceType,
     required this.sourcePath,
     required this.subpackages,
@@ -689,8 +763,12 @@ class ToolPkgContainerRuntime {
     required this.chatInputHooks,
     required this.chatViewHooks,
     required this.chatMessageHooks,
+    required this.messageTransformHooks,
+    required this.messageStreamTransforms,
+    required this.chatLifecycleHooks,
     required this.chatMessageMenuItems,
     required this.chatRuntimeHooks,
+    required this.chatResponseHooks,
     required this.hostEventHooks,
     required this.toolLifecycleHooks,
     required this.promptInputHooks,
@@ -715,11 +793,16 @@ class ToolPkgContainerRuntime {
     description: LocalizedText.fromMessagePackValue(value['description'] as Map<String, Object?>),
     version: value['version'] as String,
     apiVersion: value['apiVersion'] as String,
+    publicApi: value['publicApi'] == null ? null : value['publicApi'] as String,
+    publicApis: (value['publicApis'] as List<Object?>).map((item) => ToolPkgRegisteredFunctionHook.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     requires: (value['requires'] as List<Object?>).map((item) => ToolPkgManifestRequirement.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    optionalRequires: (value['optional_requires'] as List<Object?>).map((item) => ToolPkgManifestRequirement.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     dependencyIssues: (value['dependencyIssues'] as List<Object?>).map((item) => ToolPkgDependencyIssue.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     manifestExtensions: (value['manifestExtensions'] as Map).map((key, item) => MapEntry(key as String, item)),
     author: (value['author'] as List<Object?>).map((item) => item as String).toList(growable: false),
     mainEntry: value['mainEntry'] as String,
+    themes: (value['themes'] as List<Object?>).map((item) => ToolPkgManifestTheme.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    license: value['license'] == null ? null : value['license'] as String,
     sourceType: ToolPkgSourceType.fromMessagePackValue(value['sourceType'] as Map<String, Object?>),
     sourcePath: value['sourcePath'] as String,
     subpackages: (value['subpackages'] as List<Object?>).map((item) => ToolPkgSubpackageRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
@@ -739,8 +822,12 @@ class ToolPkgContainerRuntime {
     chatInputHooks: (value['chatInputHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     chatViewHooks: (value['chatViewHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     chatMessageHooks: (value['chatMessageHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    messageTransformHooks: (value['messageTransformHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    messageStreamTransforms: (value['messageStreamTransforms'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    chatLifecycleHooks: (value['chatLifecycleHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     chatMessageMenuItems: (value['chatMessageMenuItems'] as List<Object?>).map((item) => ToolPkgChatMessageMenuItemRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     chatRuntimeHooks: (value['chatRuntimeHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    chatResponseHooks: (value['chatResponseHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     hostEventHooks: (value['hostEventHooks'] as List<Object?>).map((item) => ToolPkgHostEventHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     toolLifecycleHooks: (value['toolLifecycleHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     promptInputHooks: (value['promptInputHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
@@ -765,11 +852,16 @@ class ToolPkgContainerRuntime {
     'description': description.toMessagePackValue(),
     'version': version,
     'apiVersion': apiVersion,
+    'publicApi': publicApi == null ? null : publicApi!,
+    'publicApis': publicApis.map((item) => item.toMessagePackValue()).toList(growable: false),
     'requires': requires.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'optional_requires': optionalRequires.map((item) => item.toMessagePackValue()).toList(growable: false),
     'dependencyIssues': dependencyIssues.map((item) => item.toMessagePackValue()).toList(growable: false),
     'manifestExtensions': manifestExtensions.map((key, item) => MapEntry(key, item)),
     'author': author.map((item) => item).toList(growable: false),
     'mainEntry': mainEntry,
+    'themes': themes.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'license': license == null ? null : license!,
     'sourceType': sourceType.toMessagePackValue(),
     'sourcePath': sourcePath,
     'subpackages': subpackages.map((item) => item.toMessagePackValue()).toList(growable: false),
@@ -789,8 +881,12 @@ class ToolPkgContainerRuntime {
     'chatInputHooks': chatInputHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'chatViewHooks': chatViewHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'chatMessageHooks': chatMessageHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'messageTransformHooks': messageTransformHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'messageStreamTransforms': messageStreamTransforms.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'chatLifecycleHooks': chatLifecycleHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'chatMessageMenuItems': chatMessageMenuItems.map((item) => item.toMessagePackValue()).toList(growable: false),
     'chatRuntimeHooks': chatRuntimeHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'chatResponseHooks': chatResponseHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'hostEventHooks': hostEventHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'toolLifecycleHooks': toolLifecycleHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'promptInputHooks': promptInputHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
@@ -813,11 +909,16 @@ class ToolPkgContainerRuntime {
   final LocalizedText description;
   final String version;
   final String apiVersion;
+  final String? publicApi;
+  final List<ToolPkgRegisteredFunctionHook> publicApis;
   final List<ToolPkgManifestRequirement> requires;
+  final List<ToolPkgManifestRequirement> optionalRequires;
   final List<ToolPkgDependencyIssue> dependencyIssues;
   final Map<String, Object?> manifestExtensions;
   final List<String> author;
   final String mainEntry;
+  final List<ToolPkgManifestTheme> themes;
+  final String? license;
   final ToolPkgSourceType sourceType;
   final String sourcePath;
   final List<ToolPkgSubpackageRuntime> subpackages;
@@ -837,8 +938,12 @@ class ToolPkgContainerRuntime {
   final List<ToolPkgFunctionHookRuntime> chatInputHooks;
   final List<ToolPkgFunctionHookRuntime> chatViewHooks;
   final List<ToolPkgFunctionHookRuntime> chatMessageHooks;
+  final List<ToolPkgFunctionHookRuntime> messageTransformHooks;
+  final List<ToolPkgFunctionHookRuntime> messageStreamTransforms;
+  final List<ToolPkgFunctionHookRuntime> chatLifecycleHooks;
   final List<ToolPkgChatMessageMenuItemRuntime> chatMessageMenuItems;
   final List<ToolPkgFunctionHookRuntime> chatRuntimeHooks;
+  final List<ToolPkgFunctionHookRuntime> chatResponseHooks;
   final List<ToolPkgHostEventHookRuntime> hostEventHooks;
   final List<ToolPkgFunctionHookRuntime> toolLifecycleHooks;
   final List<ToolPkgFunctionHookRuntime> promptInputHooks;
@@ -1082,6 +1187,37 @@ class ToolPkgManifestRequirement {
   final String? maxVersion;
 }
 
+/// Generated SDK model for Rust type `operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgManifestTheme`.
+class ToolPkgManifestTheme {
+  const ToolPkgManifestTheme({
+    required this.id,
+    required this.path,
+    required this.preview,
+    required this.files,
+  });
+
+  /// Decodes `operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgManifestTheme` from a MessagePack value map.
+  factory ToolPkgManifestTheme.fromMessagePackValue(Map<String, Object?> value) => ToolPkgManifestTheme(
+    id: value['id'] as String,
+    path: value['path'] as String,
+    preview: value['preview'] as String,
+    files: (value['files'] as List<Object?>).map((item) => ManifestFile.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+  );
+
+  /// Encodes this model into a MessagePack-compatible value map.
+  Map<String, Object?> toMessagePackValue() => <String, Object?>{
+    'id': id,
+    'path': path,
+    'preview': preview,
+    'files': files.map((item) => item.toMessagePackValue()).toList(growable: false),
+  };
+
+  final String id;
+  final String path;
+  final String preview;
+  final List<ManifestFile> files;
+}
+
 /// Generated SDK model for Rust type `operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgMarketOrigin`.
 class ToolPkgMarketOrigin {
   const ToolPkgMarketOrigin({
@@ -1141,6 +1277,7 @@ class ToolPkgNavigationEntryRuntime {
   const ToolPkgNavigationEntryRuntime({
     required this.id,
     required this.routeId,
+    required this.params,
     required this.surface,
     required this.title,
     required this.action,
@@ -1152,6 +1289,7 @@ class ToolPkgNavigationEntryRuntime {
   factory ToolPkgNavigationEntryRuntime.fromMessagePackValue(Map<String, Object?> value) => ToolPkgNavigationEntryRuntime(
     id: value['id'] as String,
     routeId: value['routeId'] as String,
+    params: value['params'],
     surface: value['surface'] as String,
     title: LocalizedText.fromMessagePackValue(value['title'] as Map<String, Object?>),
     action: value['action'] == null ? null : ToolPkgNavigationActionHookRuntime.fromMessagePackValue(value['action'] as Map<String, Object?>),
@@ -1163,6 +1301,7 @@ class ToolPkgNavigationEntryRuntime {
   Map<String, Object?> toMessagePackValue() => <String, Object?>{
     'id': id,
     'routeId': routeId,
+    'params': params,
     'surface': surface,
     'title': title.toMessagePackValue(),
     'action': action == null ? null : action!.toMessagePackValue(),
@@ -1172,11 +1311,39 @@ class ToolPkgNavigationEntryRuntime {
 
   final String id;
   final String routeId;
+  final Object? params;
   final String surface;
   final LocalizedText title;
   final ToolPkgNavigationActionHookRuntime? action;
   final String? icon;
   final int order;
+}
+
+/// Generated SDK model for Rust type `operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgRegisteredFunctionHook`.
+class ToolPkgRegisteredFunctionHook {
+  const ToolPkgRegisteredFunctionHook({
+    required this.id,
+    required this.function,
+    required this.functionSource,
+  });
+
+  /// Decodes `operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgRegisteredFunctionHook` from a MessagePack value map.
+  factory ToolPkgRegisteredFunctionHook.fromMessagePackValue(Map<String, Object?> value) => ToolPkgRegisteredFunctionHook(
+    id: value['id'] as String,
+    function: value['function'] as String,
+    functionSource: value['functionSource'] == null ? null : value['functionSource'] as String,
+  );
+
+  /// Encodes this model into a MessagePack-compatible value map.
+  Map<String, Object?> toMessagePackValue() => <String, Object?>{
+    'id': id,
+    'function': function,
+    'functionSource': functionSource == null ? null : functionSource!,
+  };
+
+  final String id;
+  final String function;
+  final String? functionSource;
 }
 
 /// Generated SDK model for Rust type `operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgRegisteredManifestExtension`.
@@ -1339,6 +1506,7 @@ class ToolPkgUiModuleRuntime {
     required this.id,
     required this.runtime,
     required this.screen,
+    required this.screenExport,
     required this.title,
     required this.keepAlive,
   });
@@ -1348,6 +1516,7 @@ class ToolPkgUiModuleRuntime {
     id: value['id'] as String,
     runtime: value['runtime'] as String,
     screen: value['screen'] as String,
+    screenExport: value['screenExport'] == null ? null : value['screenExport'] as String,
     title: LocalizedText.fromMessagePackValue(value['title'] as Map<String, Object?>),
     keepAlive: value['keepAlive'] as bool,
   );
@@ -1357,6 +1526,7 @@ class ToolPkgUiModuleRuntime {
     'id': id,
     'runtime': runtime,
     'screen': screen,
+    'screenExport': screenExport == null ? null : screenExport!,
     'title': title.toMessagePackValue(),
     'keepAlive': keepAlive,
   };
@@ -1364,6 +1534,7 @@ class ToolPkgUiModuleRuntime {
   final String id;
   final String runtime;
   final String screen;
+  final String? screenExport;
   final LocalizedText title;
   final bool keepAlive;
 }
@@ -1375,6 +1546,7 @@ class ToolPkgUiRouteRuntime {
     required this.routeId,
     required this.runtime,
     required this.screen,
+    required this.screenExport,
     required this.title,
     required this.keepAlive,
   });
@@ -1385,6 +1557,7 @@ class ToolPkgUiRouteRuntime {
     routeId: value['routeId'] as String,
     runtime: value['runtime'] as String,
     screen: value['screen'] as String,
+    screenExport: value['screenExport'] == null ? null : value['screenExport'] as String,
     title: LocalizedText.fromMessagePackValue(value['title'] as Map<String, Object?>),
     keepAlive: value['keepAlive'] as bool,
   );
@@ -1395,6 +1568,7 @@ class ToolPkgUiRouteRuntime {
     'routeId': routeId,
     'runtime': runtime,
     'screen': screen,
+    'screenExport': screenExport == null ? null : screenExport!,
     'title': title.toMessagePackValue(),
     'keepAlive': keepAlive,
   };
@@ -1403,6 +1577,7 @@ class ToolPkgUiRouteRuntime {
   final String routeId;
   final String runtime;
   final String screen;
+  final String? screenExport;
   final LocalizedText title;
   final bool keepAlive;
 }
@@ -1506,6 +1681,265 @@ class ToolPkgWorkspaceTemplateRuntime {
   final LocalizedText description;
   final String resource_key;
   final String project_type;
+}
+
+/// Generated SDK model for Rust type `operit_plugin_theme::ManifestFile`.
+class ManifestFile {
+  const ManifestFile({
+    required this.path,
+    required this.media_type,
+  });
+
+  /// Decodes `operit_plugin_theme::ManifestFile` from a MessagePack value map.
+  factory ManifestFile.fromMessagePackValue(Map<String, Object?> value) => ManifestFile(
+    path: value['path'] as String,
+    media_type: value['mediaType'] as String,
+  );
+
+  /// Encodes this model into a MessagePack-compatible value map.
+  Map<String, Object?> toMessagePackValue() => <String, Object?>{
+    'path': path,
+    'mediaType': media_type,
+  };
+
+  final String path;
+  final String media_type;
+}
+
+/// Generated SDK model for Rust type `operit_runtime::core::application::ExtensionCatalogSupport::ExtensionCatalogCandidate`.
+class ExtensionCatalogCandidate {
+  const ExtensionCatalogCandidate({
+    required this.id,
+    required this.kind,
+    required this.display_name,
+    required this.description,
+    required this.version,
+    required this.authors,
+    required this.category,
+    required this.required_scope,
+    required this.tool_count,
+    required this.subpackage_count,
+  });
+
+  /// Decodes `operit_runtime::core::application::ExtensionCatalogSupport::ExtensionCatalogCandidate` from a MessagePack value map.
+  factory ExtensionCatalogCandidate.fromMessagePackValue(Map<String, Object?> value) => ExtensionCatalogCandidate(
+    id: value['id'] as String,
+    kind: value['kind'] as String,
+    display_name: value['displayName'] as String,
+    description: value['description'] as String,
+    version: value['version'] as String,
+    authors: (value['authors'] as List<Object?>).map((item) => item as String).toList(growable: false),
+    category: value['category'] as String,
+    required_scope: value['requiredScope'] == null ? null : value['requiredScope'] as String,
+    tool_count: (value['toolCount'] as num).toInt(),
+    subpackage_count: (value['subpackageCount'] as num).toInt(),
+  );
+
+  /// Encodes this model into a MessagePack-compatible value map.
+  Map<String, Object?> toMessagePackValue() => <String, Object?>{
+    'id': id,
+    'kind': kind,
+    'displayName': display_name,
+    'description': description,
+    'version': version,
+    'authors': authors.map((item) => item).toList(growable: false),
+    'category': category,
+    'requiredScope': required_scope == null ? null : required_scope!,
+    'toolCount': tool_count,
+    'subpackageCount': subpackage_count,
+  };
+
+  final String id;
+  final String kind;
+  final String display_name;
+  final String description;
+  final String version;
+  final List<String> authors;
+  final String category;
+  final String? required_scope;
+  final int tool_count;
+  final int subpackage_count;
+}
+
+/// Generated SDK model for Rust type `operit_runtime::core::application::ExtensionCatalogSupport::ExtensionCatalogDiagnostic`.
+class ExtensionCatalogDiagnostic {
+  const ExtensionCatalogDiagnostic({
+    required this.source_path,
+    required this.package_id,
+    required this.display_name,
+    required this.code,
+    required this.message,
+    required this.package_kind,
+    required this.can_delete,
+  });
+
+  /// Decodes `operit_runtime::core::application::ExtensionCatalogSupport::ExtensionCatalogDiagnostic` from a MessagePack value map.
+  factory ExtensionCatalogDiagnostic.fromMessagePackValue(Map<String, Object?> value) => ExtensionCatalogDiagnostic(
+    source_path: value['sourcePath'] as String,
+    package_id: value['packageId'] == null ? null : value['packageId'] as String,
+    display_name: value['displayName'] as String,
+    code: value['code'] as String,
+    message: value['message'] as String,
+    package_kind: value['packageKind'] as String,
+    can_delete: value['canDelete'] as bool,
+  );
+
+  /// Encodes this model into a MessagePack-compatible value map.
+  Map<String, Object?> toMessagePackValue() => <String, Object?>{
+    'sourcePath': source_path,
+    'packageId': package_id == null ? null : package_id!,
+    'displayName': display_name,
+    'code': code,
+    'message': message,
+    'packageKind': package_kind,
+    'canDelete': can_delete,
+  };
+
+  final String source_path;
+  final String? package_id;
+  final String display_name;
+  final String code;
+  final String message;
+  final String package_kind;
+  final bool can_delete;
+}
+
+/// Generated SDK model for Rust type `operit_runtime::core::application::ExtensionCatalogSupport::ExtensionCatalogEntry`.
+class ExtensionCatalogEntry {
+  const ExtensionCatalogEntry({
+    required this.id,
+    required this.kind,
+    required this.source,
+    required this.display_name,
+    required this.description,
+    required this.version,
+    required this.authors,
+    required this.category,
+    required this.scope,
+    required this.activation_state,
+    required this.runtime_state,
+    required this.update_state,
+    required this.is_customized,
+    required this.market_entry_id,
+    required this.installed_market_version_id,
+    required this.logo_resource_key,
+    required this.logo_mime_type,
+    required this.tool_count,
+    required this.subpackage_count,
+    required this.ui_module_count,
+    required this.has_ui,
+    required this.chat_sidebar_entry_ids,
+    required this.dependency_issue_count,
+  });
+
+  /// Decodes `operit_runtime::core::application::ExtensionCatalogSupport::ExtensionCatalogEntry` from a MessagePack value map.
+  factory ExtensionCatalogEntry.fromMessagePackValue(Map<String, Object?> value) => ExtensionCatalogEntry(
+    id: value['id'] as String,
+    kind: value['kind'] as String,
+    source: value['source'] as String,
+    display_name: value['displayName'] as String,
+    description: value['description'] as String,
+    version: value['version'] as String,
+    authors: (value['authors'] as List<Object?>).map((item) => item as String).toList(growable: false),
+    category: value['category'] as String,
+    scope: value['scope'] as String,
+    activation_state: value['activationState'] as String,
+    runtime_state: value['runtimeState'] as String,
+    update_state: value['updateState'] as String,
+    is_customized: value['isCustomized'] as bool,
+    market_entry_id: value['marketEntryId'] == null ? null : value['marketEntryId'] as String,
+    installed_market_version_id: value['installedMarketVersionId'] == null ? null : value['installedMarketVersionId'] as String,
+    logo_resource_key: value['logoResourceKey'] == null ? null : value['logoResourceKey'] as String,
+    logo_mime_type: value['logoMimeType'] == null ? null : value['logoMimeType'] as String,
+    tool_count: (value['toolCount'] as num).toInt(),
+    subpackage_count: (value['subpackageCount'] as num).toInt(),
+    ui_module_count: (value['uiModuleCount'] as num).toInt(),
+    has_ui: value['hasUi'] as bool,
+    chat_sidebar_entry_ids: (value['chatSidebarEntryIds'] as List<Object?>).map((item) => item as String).toList(growable: false),
+    dependency_issue_count: (value['dependencyIssueCount'] as num).toInt(),
+  );
+
+  /// Encodes this model into a MessagePack-compatible value map.
+  Map<String, Object?> toMessagePackValue() => <String, Object?>{
+    'id': id,
+    'kind': kind,
+    'source': source,
+    'displayName': display_name,
+    'description': description,
+    'version': version,
+    'authors': authors.map((item) => item).toList(growable: false),
+    'category': category,
+    'scope': scope,
+    'activationState': activation_state,
+    'runtimeState': runtime_state,
+    'updateState': update_state,
+    'isCustomized': is_customized,
+    'marketEntryId': market_entry_id == null ? null : market_entry_id!,
+    'installedMarketVersionId': installed_market_version_id == null ? null : installed_market_version_id!,
+    'logoResourceKey': logo_resource_key == null ? null : logo_resource_key!,
+    'logoMimeType': logo_mime_type == null ? null : logo_mime_type!,
+    'toolCount': tool_count,
+    'subpackageCount': subpackage_count,
+    'uiModuleCount': ui_module_count,
+    'hasUi': has_ui,
+    'chatSidebarEntryIds': chat_sidebar_entry_ids.map((item) => item).toList(growable: false),
+    'dependencyIssueCount': dependency_issue_count,
+  };
+
+  final String id;
+  final String kind;
+  final String source;
+  final String display_name;
+  final String description;
+  final String version;
+  final List<String> authors;
+  final String category;
+  final String scope;
+  final String activation_state;
+  final String runtime_state;
+  final String update_state;
+  final bool is_customized;
+  final String? market_entry_id;
+  final String? installed_market_version_id;
+  final String? logo_resource_key;
+  final String? logo_mime_type;
+  final int tool_count;
+  final int subpackage_count;
+  final int ui_module_count;
+  final bool has_ui;
+  final List<String> chat_sidebar_entry_ids;
+  final int dependency_issue_count;
+}
+
+/// Generated SDK model for Rust type `operit_runtime::core::application::ExtensionCatalogSupport::ExtensionCatalogSnapshot`.
+class ExtensionCatalogSnapshot {
+  const ExtensionCatalogSnapshot({
+    required this.revision,
+    required this.installed,
+    required this.bundled_available,
+    required this.diagnostics,
+  });
+
+  /// Decodes `operit_runtime::core::application::ExtensionCatalogSupport::ExtensionCatalogSnapshot` from a MessagePack value map.
+  factory ExtensionCatalogSnapshot.fromMessagePackValue(Map<String, Object?> value) => ExtensionCatalogSnapshot(
+    revision: (value['revision'] as num).toInt(),
+    installed: (value['installed'] as List<Object?>).map((item) => ExtensionCatalogEntry.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    bundled_available: (value['bundledAvailable'] as List<Object?>).map((item) => ExtensionCatalogCandidate.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    diagnostics: (value['diagnostics'] as List<Object?>).map((item) => ExtensionCatalogDiagnostic.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+  );
+
+  /// Encodes this model into a MessagePack-compatible value map.
+  Map<String, Object?> toMessagePackValue() => <String, Object?>{
+    'revision': revision,
+    'installed': installed.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'bundledAvailable': bundled_available.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'diagnostics': diagnostics.map((item) => item.toMessagePackValue()).toList(growable: false),
+  };
+
+  final int revision;
+  final List<ExtensionCatalogEntry> installed;
+  final List<ExtensionCatalogCandidate> bundled_available;
+  final List<ExtensionCatalogDiagnostic> diagnostics;
 }
 
 /// Generated SDK model for Rust type `operit_tools::ConversationMarkupManager::ToolResult`.

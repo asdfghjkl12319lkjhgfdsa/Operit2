@@ -1,8 +1,14 @@
 {
   "@@locale": "zh",
+  "chatPromoteToRoot": "提升为主对话",
+  "workspaceUnsavedChangesTitle": "有未保存的修改",
+  "workspaceUnsavedChangesMessage": "关闭此文件前，要保存你的修改吗？",
+  "workspaceDiscardChanges": "放弃修改",
   "askOperitHint": "向 Operit 提问",
   "aiChat": "AI聊天",
   "fullscreenInput": "全屏输入",
+  "noticeExpand": "展开全文",
+  "noticeCollapse": "收起",
   "expandInput": "展开输入框",
   "collapseInput": "收起输入框",
   "settings": "设置",
@@ -11,7 +17,6 @@
   "addAttachment": "添加附件",
   "attachmentPhoto": "照片",
   "attachmentCamera": "拍照",
-  "attachmentMemory": "记忆",
   "attachmentFile": "文件",
   "attachmentScreenContent": "屏幕内容",
   "attachmentNotifications": "当前通知",
@@ -25,7 +30,6 @@
   "attachmentPackageKindSkill": "技能",
   "attachmentPackageKindMcp": "MCP",
   "attachmentCameraUnavailable": "当前 Flutter 端没有相机采集能力",
-  "attachmentMemoryUnavailable": "当前 Flutter 端没有记忆文件夹选择器",
   "clearSearch": "清空搜索",
   "chatPendingQueueTitle": "待发送消息（{count}）",
   "@chatPendingQueueTitle": {
@@ -37,6 +41,15 @@
   },
   "chatQueueAddMessage": "加入队列",
   "chatQueueAdded": "已加入发送队列",
+  "chatSendOptions": "选择发送方式",
+  "chatQueueAddMessageDescription": "当前回复结束后自动发送（默认）",
+  "chatGuideCurrentTurn": "引导当前对话",
+  "chatGuideCurrentTurnDescription": "不打断当前任务，在后续模型请求中生效",
+  "chatInterruptAndSend": "打断并发送",
+  "chatInterruptAndSendDescription": "停止当前回复，立即发送这条消息",
+  "chatGuidanceAccepted": "已添加引导，将在后续模型请求中生效",
+  "chatGuidanceTextOnly": "引导仅支持文本，请先移除附件和回复目标。",
+  "chatQueueWithdrawToEditor": "撤回到编辑框",
   "chatPleaseCreateNewChat": "请新建对话",
   "cancel": "取消",
   "send": "发送",
@@ -46,18 +59,15 @@
   "connectingAiService": "正在连接 AI 服务...",
   "receivingAiResponse": "正在接收 AI 响应...",
   "receivingToolResultAiResponse": "正在接收工具执行后的 AI 响应...",
-  "roleResponsePlannerPlanning": "正在规划群组发言顺序...",
-  "roleResponsePlannerMemberReplying": "正在生成「{memberName}」的回复...",
-  "@roleResponsePlannerMemberReplying": {
-    "placeholders": {
-      "memberName": {
-        "type": "String"
-      }
-    }
-  },
-  "roleResponsePlannerFailed": "群组规划失败",
   "summarizingMemories": "正在总结记忆...",
   "summaryGenerating": "正在生成总结...",
+  "summaryStageCore": "正在整理核心任务...",
+  "summaryStageConstraints": "正在整理用户需求与约束...",
+  "summaryStageFiles": "正在整理关键文件与代码...",
+  "summaryStageErrors": "正在整理错误与修复...",
+  "summaryStageInteraction": "正在整理互动与设定...",
+  "summaryStageNext": "正在整理下一步...",
+  "summaryStageFormatting": "正在调整总结格式...",
   "chatCompressingHistory": "正在压缩历史记录...",
   "executingPlan": "正在执行计划...",
   "executingTool": "正在执行工具: {toolName}",
@@ -99,6 +109,13 @@
     }
   },
   "close": "关闭",
+  "workspaceCloseOtherTabs": "关闭其他",
+  "workspaceOpenWith": "打开方式",
+  "workspaceDockDropTarget": "拖到工作区",
+  "workspaceBuiltInPreview": "内置预览",
+  "workspacePluginUnsavedChanges": "请先在编辑器中保存，或放弃未保存的修改。",
+  "workspaceCloseTabsToRight": "关闭右侧",
+  "workspaceCloseAllTabs": "关闭全部",
   "commonExpand": "展开",
   "commonCollapse": "收起",
   "create": "创建",
@@ -112,8 +129,6 @@
   "toolApprovalDeny": "拒绝",
   "toolApprovalAllowOnce": "允许本次",
   "toolApprovalAlwaysAllow": "本次会话中始终允许",
-  "createGroupTitle": "新建分组",
-  "groupNameLabel": "群组名称",
   "renameConversationTitle": "编辑标题",
   "newTitleLabel": "新标题",
   "deleteConversationTitle": "确认删除对话",
@@ -156,6 +171,17 @@
       }
     }
   },
+  "messageLocatorSearchMessages": "搜索消息",
+  "messageLocatorViewFavorites": "查看收藏",
+  "messageLocatorAll": "全部",
+  "messageLocatorFavorites": "收藏",
+  "messageLocatorNoFavorites": "还没有收藏的消息",
+  "messageLocatorLoadFailed": "暂时无法加载消息，请重试",
+  "messageTransformFailed": "消息显示处理失败：{error}",
+  "@messageTransformFailed": { "placeholders": { "error": { "type": "String" } } },
+  "messageLocatorFavoriteFailed": "收藏更新失败，请重试",
+  "messageLocatorAddFavorite": "收藏消息",
+  "messageLocatorRemoveFavorite": "取消收藏",
   "messageLocatorNoMatches": "没有匹配的消息",
   "messageSenderUser": "用户",
   "messageSenderSummary": "总结",
@@ -194,6 +220,7 @@
   },
   "messageSenderOther": "其他",
   "hiddenUserMessage": "隐藏的用户消息",
+  "autoTriggeredUserMessage": "自动触发",
   "workspaceSetupTitle": "设置工作区",
   "workspaceSetupSubtitle": "为您的AI项目提供一个专属的文件环境",
   "workspaceCreateTitle": "创建工作区",
@@ -207,6 +234,11 @@
   "workspaceAddFolderDescription": "把另一个文件夹挂进当前工作区",
   "workspaceProjectTypeDialogTitle": "选择语言类型",
   "workspaceProjectTypeDialogDescription": "请选择要创建的默认工作区类型",
+  "workspaceUnbindTitle": "从当前对话移除项目",
+  "workspaceUnbindDescription": "解除当前会话的关联，保留工作区文件",
+  "workspaceUnbindConfirmation": "确定解除当前会话与工作区的绑定吗？工作区和文件都会保留，不影响其他会话，之后可以重新绑定工作区。",
+  "workspaceUnbindFailed": "解除绑定失败，请重试。",
+  "workspaceUnbindChanged": "当前会话或工作区已切换，请取消后重试。",
   "workspaceBindDialogTitle": "选择已有工作区",
   "workspacePathLabel": "已选工作区",
   "workspaceEnvLabel": "工作区环境",
@@ -268,7 +300,7 @@
       }
     }
   },
-  "desktopWidgetsCount": "桌面组件 {count}",
+  "desktopWidgetsCount": "桌面小部件 {count}",
   "@desktopWidgetsCount": {
     "placeholders": {
       "count": {
@@ -311,6 +343,19 @@
   "disable": "停用",
   "enable": "启用",
   "environmentVariables": "环境变量",
+  "packageConfigureEnvironmentVariables": "配置环境变量",
+  "packageNoEnvironmentVariables": "当前已启用的工具包没有声明需要的环境变量。",
+  "packageEnvironmentOptional": "可选",
+  "packageEnvironmentInputRequired": "输入值（必需）",
+  "packageEnvironmentInputOptional": "输入值（可选）",
+  "packageEnvironmentDefault": "默认: {value}",
+  "@packageEnvironmentDefault": {
+    "placeholders": {
+      "value": {
+        "type": "String"
+      }
+    }
+  },
   "required": "必填",
   "states": "状态",
   "stateToolSummary": "{condition} · {toolCount} 工具 · 排除 {excludeCount}",
@@ -360,6 +405,8 @@
   "searchHistory": "搜索历史",
   "noDownloadTasks": "还没有下载任务",
   "openFile": "打开文件",
+  "workspaceFileOpening": "正在打开文件…",
+  "workspaceFileOpenTimedOut": "打开文件超时，请重试。",
   "openLocation": "打开位置",
   "retry": "重试",
   "removeRecord": "移除记录",
@@ -436,14 +483,8 @@
   "settingsCategoryModelSubtitle": "模型、Key、上下文",
   "settingsCategoryModelDescription": "配置模型连接，选择聊天模型，并管理思考、上下文和多模态能力。",
   "settingsCategoryLocalModelsTitle": "本地模型",
-  "settingsCategoryLocalModelsSubtitle": "下载、引擎、STT / TTS",
+  "settingsCategoryLocalModelsSubtitle": "LLM、下载、STT / TTS",
   "settingsCategoryLocalModelsDescription": "管理按需安装的本地模型和推理引擎。",
-  "settingsCategoryCharactersTitle": "角色",
-  "settingsCategoryCharactersSubtitle": "角色卡、群组、绑定",
-  "settingsCategoryCharactersDescription": "管理角色卡、群组、当前激活角色和角色级模型/记忆/工具绑定。",
-  "settingsCategoryMemoryTitle": "记忆",
-  "settingsCategoryMemorySubtitle": "记忆图谱、共享记忆库、用户资料",
-  "settingsCategoryMemoryDescription": "管理角色与共享记忆库、记忆图谱可视化、用户资料与自动更新策略。",
   "settingsCategoryToolsTitle": "工具与权限",
   "settingsCategoryToolsSubtitle": "AI 能力、系统授权、扩展",
   "settingsCategoryToolsDescription": "设置 AI 的只读、读写或完整权限，并查看当前设备的系统授权状态。",
@@ -452,13 +493,15 @@
   "settingsCategoryWorkspaceDescription": "管理默认工作区、终端会话、浏览器模式、脚本和网页自动化。",
   "settingsCategoryGlobalBehaviorTitle": "全局行为设置",
   "settingsCategoryGlobalBehaviorSubtitle": "输入处理与交互",
-  "settingsCategoryGlobalBehaviorDescription": "设置不随角色卡变化的输入与交互行为。",
+  "settingsCategoryGlobalBehaviorDescription": "设置应用全局的输入与交互行为。",
   "settingsCategoryAppearanceTitle": "外观与交互",
   "settingsCategoryAppearanceSubtitle": "主题、气泡与交互",
   "settingsCategoryAppearanceDescription": "调整全局主题、背景壁纸、聊天气泡样式与信息流交互。",
   "settingsCategoryDataTitle": "数据与备份",
-  "settingsCategoryDataSubtitle": "备份、恢复、统计",
-  "settingsCategoryDataDescription": "备份聊天、角色和模型配置，恢复备份内容，并查看数据统计。",
+  "settingsCategoryDataSubtitle": "备份、恢复、存储",
+  "settingsCategoryDataDescription": "备份和恢复聊天、插件数据及模型配置，并管理存储位置。",
+  "settingsUsageReportTitle": "Token 用量报告",
+  "settingsUsageReportSubtitle": "模型用量、缓存与费用",
   "settingsCategoryAccessLinksTitle": "设备空间",
   "settingsCategoryAccessLinksSubtitle": "连接、同步、协同",
   "settingsCategoryAccessLinksDescription": "管理当前设备空间，连接设备并同步数据和路由。",
@@ -477,7 +520,7 @@
       }
     }
   },
-  "settingsComingSoon": "这个区域会继续接入现有 runtime 能力。当前优先完成模型、角色和工具设置。",
+  "settingsComingSoon": "这个区域会继续接入现有 runtime 能力。当前优先完成模型和工具设置。",
   "settingsAdvanced": "高级设置",
   "settingsActive": "当前",
   "settingsActivate": "设为当前",
@@ -488,8 +531,6 @@
   "settingsModelNoModels": "暂无模型",
   "settingsModelProviderModelCount": "{count} 个模型",
   "settingsModelSetCurrentActive": "设为当前",
-  "settingsChatThinkingMode": "思考模式",
-  "settingsChatThinkingModeDescription": "让支持的模型输出更稳的推理过程。",
   "settingsChatStreamOutput": "流式输出",
   "settingsChatStreamOutputDescription": "回复生成时逐步显示内容。",
   "settingsModelProfilesSection": "模型档案",
@@ -582,7 +623,6 @@
     }
   },
   "settingsTtsCurrentConfigCannotDelete": "当前正在使用的 TTS 配置不能删除",
-  "settingsTtsConfigUsedByCharacter": "该 TTS 配置正在被角色卡使用，不能删除",
   "settingsModelChatAutoGlmWarning": "禁止使用 AutoGLM 作为对话主模型。对话模型和 UI 控制模型是分离的，请选择其他大模型。",
   "settingsModelFunctionChat": "聊天",
   "settingsModelFunctionChatDescription": "主对话回复使用的模型。",
@@ -615,6 +655,8 @@
   "settingsModelApiEndpoint": "API 地址",
   "settingsModelModelNames": "模型名称",
   "settingsModelApiKey": "API Key",
+  "settingsModelShowApiKey": "显示 API Key",
+  "settingsModelHideApiKey": "隐藏 API Key",
   "settingsModelCodexLogin": "ChatGPT 登录",
   "settingsModelCodexLoginTitle": "登录 ChatGPT Codex",
   "settingsModelCodexLoginDescription": "OpenAI Codex 使用 ChatGPT 订阅登录，不使用 API Key。",
@@ -642,7 +684,7 @@
     }
   },
   "settingsModelApiKeyPool": "API Key 池",
-  "settingsModelApiKeyPoolDescription": "给同一个模型配置准备多个 Key，用于多 Key 轮换。",
+  "settingsModelApiKeyPoolDescription": "持续使用健康的 Key；遇到鉴权、额度、限流或临时故障时切换，并跳过冷却中的 Key。",
   "settingsModelApiKeyPoolCount": "{count} 个 Key",
   "@settingsModelApiKeyPoolCount": {
     "placeholders": {
@@ -651,11 +693,20 @@
       }
     }
   },
-  "settingsModelApiKeyPoolEmpty": "还没有 Key。添加后，运行时会按当前配置使用 Key 池。",
+  "settingsModelApiKeyPoolEmpty": "Key 池为空，请添加 Key 后再启用。",
   "settingsModelAddApiKey": "添加 Key",
   "settingsModelEditApiKey": "编辑 Key",
   "settingsModelApiKeyName": "Key 名称",
   "settingsModelApiKeyEnabled": "启用这个 Key",
+  "settingsModelPoolAddSingle": "添加当前单 Key",
+  "settingsModelPoolPaste": "每行粘贴一个 Key，可批量添加。",
+  "settingsModelPoolNoEligible": "请至少启用一个非空且未标记为不可用的 Key。",
+  "settingsModelPoolUntested": "未测试",
+  "settingsModelPoolAvailable": "可用",
+  "settingsModelPoolUnavailable": "不可用",
+  "settingsModelPoolClearMarks": "重置 Key 状态",
+  "settingsModelPoolTest": "测试未检测的 Key",
+  "settingsModelPoolNeedsModel": "保存供应商并添加模型后，即可测试 Key。",
   "settingsModelProviderId": "供应商 ID",
   "settingsModelProvidersSection": "LLM 供应商",
   "settingsModelProviderType": "供应商类型",
@@ -690,7 +741,6 @@
   "settingsModelProviderTypeDeepseek": "DeepSeek",
   "settingsModelProviderTypeMistral": "Mistral",
   "settingsModelProviderTypeSiliconflow": "硅基流动",
-  "settingsModelProviderTypeIflow": "心流",
   "settingsModelProviderTypeOpenrouter": "OpenRouter",
   "settingsModelProviderTypeOpencode": "OpenCode",
   "settingsModelProviderTypeFourRouter": "4Router",
@@ -715,6 +765,23 @@
       "error": {}
     }
   },
+  "localModelsAddModel": "添加模型",
+  "localModelsFilterDownloads": "下载任务",
+  "localModelsAllTypes": "全部类型",
+  "localModelsNoMatches": "没有符合条件的模型",
+  "localModelsResetFilters": "重置筛选",
+  "localModelsDetails": "模型详情",
+  "localModelsMoreActions": "更多操作",
+  "localModelsResultCount": "显示 {count} / {total} 个模型",
+  "@localModelsResultCount": {
+    "placeholders": {
+      "count": {"type": "int"},
+      "total": {"type": "int"}
+    }
+  },
+  "localModelsHubRepositoryTab": "仓库地址",
+  "localModelsDownloadFailed": "下载失败",
+  "localModelsDownloadPausedLabel": "已暂停",
   "localModelsCatalog": "模型目录",
   "localModelsCategorySpeechToText": "语音识别（STT）模型",
   "localModelsCategoryTextToSpeech": "语音合成（TTS）模型",
@@ -812,6 +879,36 @@
   "settingsModelAvailableSourceFetched": "已拉取",
   "settingsModelAvailableSourceHistory": "历史",
   "settingsModelAvailableEmptyFetched": "没有拉取到的模型。可选择「包含历史」查看目录中的模型 ID。",
+  "settingsModelUnrecognized": "未识别",
+  "settingsModelCatalogUpdatedAt": "能力和上下文信息来自 models.dev，{time} 更新",
+  "@settingsModelCatalogUpdatedAt": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelCatalogUpdateFailed": "模型信息下载失败：{error}",
+  "@settingsModelCatalogUpdateFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelCatalogUpdateFailedUsing": "模型信息更新失败，暂用 {time} 的信息：{error}",
+  "@settingsModelCatalogUpdateFailedUsing": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      },
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelCatalogBundled": "使用内置模型信息，联网更新成功后自动替换",
+  "settingsModelCatalogRetry": "更新",
   "settingsModelCustomModel": "自定义模型",
   "settingsModelModelId": "模型 ID",
   "settingsModelDuplicateModelId": "该模型已添加到当前供应商。",
@@ -835,9 +932,7 @@
   "settingsModelContextLength": "上下文长度",
   "settingsModelMaxContextLength": "最大上下文长度",
   "settingsModelMaxContextLengthInvalid": "请输入大于 0 的最大上下文长度",
-  "settingsModelSummaryThreshold": "总结 Token 阈值",
-  "settingsModelSummaryByMessageCount": "按消息数总结",
-  "settingsModelSummaryMessageCount": "总结消息数阈值",
+  "settingsModelSummaryThreshold": "总结阈值",
   "settingsModelCustomHeaders": "自定义 Headers",
   "settingsModelCustomParameters": "自定义参数 JSON",
   "settingsModelToolCall": "工具调用",
@@ -850,22 +945,70 @@
   "settingsModelDirectVideoDescription": "支持视频能力的模型可直接接收视频。",
   "settingsModelGoogleSearch": "Google 搜索",
   "settingsModelGoogleSearchDescription": "启用供应商侧搜索能力。",
-  "settingsModelContext": "上下文窗口",
+  "settingsModelContext": "上下文",
   "settingsModelSummary": "自动总结",
   "settingsModelThinking": "思考",
-  "settingsModelThinkingOption": "思考档位",
-  "settingsModelThinkingRules": "思考规则 JSON",
+  "thinkingLevelLabel": "思考程度",
+  "thinkingAlwaysOn": "始终思考",
+  "thinkingChip": "思考",
+  "settingsModelThinkingSourceDeclared": "档位按你的描述",
+  "settingsModelThinkingSourceLocalRuntime": "本地运行：可以开关思考，模型本身不会思考时开关不起作用",
+  "settingsModelThinkingUnknown": "目录里没有这个模型的思考信息",
+  "settingsModelThinkingNotAdjustable": "当前接口不能调节这个模型的思考",
+  "settingsModelThinkingNotSupported": "这个模型不会思考",
+  "settingsModelThinkingCarried": "沿用你最近一次设置的档位",
+  "settingsModelThinkingDescribe": "手动描述",
+  "settingsModelThinkingUseCatalog": "改回目录描述",
+  "settingsModelThinkingDescribeTitle": "这个模型怎么思考",
+  "settingsModelThinkingKindNone": "不会思考",
+  "settingsModelThinkingKindAlways": "总是思考，不能调节",
+  "settingsModelThinkingKindSwitch": "只能开关",
+  "settingsModelThinkingKindLevels": "分档位",
+  "settingsModelThinkingKindBudget": "按 token 预算",
+  "settingsModelThinkingCanTurnOff": "可以关闭思考",
+  "settingsModelThinkingBudgetMin": "最少 token",
+  "settingsModelThinkingBudgetMax": "最多 token",
+  "settingsModelThinkingLevelsRequired": "至少选一个档位",
   "settingsModelMediaHistory": "媒体历史",
   "settingsModelCapabilities": "能力",
   "settingsModelBuiltinTools": "内置工具",
   "settingsModelBuiltinToolExclusive": "开启后会关闭外部工具调用",
-  "settingsModelConnectionTestSection": "连接测试",
   "settingsModelRunConnectionTest": "测试当前模型",
-  "settingsModelTestModel": "测试模型",
+  "settingsModelTestModel": "测试",
+  "settingsModelCapabilityToolCall": "工具调用",
+  "settingsModelCapabilityImage": "图片",
+  "settingsModelCapabilityAudio": "音频",
+  "settingsModelCapabilityVideo": "视频",
+  "settingsModelClaudeCache": "Claude 1 小时缓存",
+  "settingsModelClaudeCacheDescription": "为显式缓存断点设置 1 小时 TTL；关闭时使用默认 TTL。",
+  "settingsModelSummaryThresholdDescription": "上下文占用达到这个比例时自动总结，填 0 关闭。",
+  "settingsModelMoreActions": "更多操作",
+  "settingsModelRestoreDefaults": "恢复默认值",
+  "settingsModelDescribeThinking": "手动描述思考档位",
+  "settingsModelDeleteModel": "删除模型",
+  "settingsModelSaveFailed": "保存失败：{error}",
+  "settingsModelTestAll": "测试全部",
+  "settingsModelTestProgress": "测试中 {done}/{total}",
+  "settingsModelTestSummary": "{passed} 个通过，{failed} 个失败",
+  "settingsModelTestSummaryWithRestricted": "{passed} 个通过，{failed} 个失败，{restricted} 个受限",
+  "settingsModelTestAllPassed": "{count} 个全部通过",
+  "settingsModelTestCouldNotRun": "测试没能运行",
+  "settingsModelCopyError": "复制错误信息",
+  "settingsModelSelect": "多选",
+  "settingsModelCheckAll": "全选",
+  "settingsModelCheckedCount": "已选 {count} 个",
+  "settingsModelDeleteModelsTitle": "删除 {count} 个模型？",
+  "settingsModelDeleteModelsMessage": "这些模型的设置会一起删除。",
+  "settingsModelDeleteModelsKept": "{count} 个正在被功能使用，会保留：{names}",
+  "settingsModelDeleteModelsBlocked": "所选模型正在被这些功能使用，请先更改功能模型分配：{functions}",
+  "settingsModelDeletedCount": "已删除 {count} 个模型",
   "settingsModelTestingConnection": "正在测试当前模型连接…",
   "settingsModelTestedModel": "测试模型",
   "settingsModelConnectionTestPassed": "全部通过",
   "settingsModelConnectionTestFailed": "存在失败项",
+  "settingsModelConnectionTestRestricted": "检测受限",
+  "settingsModelTestCreditRestricted": "账户额度或输出预算受限",
+  "settingsModelTestRateRestricted": "上游限流或冷却中",
   "settingsModelCapabilitiesApplied": "已按测试结果更新模型能力开关。",
   "settingsModelCapabilitiesNeedChat": "聊天测试未通过，模型能力开关未更新。",
   "settingsModelConnectionTestError": "连接测试失败：{error}",
@@ -882,172 +1025,6 @@
   "settingsModelTestItemAudio": "音频",
   "settingsModelTestItemVideo": "视频",
   "settingsModelTestItemUnknown": "未知项",
-  "settingsCharactersCreateCard": "新建角色卡",
-  "settingsCharactersEditCard": "编辑角色卡",
-  "settingsCharactersCardName": "角色名称",
-  "settingsCharactersCreateGroup": "新建群组",
-  "settingsCharactersEditGroup": "编辑群组",
-  "settingsCharactersGroupName": "群组名称",
-  "settingsCharactersDescription": "描述",
-  "settingsCharactersCharacterSetting": "角色设定",
-  "settingsCharactersOpeningStatement": "开场白",
-  "settingsCharactersOtherContentChat": "聊天附加内容",
-  "settingsCharactersOtherContentVoice": "语音附加内容",
-  "settingsCharactersAdvancedPrompt": "高级自定义 Prompt",
-  "settingsCharactersMarks": "备注",
-  "settingsCharactersTags": "标签",
-  "settingsCharactersNoTags": "当前没有可选标签。可在标签管理中创建后绑定到角色卡。",
-  "settingsCharactersImport": "导入",
-  "settingsCharactersExport": "导出",
-  "settingsCharactersImportJson": "导入 JSON",
-  "settingsCharactersExportJson": "导出 JSON",
-  "settingsCharactersImportTavernJson": "导入 Tavern JSON",
-  "settingsCharactersExportTavernJson": "导出 Tavern JSON",
-  "settingsCharactersImportCardJson": "导入角色卡 JSON",
-  "settingsCharactersImportCardJsonDone": "已导入角色卡。",
-  "settingsCharactersImportTavernJsonDone": "已导入 Tavern 角色卡。",
-  "settingsCharactersImportGroupJson": "导入群组 JSON",
-  "settingsCharactersImportGroupJsonDone": "已导入群组。",
-  "settingsCharactersImportJsonError": "导入 JSON 失败：{error}",
-  "@settingsCharactersImportJsonError": {
-    "placeholders": {
-      "error": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersImportTavernJsonError": "导入 Tavern JSON 失败：{error}",
-  "@settingsCharactersImportTavernJsonError": {
-    "placeholders": {
-      "error": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersExportJsonError": "导出 JSON 失败：{error}",
-  "@settingsCharactersExportJsonError": {
-    "placeholders": {
-      "error": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersExportTavernJsonError": "导出 Tavern JSON 失败：{error}",
-  "@settingsCharactersExportTavernJsonError": {
-    "placeholders": {
-      "error": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersTagsSection": "标签",
-  "settingsCharactersManageTags": "管理标签",
-  "settingsCharactersCreateTag": "新建标签",
-  "settingsCharactersEditTag": "编辑标签",
-  "settingsCharactersDeleteTag": "删除标签",
-  "settingsCharactersDeleteTagMessage": "确定删除“{name}”吗？",
-  "@settingsCharactersDeleteTagMessage": {
-    "placeholders": {
-      "name": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersTagName": "标签名称",
-  "settingsCharactersTagDescription": "标签描述",
-  "settingsCharactersTagPromptContent": "Prompt 内容",
-  "settingsCharactersChatModelBindingMode": "聊天模型绑定模式",
-  "settingsCharactersChatModelConfigId": "聊天模型配置 ID",
-  "settingsCharactersChatModelIndex": "聊天模型序号",
-  "settingsCharactersToolAccess": "工具权限模式",
-  "settingsCharactersChatModelFollowGlobal": "跟随全局模型",
-  "settingsCharactersChatModelFixedConfig": "固定模型配置",
-  "settingsCharactersChatModelConfig": "模型配置",
-  "settingsCharactersToolAccessFollowGlobal": "跟随全局工具权限",
-  "settingsCharactersToolAccessCustom": "自定义角色工具权限",
-  "settingsCharactersToolAccessEmpty": "已启用，但未选择任何工具",
-  "settingsCharactersToolAccessSummaryCounts": "内置 {builtinCount} · 工具包 {packageCount} · 技能 {skillCount} · MCP {mcpCount}",
-  "@settingsCharactersToolAccessSummaryCounts": {
-    "placeholders": {
-      "builtinCount": {
-        "type": "int"
-      },
-      "packageCount": {
-        "type": "int"
-      },
-      "skillCount": {
-        "type": "int"
-      },
-      "mcpCount": {
-        "type": "int"
-      }
-    }
-  },
-  "settingsCharactersToolAccessConfigure": "配置工具白名单",
-  "settingsCharactersToolAccessTitle": "自定义允许使用的工具",
-  "settingsCharactersToolAccessTabBuiltin": "内建工具",
-  "settingsCharactersToolAccessTabPackage": "包",
-  "settingsCharactersToolAccessTabSkill": "Skill",
-  "settingsCharactersToolAccessTabMcp": "MCP",
-  "settingsCharactersToolAccessSearchPlaceholder": "搜索名称、描述或标识",
-  "settingsCharactersToolAccessEmptySearch": "未找到匹配的工具",
-  "settingsCharactersToolAccessRequiresUsePackage": "选择工具包、技能或 MCP 时，需要同时允许内置工具 use_package。",
-  "settingsCharactersToolAccessEmptyBuiltin": "当前没有可配置的内建工具",
-  "settingsCharactersToolAccessEmptyPackages": "当前没有全局可用的包",
-  "settingsCharactersToolAccessEmptySkills": "当前没有对 AI 可见的 Skill",
-  "settingsCharactersToolAccessEmptyMcp": "当前没有已启用的 MCP 服务器",
-  "settingsCharactersBuiltinTools": "允许的内置工具",
-  "settingsCharactersAllowedPackages": "允许的工具包",
-  "settingsCharactersAllowedSkills": "允许的技能",
-  "settingsCharactersAllowedMcpServers": "允许的 MCP 服务",
-  "settingsCharactersGroupMembersTitle": "组内角色",
-    "settingsCharactersOpenMemoryGraph": "查看记忆图谱",
-    "settingsCharactersMemoryGraphTitle": "{profileName} 的记忆图谱",
-    "@settingsCharactersMemoryGraphTitle": {
-      "placeholders": {
-        "profileName": {
-          "type": "String"
-        }
-      }
-    },
-    "settingsCharactersMemoryGraphEmpty": "当前记忆库还没有节点",
-    "settingsCharactersMemoryGraphStats": "{nodes} 个节点 · {edges} 条关系",
-    "@settingsCharactersMemoryGraphStats": {
-      "placeholders": {
-        "nodes": {
-          "type": "int"
-        },
-        "edges": {
-          "type": "int"
-        }
-      }
-    },
-    "settingsCharactersMemoryGraphLink": "记忆关系",
-    "settingsCharactersEditUserMarkdown": "编辑用户资料",
-  "settingsCharactersUserMarkdownTitle": "{profileName} 的用户资料",
-  "@settingsCharactersUserMarkdownTitle": {
-    "placeholders": {
-      "profileName": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersUserMarkdownSaved": "用户资料已保存",
-  "settingsCharactersUserMarkdownContent": "用户资料内容",
-  "settingsCharactersMemoryAutoUpdate": "自动更新记忆库",
-  "settingsCharactersMemoryAutoUpdateDescription": "允许 AI 从对话中整理信息并写入记忆库。",
-  "settingsCharactersPreferenceDescription": "向模型提供用户资料",
-  "settingsCharactersPreferenceDescriptionSubtitle": "聊天时把当前用户资料写入提示词。",
-  "settingsCharactersCardsSection": "角色卡",
-  "settingsCharactersGroupsSection": "群组",
-  "settingsCharactersGroupMembers": "{count} 个成员",
-  "@settingsCharactersGroupMembers": {
-    "placeholders": {
-      "count": {
-        "type": "int"
-      }
-    }
-  },
   "settingsToolsPermissionMode": "AI 能力模式",
   "settingsToolsAsk": "询问",
   "settingsToolsExtensions": "扩展管理",
@@ -1222,6 +1199,8 @@
   "settingsRuntimeCurrentSpace": "当前设备空间",
   "settingsRuntimeOverviewDescription": "在同一设备空间内，设备可以建立连接，共享数据和路由。",
   "settingsRuntimeRenameSpace": "重命名设备空间",
+  "settingsRuntimeResetTransactions": "重置事务",
+  "settingsRuntimeResetTransactionsDone": "已按本机当前内容重建同步事务",
   "settingsRuntimeLeaveSpace": "退出设备空间",
   "settingsRuntimeLeaveSpaceTitle": "退出当前设备空间？",
   "settingsRuntimeLeaveSpaceDescription": "这台设备会创建一个新的单设备空间。业务数据保留，已配对设备也不会被删除。",
@@ -1279,16 +1258,17 @@
   "settingsRuntimeRemoteDescription": "已直接配对的设备。配对负责建立连接，加入设备空间后才会共享数据和路由。",
   "settingsRuntimePairRemote": "连接另一台设备",
   "settingsRuntimeDiscoveredEdges": "ESP32 设备",
-  "settingsRuntimeEdgeEndpointTokenRequired": "Edge 地址和 Token 不能为空",
   "settingsRuntimeEdgeEndpointRequired": "Edge 地址不能为空",
   "settingsRuntimePairingCodeRequired": "请输入配对码",
   "settingsRuntimeNoPairedRemote": "还没有已连接的设备。",
   "settingsRuntimeConnectionInitiatedByOtherDevice": "连接由对方设备发起",
-  "settingsRuntimePairToken": "连接 Token",
   "settingsRuntimePairCode": "配对码",
   "settingsRuntimeStartPairing": "开始连接",
   "settingsRuntimeFinishPairing": "完成连接",
   "settingsRuntimeBaseUrl": "设备地址",
+  "settingsRuntimeTcpAddressHint": "host:端口，例如 192.168.1.10:37195",
+  "settingsRuntimeTransportAuto": "自动（推荐）",
+  "settingsRuntimeTransportAutoHint": "输入 IP:端口，自动识别 HTTP/WebSocket/TCP 协议",
   "settingsRuntimeConnectionFailed": "设备连接失败：{error}",
   "@settingsRuntimeConnectionFailed": {
     "placeholders": {
@@ -1324,7 +1304,7 @@
   "settingsRuntimeDeviceInCurrentSpace": "已在当前设备空间",
   "settingsRuntimeDiscoverSpaces": "发现设备空间",
   "settingsRuntimeDiscoverSpacesDescription": "附近设备会按设备空间归并；展开设备空间后，可以选择其中一台设备直接连接。",
-  "settingsRuntimeWebPairDescription": "输入其他设备的地址和配对令牌，让此浏览器作为主动配对方连接。",
+  "settingsRuntimeWebPairDescription": "输入其他设备的地址并确认配对码，让此浏览器作为主动配对方连接。",
   "settingsRuntimeDiscoveredSpaceSummary": "共 {memberCount} 台设备 · 附近可连接 {nearbyCount} 台",
   "@settingsRuntimeDiscoveredSpaceSummary": {
     "placeholders": {
@@ -1426,20 +1406,6 @@
   },
   "settingsAppearanceThemeSection": "主题",
   "settingsAppearanceThemeMode": "当前模式",
-  "settingsAppearanceThemeTarget": "主题保存目标",
-  "settingsAppearanceThemeTargetGlobal": "全局",
-  "settingsAppearanceThemeTargetCharacter": "当前角色：{name}",
-  "@settingsAppearanceThemeTargetCharacter": {
-    "placeholders": {
-      "name": {}
-    }
-  },
-  "settingsAppearanceThemeTargetGroup": "当前群组：{name}",
-  "@settingsAppearanceThemeTargetGroup": {
-    "placeholders": {
-      "name": {}
-    }
-  },
   "settingsAppearanceThemeSystem": "跟随系统",
   "settingsAppearanceThemeLight": "浅色",
   "settingsAppearanceThemeDark": "深色",
@@ -1483,6 +1449,7 @@
   "settingsAppearanceClearCustomFont": "清除自定义字体",
   "settingsAppearanceFontSerif": "衬线",
   "settingsAppearanceFontMonospace": "等宽",
+  "settingsAppearanceInterfaceScale": "界面缩放",
   "settingsAppearanceFontScale": "字体大小",
   "settingsAppearanceAvatarSection": "头像",
   "settingsAppearanceUserAvatar": "用户头像",
@@ -1496,7 +1463,8 @@
   "settingsAppearanceClearUserAvatar": "清除用户头像",
   "settingsAppearanceClearAiAvatar": "清除 AI 头像",
   "settingsAppearanceChatDisplaySection": "聊天显示",
-  "settingsAppearanceMessageStyle": "消息样式",
+  "settingsAppearanceUserMessageStyle": "用户消息样式",
+  "settingsAppearanceAiMessageStyle": "AI 消息样式",
   "settingsAppearanceMessageStyleClean": "命令式",
   "settingsAppearanceMessageStyleCard": "气泡式",
   "settingsAppearanceMessageColors": "消息配色",
@@ -1530,8 +1498,21 @@
   "settingsAppearanceBubbleImageNinePatch": "拉伸九宫格",
   "settingsAppearanceBubbleImageAdjustUser": "调整用户气泡图片",
   "settingsAppearanceBubbleImageAdjustAi": "调整 AI 气泡图片",
-  "settingsAppearanceBubbleImagePreview": "预览",
-  "settingsAppearanceBubbleImagePreviewText": "这是一条气泡预览，切线展示九宫格区域",
+  "settingsAppearanceBubbleImagePreview": "实时预览",
+  "settingsAppearanceBubbleImagePreviewText": "这是一条气泡预览消息。\n可以查看边角和中间区域的实际效果。",
+  "settingsAppearanceBubbleImageSource": "原图",
+  "settingsAppearanceBubbleImageSourceHint": "原图 · 白框为裁切边界，蓝线分出九宫格；可双指缩放、拖动查看",
+  "settingsAppearanceBubbleImageFitSource": "完整显示原图",
+  "settingsAppearanceBubbleImageGrid": "九宫格",
+  "settingsAppearanceBubbleImageGridHint": "两横两竖分出九块：四角保留，上下边横向重复、左右边纵向重复，中间双向重复；拉伸模式则拉伸对应区域。起点和终点相对于裁切后的图片。",
+  "settingsAppearanceBubbleImageImportFailed": "气泡图片没有生效：{error}",
+  "@settingsAppearanceBubbleImageImportFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "settingsAppearanceBubbleImageCrop": "裁切",
   "settingsAppearanceBubbleImageRepeat": "重复区域",
   "settingsAppearanceBubbleImageScale": "图片缩放",
@@ -1551,7 +1532,7 @@
   "settingsAppearanceShowAvatars": "显示消息头像",
   "settingsAppearanceMessageDisplaySection": "消息显示",
   "settingsAppearanceShowThinkingProcess": "显示思考过程",
-  "settingsAppearanceShowRoleName": "显示角色名",
+  "settingsAppearanceShowRoleName": "显示自定义回复者名称",
   "settingsAppearanceShowUserName": "显示用户名",
   "settingsAppearanceShowModelName": "显示模型名",
   "settingsAppearanceShowModelProvider": "显示模型供应商",
@@ -1575,6 +1556,34 @@
   "settingsAppearanceLivePreviewUserSample": "帮我梳理一下今天的工作计划。",
   "settingsAppearanceLivePreviewAiSample": "好的！我已经为你整理好核心任务清单，随时可以开始执行。",
   "settingsAppearanceLivePreviewThinkingSample": "正在分析上下文与日程优先级...",
+  "settingsDataLogsSection": "诊断日志",
+  "settingsDataLogsDescription": "将当前连接的 Core 与本客户端的日志按时间合并为一个 .log 文件，并标记 [CORE] / [CLIENT]。日志可能包含敏感信息，分享前请检查。",
+  "settingsDataExportLogs": "导出诊断日志",
+  "settingsDataLogsExporting": "正在导出日志…",
+  "settingsDataLogsExportError": "日志导出失败：{error}",
+  "@settingsDataLogsExportError": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsDataLogsExportPartial": "已保存至 {path}。部分日志读取失败，请查看文件中的警告。",
+  "@settingsDataLogsExportPartial": {
+    "placeholders": {
+      "path": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsDataOverviewLoadError": "数据概览加载失败：{error}。仍可导出诊断日志。",
+  "@settingsDataOverviewLoadError": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "settingsDataRuntimeSection": "数据概览",
   "settingsDataCoreVersion": "当前版本",
   "settingsDataStorageSection": "储存路径",
@@ -1584,6 +1593,16 @@
   "settingsDataChooseStorageRoots": "编辑位置",
   "settingsDataEditStorageRootsTitle": "编辑储存位置",
   "settingsDataStorageRootsRequired": "运行时目录和工作区目录都不能为空。",
+  "storageDirectoryTermuxUnsupported": "不支持将 Termux 文档提供器中的目录用作本地存储路径。请选择共享存储中的目录（如 Download 或 Documents），而不是 Termux 私有目录。",
+  "storageDirectoryProviderUnsupported": "无法将所选目录解析为支持的本地存储路径。请选择共享存储中的目录（如 Download 或 Documents），或手动输入本应用有权限访问的本地路径。",
+  "storageDirectorySelectionFailed": "选择目录失败：{error}",
+  "@storageDirectorySelectionFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "settingsDataStorageConfirmTitle": "更改储存路径",
   "settingsDataStorageConfirmMessage": "runtime 和 workspace 数据会分别复制到所选目录，重启应用后使用新位置。",
   "settingsDataStorageConfirmAction": "更改位置",
@@ -1596,14 +1615,10 @@
       }
     }
   },
-  "settingsDataTokenSection": "使用统计",
   "settingsDataInputTokens": "输入",
   "settingsDataOutputTokens": "输出",
-  "settingsDataOpenDetailedStats": "查看详细统计",
-  "settingsDataOpenDetailedStatsDescription": "打开每日趋势、输入输出 Token 变化、使用热力图，以及按供应商、模型、功能模型分类的使用明细。",
-  "settingsDataRefreshTokenStats": "刷新统计",
   "settingsDataResetTokenStats": "重置统计",
-  "settingsDataDetailedStatsTitle": "详细统计",
+  "settingsUsageReportResetConfirmation": "这将永久删除所有已保存的模型用量记录，聊天记录会保留。",
   "settingsDataDetailedStatsDescription": "统计基于独立保存的模型请求明细计算。",
   "settingsDataDetailedStatsEmpty": "暂无可展示的详细使用记录",
   "settingsDataDetailedStatsDateRange": "{start} 至 {end}",
@@ -1634,7 +1649,6 @@
   "settingsDataDetailedStatsSourceToolResult": "工具结果续写",
   "settingsDataDetailedStatsSourceSummary": "摘要生成",
   "settingsDataDetailedStatsSourceTitleGeneration": "标题生成",
-  "settingsDataDetailedStatsSourceMemory": "记忆分析",
   "settingsDataDetailedStatsTotalRequests": "总请求数",
   "settingsDataDetailedStatsCachedInput": "缓存输入",
   "settingsDataDetailedStatsActiveDays": "活跃天数",
@@ -1717,10 +1731,6 @@
   "settingsDataBackupSection": "备份与恢复",
   "settingsDataChatHistoriesBackup": "聊天数据",
   "settingsDataChatHistoriesBackupDescription": "备份全部聊天和消息；恢复时按聊天 ID 更新或新增。",
-  "settingsDataCharacterCardsBackup": "角色卡数据",
-  "settingsDataCharacterCardsBackupDescription": "备份全部角色卡和已引用标签；恢复时按原 ID 更新或新增。",
-  "settingsDataCharacterGroupsBackup": "群组数据",
-  "settingsDataCharacterGroupsBackupDescription": "备份全部群组；恢复时保留组内角色引用和顺序。",
   "settingsDataModelConfigsBackup": "模型配置",
   "settingsDataModelConfigsBackupDescription": "备份全部模型配置，包含模型参数和 API Key 池。",
   "settingsDataBackupCount": "当前 {count} 项",
@@ -1764,9 +1774,32 @@
     }
   },
   "settingsDataSnapshotBackupTitle": "完整快照",
-  "settingsDataExportRawSnapshot": "导出快照",
-  "settingsDataImportRawSnapshot": "恢复快照",
-  "settingsDataExportRawSnapshotDescription": "把聊天、角色、模型设置和本地文件打包成一个备份文件。恢复时会用备份里的数据覆盖当前数据。",
+  "settingsDataExportRawSnapshot": "导出完整快照",
+  "settingsDataImportRawSnapshot": "恢复完整快照",
+  "settingsDataExportRawSnapshotDescription": "将聊天、插件数据、模型设置和本地文件打包为 .opsnapshot 文件。",
+  "settingsDataDatabaseBackup": "数据库备份",
+  "settingsDataDatabaseBackupDescription": "每天保存一份数据库文件，保留最近 10 份自动备份。附件和工作区文件单独存放。",
+  "settingsDataBackupScheduled": "每日备份已开启",
+  "settingsDataBackupUnavailable": "请选择可用的文件夹以开启每日备份",
+  "settingsDataBackupNow": "立即备份",
+  "settingsDataBackupSaved": "数据库备份已保存。",
+  "settingsDataRecoverySection": "恢复数据",
+  "settingsDataRestoreDatabaseDescription": "从备份目录按日期选择一份数据库，恢复后以这份数据为准同步到其他设备。",
+  "settingsDataRestoreArchiveDescription": "用 Operit2 的完整快照替换当前运行数据，恢复后会重启应用。",
+  "settingsDataImportSection": "导入数据",
+  "settingsDataImportOperit1Description": "选择 Operit1 快照，预览后迁移聊天、模型配置和资源。",
+  "settingsDataImportChatJson": "导入聊天 JSON",
+  "settingsDataImportChatJsonDescription": "新增聊天，已有相同 ID 的聊天会更新。",
+  "settingsDataImportModelJson": "导入模型配置 JSON",
+  "settingsDataImportModelJsonDescription": "新增模型服务商配置，已有相同 ID 的配置会更新。",
+  "settingsDataImportAction": "确认导入",
+  "settingsDataReadingSnapshot": "正在读取快照",
+  "settingsDataPreparingPreview": "正在生成预览",
+  "settingsDataOperit1ImportResult": "已导入 {chatCount} 个聊天、{messageCount} 条消息。",
+  "@settingsDataOperit1ImportResult": {"placeholders": {"chatCount": {"type": "int"}, "messageCount": {"type": "int"}}},
+  "settingsDataExportSection": "导出文件",
+  "settingsDataExportChatJson": "导出聊天 JSON",
+  "settingsDataExportModelJson": "导出模型配置 JSON",
   "settingsDataSnapshotBytes": "快照大小：{bytes} 字节",
   "@settingsDataSnapshotBytes": {
     "placeholders": {
@@ -1851,38 +1884,65 @@
   "settingsDataAdvancedBackupOptions": "高级选项",
   "settingsDataAdvancedBackupOptionsDescription": "单项 JSON 导出与恢复",
   "settingsRuntimeNetworkControl": "网络控制",
-  "settingsRuntimeNetworkControlDescription": "角色、身份、设备权限与审计",
+  "settingsRuntimeNetworkControlDescription": "管理设备身份与权限，查看操作记录",
+  "settingsRuntimeIdentitiesAndPermissions": "身份与权限",
   "settingsRuntimeControlInitialize": "初始化控制",
   "settingsRuntimeControlRoles": "角色",
   "settingsRuntimeControlIdentities": "身份",
-  "settingsRuntimeControlAudit": "审计",
-  "settingsRuntimeControlAddRole": "添加角色",
+  "settingsRuntimeControlAuditAccepted": "已执行",
+  "settingsRuntimeControlAuditRejected": "已拒绝",
+  "settingsRuntimeControlAuditIssuer": "操作设备",
+  "settingsRuntimeControlAuditDetails": "技术详情",
+  "settingsRuntimeControlAuditBootstrap": "初始化空间权限",
+  "settingsRuntimeControlAuditAdmit": "接纳设备",
+  "settingsRuntimeControlAuditMerge": "合并设备空间",
+  "settingsRuntimeControlAuditPolicy": "更新权限策略",
+  "settingsRuntimeControlAudit": "操作记录",
+  "settingsRuntimeControlAddRole": "新建身份",
   "settingsRuntimeControlGrantRole": "授予角色",
   "settingsRuntimeControlAddIdentity": "添加身份",
   "settingsRuntimeControlBindDevice": "绑定设备",
-  "settingsRuntimeControlRoleName": "角色名称",
-  "settingsRuntimeControlCapabilities": "这个角色可以做什么",
+  "settingsRuntimeControlRoleName": "身份名称",
+  "settingsRuntimeControlCapabilities": "允许这个身份执行的操作",
   "settingsRuntimeControlManagedDevices": "这个角色可以管理哪些设备（不选表示全部）",
   "settingsRuntimeControlIdentityName": "身份名称",
-  "settingsRuntimeControlDevice": "设备",
   "settingsRuntimeControlDeviceId": "设备 ID",
-  "settingsRuntimeControlNoAudit": "暂无控制命令记录",
+  "settingsRuntimeControlNoAudit": "暂无操作记录，身份和设备的变更会显示在这里",
+  "settingsRuntimeControlAuditCount": "{count} 条记录",
+  "@settingsRuntimeControlAuditCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "settingsRuntimeControlNoBindings": "暂无设备绑定",
   "settingsRuntimeControlGranted": "已授予",
   "settingsRuntimeControlRevoked": "已撤销",
   "settingsRuntimeControlRemoveDevice": "移除设备",
-  "settingsRuntimeControlDisconnectDevice": "断开设备",
+  "settingsRuntimeControlDisconnectDevice": "隔离设备",
   "settingsRuntimeControlRemoved": "已移除",
-  "settingsRuntimeControlDisconnected": "已断开",
-  "settingsRuntimeControlAdmitDevice": "重新接纳设备",
+  "settingsRuntimeControlDisconnected": "已隔离",
+  "settingsRuntimeControlAdmitDevice": "解除隔离设备",
   "settingsRuntimeControlAllDevices": "全部设备",
   "settingsRuntimeControlManages": "可管理",
+  "settingsRuntimeControlLocalIdentity": "本机身份",
   "settingsRuntimeControlCurrentIdentity": "当前身份",
-  "settingsRuntimeControlCurrentCapabilities": "当前能力",
+  "settingsRuntimeControlCurrentCapabilities": "可用权限",
   "settingsRuntimeControlManageIdentities": "管理身份",
   "settingsRuntimeControlAssignIdentity": "设置设备身份",
-  "settingsRuntimeControlClearIdentity": "清除设备身份",
-  "settingsRuntimeControlIdentityDefinitions": "身份定义",
+  "settingsRuntimeControlClearIdentity": "重置为默认身份",
+  "settingsRuntimeControlDeviceAdmitted": "已解除隔离，等待设备重连",
+  "settingsRuntimeControlIdentityResetDone": "身份已重置为默认用户",
+  "settingsRuntimeControlIdentityDefinitions": "身份权限",
+  "settingsRuntimeControlIdentityCount": "{count} 个身份",
+  "@settingsRuntimeControlIdentityCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "settingsRuntimeControlIdentityAssignment": "身份分配",
   "settingsRuntimeControlNoIdentity": "未设置身份",
   "settingsRuntimeControlOnline": "在线",
@@ -1890,10 +1950,8 @@
   "settingsRuntimeControlCapabilityAll": "全部权限",
   "settingsRuntimeControlCapabilityAuditRead": "查看审计记录",
   "settingsRuntimeControlCapabilityNetworkRelay": "中继网络流量",
-  "settingsRuntimeControlCapabilityStorageProvide": "提供存储空间",
-  "settingsRuntimeControlCapabilityRuntimeExecute": "执行任务",
-  "settingsRuntimeControlCapabilityNetworkUser": "使用网络",
-  "settingsRuntimeControlCapabilityChatRead": "读取聊天记录",
+  "settingsRuntimeControlCapabilityStorageProvide": "保存共享数据副本",
+  "settingsRuntimeControlCapabilityRuntimeExecute": "承载 Core 执行",
   "settingsRuntimeControlCapabilityViewDevices": "查看设备与当前身份",
   "settingsRuntimeControlCapabilityApproval": "审批授权",
   "chatRoutePermissionDenied": "权限不足：目标设备 {targetNodeId} 没有 {capability} 权限。",
@@ -1904,10 +1962,8 @@
     }
   },
   "settingsRuntimeControlRoleAdministrator": "管理员",
-  "settingsRuntimeControlRoleAuditor": "审计员",
   "settingsRuntimeControlRoleRelay": "中继节点",
-  "settingsRuntimeControlRoleStorage": "存储节点",
-  "settingsRuntimeControlRoleRunner": "执行节点",
+  "settingsRuntimeControlRoleEdge": "边缘节点",
   "settingsRuntimeControlRoleUser": "普通用户",
   "pluginLoadingTitle": "正在加载",
   "pluginLoadingSkip": "跳过",
@@ -1935,6 +1991,7 @@
   "pluginLoadingFailed": "加载失败",
   "pluginLoadingWaiting": "等待中",
   "pluginLoadingKindPackage": "包",
+  "pluginLoadingKindPlugin": "插件",
   "pluginLoadingKindMcp": "MCP",
   "pluginLoadingCompleteSuccess": "包和插件已全部加载",
   "pluginLoadingCompleteWithFailures": "部分包或插件加载失败",
@@ -1944,6 +2001,9 @@
   "chatRouteRemoteOffline": "远程{platform} 离线",
   "chatRouteLoading": "正在读取运行设备",
   "chatRouteUnknown": "运行设备状态未知",
+  "chatRouteClaimHostPrompt": "当前设备宿主未找到，是否切换为当前设备？",
+  "chatRouteClaimHostYes": "是",
+  "chatRouteClaimHostNo": "否",
   "@chatRouteRemote": {
     "placeholders": {
       "platform": {
@@ -2040,7 +2100,7 @@
       }
     }
   },
-  "chatMessageRole": "角色: {roleName}",
+  "chatMessageRole": "回复者: {roleName}",
   "@chatMessageRole": {
     "placeholders": {
       "roleName": {
@@ -2127,5 +2187,519 @@
         "type": "String"
       }
     }
-  }
+  },
+  "settingsPeerPortModeHelp": "默认由系统分配可用端口，并通过局域网发现公布。固定模式使用填写的监听地址和端口，端口被占用时会报错。",
+  "settingsPeerPortMode": "端口分配方式",
+  "settingsPeerPortModeFixed": "固定监听地址和端口",
+  "settingsPeerPortModeAutomatic": "自动分配端口",
+  "settingsPeerNetworkDiscoveryHelp": "跨网络发现需要共同的目录地址和组密钥。要由本机提供目录，请留空目录地址并设置组密钥。",
+  "settingsPeerDiscoveryDirectory": "发现目录地址（可选）",
+  "settingsPeerDiscoveryGroup": "发现组密钥",
+  "settingsPeerDiscoveryGenerateKey": "生成新的发现组密钥",
+  "settingsPeerDiscoveryCopyKey": "复制发现组密钥",
+  "settingsPeerDiscoveryPort": "目录监听端口",
+  "settingsPeerDiscoveryPortHelp": "仅目录设备使用此端口；其他设备使用目录地址中的端口。",
+  "settingsPeerNetworkDiscoveryInvalid": "请检查发现设置：目录为不含路径的 HTTP(S) 地址，密钥为 16–128 字节；本机提供目录时，监听端口应为 1–65535。",
+  "settingsPeerAdvanced": "高级选项",
+  "settingsPeerDiscoveryUnavailable": "当前 Host 不支持在局域网广播监听服务。支持的协议仍可通过地址直接连接。",
+  "settingsPeerTransportUnavailable": "当前 Host 不支持 {transport} 监听。",
+  "@settingsPeerTransportUnavailable": {
+    "placeholders": {
+      "transport": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsPeerTransportHelp": "暴露方式（可多选）。HTTP、WebSocket 和 TCP 共用同一个监听端口，可自由组合。蓝牙需要平台支持。关闭发现并取消全部选择可停止监听。修改设置会中断现有连接；仅关闭发现不会关闭直接连接。",
+  "settingsPeerBindAddress": "监听 IP 地址",
+  "settingsPeerBindAddressHelp": "例如 0.0.0.0，允许局域网访问；也支持 IPv6 地址。",
+  "settingsPeerBindPort": "监听端口",
+  "settingsPeerBindPortHelp": "固定模式使用此端口监听。",
+  "settingsPeerBindPortAutomaticHelp": "由系统分配可用端口；启动后显示实际端口。",
+  "settingsPeerDiscoveryNeedsTransport": "开启允许被搜索前，请至少选择一种暴露方式。",
+  "settingsPeerAddressRequired": "请输入监听 IP 地址。",
+  "settingsPeerPortRequired": "请输入 1 到 65535 之间的端口。",
+  "settingsPeerApplied": "监听设置已生效。",
+  "settingsPeerRestoreFailed": "恢复原监听配置失败：{error}",
+  "@settingsPeerRestoreFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsPeerCodeInstructions": "在另一台设备上输入此验证码以完成配对。验证码五分钟内有效，请勿提供给陌生人。",
+  "settingsPeerSixDigitCode": "请输入接收设备上显示的六位配对码。",
+  "spaceJoinRequests": "空间加入申请",
+  "spaceJoinReviewer": "审批人：{name}",
+  "@spaceJoinReviewer": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "spaceJoinWaitingReviewer": "等待有审批权限的设备上线",
+  "spaceJoinPending": "等待批准",
+  "spaceJoinApproving": "正在处理审批结果",
+  "spaceJoinApproved": "已批准，正在完成加入",
+  "spaceJoinJoined": "已加入",
+  "spaceJoinRejected": "已拒绝",
+  "spaceJoinCancelled": "已取消",
+  "spaceJoinExpired": "已过期",
+  "spaceJoinSubmit": "提交申请",
+  "spaceJoinApprovalTitle": "空间加入申请",
+  "spaceJoinApprovalDescription": "{name} 申请加入「{space}」。批准前不会共享空间数据。",
+  "@spaceJoinApprovalDescription": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "space": {
+        "type": "String"
+      }
+    }
+  },
+  "spaceJoinApprove": "批准",
+  "spaceJoinReject": "拒绝",
+  "spaceJoinRetry": "重新申请",
+  "spaceJoinKeepWaiting": "后台等待",
+  "spaceJoinCancel": "取消申请",
+  "spaceJoinCancelFailed": "未能确认申请已取消，请检查连接或稍后重试。",
+  "spaceJoinRefreshingFailed": "暂时无法联系设备。申请已保留，会继续重试。",
+  "spaceJoinAssignmentChanged": "该申请已转交或已处理。",
+  "spaceJoinProgressTitle": "申请加入空间",
+  "spaceJoinSending": "正在提交申请…",
+  "spaceJoinSubmitFailed": "申请暂时未能提交，请检查连接后重试。",
+  "spaceJoinNoDataYet": "批准前，你当前的空间不会改变。关闭窗口后，申请仍会在后台等待。",
+  "deviceSpaceAddDevice": "添加设备",
+  "deviceSpaceDevices": "设备",
+  "deviceSpaceMemberNotPaired": "空间成员 · 未直连",
+  "deviceSpaceMemberPaired": "空间成员 · 已配对",
+  "deviceSpacePairedOnly": "已配对",
+  "deviceSpaceDirectLink": "直连",
+  "deviceSpaceRelayHops": "经中继 {hops} 跳",
+  "@deviceSpaceRelayHops": {
+    "placeholders": {
+      "hops": {
+        "type": "int"
+      }
+    }
+  },
+  "deviceSpaceRelayPath": "路径",
+  "deviceSpaceLocalDevice": "本机",
+  "deviceSpaceManageDevice": "管理设备",
+  "deviceSpaceConnectDirect": "建立直连",
+  "deviceSpaceConnectDirectHint": "该设备已是本空间成员。与它配对成功即建立直连，无需重新加入空间；配对需要对方显示、由你输入六位确认码。",
+  "deviceSpaceUpdateEndpoint": "更新直连地址",
+  "deviceSpaceUpdateEndpointLabel": "直连地址",
+  "deviceSpaceUpdateEndpointHint": "例如 ws://主机:端口/link 或 主机:端口 —— 填对方当前的监听端口",
+  "deviceSpaceUpdateEndpointSaved": "直连地址已更新",
+  "deviceSpaceDirectLinkEstablished": "已建立直连：{device}",
+  "@deviceSpaceDirectLinkEstablished": {
+    "placeholders": {
+      "device": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceUnpair": "解除配对",
+  "deviceSpaceMore": "更多设备操作",
+  "deviceSpaceConnectionSettings": "连接设置",
+  "deviceSpaceViewRequest": "查看申请",
+  "devicePickerNearby": "附近设备",
+  "devicePickerDiscoveryFailed": "附近设备发现失败：{error}",
+  "@devicePickerDiscoveryFailed": {"placeholders": {"error": {"type": "String"}}},
+  "devicePickerEmpty": "暂未发现附近设备",
+  "devicePickerHint": "请让两台设备连接同一网络，并在对方设备开启允许被搜索。",
+  "devicePickerManual": "通过地址连接",
+  "deviceSpaceMyRequests": "我发出的",
+  "deviceSpaceMyReviews": "待我审批",
+  "deviceSpaceNoRequests": "暂无申请",
+  "workspaceUndo": "撤销",
+  "workspaceRedo": "重做",
+  "workspaceInsertSymbol": "插入 {symbol}",
+  "@workspaceInsertSymbol": {
+    "placeholders": {
+      "symbol": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceThemeConfig": "主题配置",
+  "settingsAppearanceThemeConfigCustom": "未绑定的外观",
+  "settingsAppearanceThemeConfigCreate": "新建主题配置",
+  "settingsAppearanceThemeConfigRename": "重命名主题配置",
+  "settingsAppearanceThemeConfigDelete": "删除当前未启用的主题配置",
+  "settingsAppearanceThemeConfigName": "主题名称",
+  "settingsAppearanceThemeConfigNameRequired": "请输入主题名称",
+  "settingsAppearanceThemeConfigCustomHint": "创建主题保存你的外观。点击卡片切换，点击编辑调整细节。",
+  "settingsAppearanceThemeConfigEditingHint": "点击卡片切换主题；上方明暗切换仅修改当前主题。编辑后自动保存。",
+  "settingsAppearanceThemeConfigFailed": "主题操作失败：{detail}",
+  "@settingsAppearanceThemeConfigFailed": {
+    "placeholders": {
+      "detail": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsRuntimeControlEditRole": "编辑角色",
+  "settingsRuntimeControlDeleteRole": "删除角色",
+  "settingsRuntimeControlDeleteRoleTitle": "删除角色 {roleName}？",
+  "@settingsRuntimeControlDeleteRoleTitle": {
+    "placeholders": {
+      "roleName": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsRuntimeControlDeleteRoleMessage": "持有该角色的设备将回退为默认的普通用户身份。",
+  "settingsAppearanceThemeConfigSource": "创建来源",
+  "settingsAppearanceThemeConfigFromDefaults": "默认外观",
+  "settingsAppearanceThemeConfigFromCurrent": "当前外观",
+  "settingsAppearanceThemeConfigInherit": "继承：{name}",
+  "@settingsAppearanceThemeConfigInherit": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceThemeConfigFromTemplate": "模板：{name}",
+  "@settingsAppearanceThemeConfigFromTemplate": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceThemeConfigDefaultsHint": "从软件默认样式开始",
+  "settingsAppearanceThemeConfigCurrentHint": "复制现在的外观设置",
+  "settingsAppearanceThemeConfigSavedSources": "继承已有配置",
+  "settingsAppearanceThemeConfigPluginSources": "从插件模板新建",
+  "settingsAppearanceThemeConfigSourceHint": "模板来自已安装的插件。新建后可独立编辑，并沿用外观配置同步。",
+  "settingsAppearanceLoadFailed": "无法加载外观设置",
+  "settingsAppearanceRepairHint": "已保存的外观没有被替换。修复资源后可以重试，也可以主动重置外观。重置会保留头像和已保存的配置，并切换到自定义外观。",
+  "settingsAppearanceAssetBackgroundFailed": "背景图片无法加载，已使用默认背景（{reference}）。",
+  "@settingsAppearanceAssetBackgroundFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetVideoFailed": "背景视频无法播放，已使用默认背景（{reference}）。",
+  "@settingsAppearanceAssetVideoFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetBubbleFailed": "气泡图片无法加载，已使用默认气泡颜色（{reference}）。",
+  "@settingsAppearanceAssetBubbleFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetPreviousRetained": "此主题资源无法加载，暂用上一张图片或媒体（{reference}），其他主题设置仍有效。",
+  "@settingsAppearanceAssetPreviousRetained": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetRetry": "重试",
+  "settingsAppearanceAssetReimportHint": "重试后仍无法加载时，请重新选择并导入可读取的图片或可播放的视频。",
+  "settingsAppearanceAssetImportFailed": "背景资源没有生效：{reason}。请选择可读取的图片或可播放的视频。",
+  "@settingsAppearanceAssetImportFailed": {
+    "placeholders": {
+      "reason": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceRetry": "重试",
+  "settingsAppearanceResetAfterError": "重置外观",
+  "backgroundWorkIdle": "当前没有正在运行的工作",
+  "backgroundWorkRunningCount": "项工作正在运行",
+  "backgroundWorkWaiting": "等待你确认",
+  "backgroundWorkWaitingCount": "项待确认",
+  "backgroundWorkCompleted": "已完成",
+  "backgroundWorkFailed": "执行失败，打开查看详情",
+  "backgroundWorkCancelled": "已停止",
+  "backgroundWorkProcessing": "正在准备",
+  "backgroundWorkConnecting": "正在连接",
+  "backgroundWorkReceiving": "正在生成回复",
+  "backgroundWorkTool": "正在执行工具",
+  "backgroundWorkToolResult": "正在处理工具结果",
+  "backgroundWorkSummarizing": "正在整理上下文",
+  "backgroundWorkPlan": "正在执行计划",
+  "backgroundWorkOpen": "查看会话",
+  "backgroundWorkReview": "查看并确认",
+  "backgroundWorkStop": "停止",
+  "localModelsDeviceOnly": "保存在此设备",
+  "localModelsDeviceOnlyDescription": "模型权重、下载进度和安装记录仅保存在当前设备，不参与设备空间同步。聊天可通过路由使用安装了模型的设备。",
+  "localModelsRunChat": "推理与设置",
+  "localModelsUseForChat": "用于聊天",
+  "localModelsChatActivated": "已设为聊天模型",
+  "localModelsPrompt": "输入提示词",
+  "localModelsGenerate": "开始推理",
+  "localModelsGenerating": "正在推理…",
+  "localModelsThreads": "CPU 线程数",
+  "localModelsContextSize": "上下文长度（token）",
+  "localModelsBatchSize": "批次大小",
+  "localModelsUnload": "释放模型内存",
+  "localModelsCpuBackend": "本机 CPU 推理",
+  "localModelsLlmDescription": "下载 GGUF 模型使用 llama.cpp，或下载 MNN 模型包。安装后可在这里试运行，或设为聊天模型。",
+  "localModelsInvalidSettings": "请检查线程数、上下文长度和批次大小。",
+  "localModelsFilterAll": "全部模型",
+  "localModelsFilterInstalled": "已安装",
+  "localModelsSearchCatalog": "搜索模型名称、标签或推理引擎",
+  "deviceSpaceSyncPeer": "空间设备",
+  "deviceSpaceSyncActive": "正在与 {device} 同步",
+  "@deviceSpaceSyncActive": {
+    "placeholders": {
+      "device": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceSyncCompleted": "与 {device} 同步完成",
+  "@deviceSpaceSyncCompleted": {
+    "placeholders": {
+      "device": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceSyncChecking": "正在检查数据差异",
+  "deviceSpaceSyncRecords": "正在交换数据记录",
+  "deviceSpaceSyncRecordProgress": "{completed} / {total} 条 · {percent}%",
+  "@deviceSpaceSyncRecordProgress": {"placeholders": {"completed": {"type": "int"}, "total": {"type": "int"}, "percent": {"type": "int"}}},
+  "deviceSpaceSyncPendingCount": "待应用 {count} 条",
+  "@deviceSpaceSyncPendingCount": {"placeholders": {"count": {"type": "int"}}},
+  "deviceSpaceSyncCounting": "正在统计总量 · 已处理 {count} 条",
+  "@deviceSpaceSyncCounting": {"placeholders": {"count": {"type": "int"}}},
+  "deviceSpaceSyncFiles": "正在传输并校验文件",
+  "deviceSpaceSyncRetrying": "同步暂时中断，稍后自动重试",
+  "deviceSpaceSyncPending": "部分数据尚未处理完成",
+  "deviceSpaceSyncCurrentFile": "当前文件：{done} / {total}",
+  "@deviceSpaceSyncCurrentFile": {
+    "placeholders": {
+      "done": {
+        "type": "String"
+      },
+      "total": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceSyncTransferred": "已交换 {count} 条记录 · 已传输 {bytes}",
+  "@deviceSpaceSyncTransferred": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      },
+      "bytes": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceSyncBackground": "可以继续使用，同步会在后台完成",
+  "runtimeActivityTitle": "后台任务",
+  "runtimeActivitySyncing": "正在同步",
+  "runtimeActivitySyncCompleted": "同步完成",
+  "runtimeActivityWaiting": "等待重试",
+  "runtimeActivityExpand": "查看后台任务",
+  "runtimeActivityLoadingPackages": "加载扩展",
+  "peerQrTitle": "二维码连接",
+  "peerQrScan": "扫码连接",
+  "peerQrShow": "出示连接码",
+  "peerQrShowHint": "让另一台设备扫描此码，连接到这台设备。",
+  "peerQrScanHint": "扫描另一台设备的 Operit 连接码。",
+  "peerQrTrustHint": "二维码有效期为 5 分钟，请仅分享给可信设备。对方确认加入后即可连接；本机有管理员审批权限时会自动批准加入。",
+  "peerQrConfirmJoin": "确认加入",
+  "peerQrConfirmJoinHint": "是否确认加入此设备的空间？确认后将直接连接并提交加入，无需输入配对码。",
+  "peerQrListenerRequired": "请先在连接设置中开启接收连接，并连接到可用的网络。",
+  "peerQrCopy": "复制连接信息",
+  "peerQrCopied": "已复制",
+  "peerQrImport": "从图片识别",
+  "peerQrPaste": "或粘贴连接信息",
+  "peerQrRead": "识别连接信息",
+  "peerQrWrongDevice": "此连接码属于其他设备，请扫描当前所选设备的连接码。",
+  "peerPairTimeoutHint": "连接超时：未能与对方设备建立连接。常见原因是对方设备的防火墙拦截了入站连接。可改由对方设备发起连接，或在对方设备的防火墙中放行 Operit（公用网络尤其需要）。",
+  "peerQrImageInvalid": "未能从图片中识别二维码。请选择清晰的二维码图片（不超过 16 MB）。",
+  "peerQrCameraUnavailable": "此设备暂时无法使用相机扫码，你可以导入二维码图片或粘贴连接信息。",
+  "peerQrCameraPermission": "需要相机权限才能扫码。请在系统设置中允许相机访问，也可导入图片。",
+  "peerQrDevice": "连接设备",
+  "peerQrScanAgain": "重新扫码",
+  "peerQrMethodsHint": "发现不到设备？也可以使用连接码。",
+  "toolParametersLabel": "参数",
+  "toolResultLabel": "执行结果",
+  "toolGroupThinkingCount": "{count} 次思考",
+  "toolGroupCallCount": "{count} 次调用",
+  "toolGroupSearchCount": "{count} 次搜索",
+  "toolEditedFileCount": "已编辑 {count} 个文件",
+  "toolViewChanges": "查看变更",
+  "toolViewFileDiff": "查看 {fileName} 的变更",
+  "@toolEditedFileCount": {"placeholders": {"count": {"type": "int"}}},
+  "@toolViewFileDiff": {"placeholders": {"fileName": {"type": "String"}}},
+  "toolGroupCompleted": "已完成",
+  "toolGroupExecuting": "正在执行",
+  "@toolGroupThinkingCount": {"placeholders": {"count": {"type": "int"}}},
+  "@toolGroupCallCount": {"placeholders": {"count": {"type": "int"}}},
+  "@toolGroupSearchCount": {"placeholders": {"count": {"type": "int"}}},
+  "settingsDataTimelineTitle": "模型使用时间线",
+  "settingsDataTimelineHint": "每个模型一条线。双指或滚轮缩放，拖动查看其他时段，点击查看具体用量。",
+  "settingsDataTimelineHours": "{hours} 小时",
+  "@settingsDataTimelineHours": {
+    "placeholders": {
+      "hours": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataTimelineBucket": "每 {minutes} 分钟汇总",
+  "@settingsDataTimelineBucket": {
+    "placeholders": {
+      "minutes": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataTimelineSecondsBucket": "每 {seconds} 秒汇总",
+  "@settingsDataTimelineSecondsBucket": {
+    "placeholders": {
+      "seconds": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataTimelineEarlier": "更早时段",
+  "settingsDataTimelineLater": "更晚时段",
+  "settingsDataTimelineRecent": "最近 3 小时",
+  "settingsDataTimelineRange": "可见时间范围",
+  "settingsDataTimelineSelectModel": "点选下方模型以查看用量",
+  "settingsDataTimelineSpend": "消费金额（估算）",
+  "settingsDataTimelineCacheRate": "缓存命中率",
+  "settingsDataTimelineSpendHint": "按当前模型价格估算，与上方共用时间范围。",
+  "settingsDataTimelineCacheRateHint": "每个时间段的缓存输入 ÷ 总输入；空闲时段不计命中率。",
+  "settingsDataTimelineNoPrices": "未找到对应的模型价格",
+  "settingsDataTimelinePricesFailed": "读取模型价格失败，请刷新重试。",
+  "settingsDataTimelineUnpriced": "{count} 次请求的费用未知",
+  "@settingsDataTimelineUnpriced": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataTimelineKnownSpend": "已知消费（估算）",
+  "settingsDataDetailedStatsRangeLastDay": "最近 24 小时",
+  "settingsDataTimelineAverageInput": "单次请求平均输入",
+  "settingsDataTimelineAverageInputHint": "每段总输入 ÷ 请求数，用来观察上下文是否越来越长；空闲时段留空。",
+  "settingsDataTimelineCacheSavings": "缓存节省金额（估算）",
+  "settingsDataTimelineCacheSavingsHint": "按当前价格，比较缓存输入与普通输入的费用差；按次计费节省为 0，负数表示缓存更贵。",
+  "settingsDataTimelineTokensPerRequest": "{tokens} tokens / 次",
+  "@settingsDataTimelineTokensPerRequest": {
+    "placeholders": {
+      "tokens": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsDataTimelineUnknownSavings": "{count} 次请求无法估算节省金额",
+  "@settingsDataTimelineUnknownSavings": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "contextStatsSummaryLoadFailed": "无法加载上下文信息",
+  "contextStatsDevicesLoadFailed": "无法加载设备信息",
+  "settingsAppearanceThemeLibrary": "我的主题",
+  "settingsAppearanceThemeLibraryHint": "选一个喜欢的外观，再把它调成你的样子。",
+  "settingsAppearanceThemeActive": "使用中",
+  "settingsAppearanceThemeApply": "使用此主题",
+  "settingsAppearanceThemeMore": "更多主题操作",
+  "settingsAppearanceThemeDuplicate": "创建副本",
+  "settingsAppearanceThemeUnboundHint": "保留当前外观，自由调整，不绑定已保存的主题。",
+  "settingsAppearanceThemeDeleteTitle": "删除主题",
+  "settingsAppearanceThemeDeleteConfirm": "确定删除「{name}」？删除后无法恢复。",
+  "settingsAppearancePreviewCollapse": "收起",
+  "settingsAppearancePreviewExpand": "展开",
+  "@settingsAppearanceThemeDeleteConfirm": {"placeholders": {"name": {"type": "String"}}},
+  "settingsAppearanceThemeNew": "新建主题",
+  "settingsAppearanceDeviceFonts": "设备字体",
+  "settingsAppearanceChooseDeviceFont": "选择设备字体",
+  "settingsAppearanceNoDeviceFonts": "没有匹配的设备字体",
+  "settingsAppearanceDeviceFontPreview": "字体预览：你好，世界\nThe quick brown fox · 0123456789",
+  "workspaceFileRename": "重命名",
+  "workspaceFileCopy": "复制",
+  "workspaceFileCut": "剪切",
+  "workspaceFilePaste": "粘贴",
+  "workspaceFileName": "名称",
+  "workspaceFileInvalidName": "请输入有效名称，不能包含路径分隔符。",
+  "workspaceDeleteFolderTitle": "删除文件夹？",
+  "workspaceDeleteFolderMessage": "确定删除“{name}”及其全部内容？此操作无法撤销。",
+  "@workspaceDeleteFolderMessage": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileOperationFailed": "文件操作失败：{error}",
+  "@workspaceFileOperationFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileCopyName": "{name}（副本 {index}）",
+  "@workspaceFileCopyName": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "index": {
+        "type": "int"
+      }
+    }
+  },
+  "workspaceFileSaving": "文件正在保存，请保存完成后重试。",
+  "chatBackupChooseTitle": "选择你的备份目录",
+  "chatBackupTitle": "每日聊天备份",
+  "chatBackupDescription": "应用运行时每天直接复制整个 SQLite 数据库文件，保留最近 10 份自动备份。包含数据库中的全部数据；附件文件、工作区和单独存储的配置文件不随之复制。",
+  "chatRestoreTitle": "从数据库备份恢复",
+  "chatRestoreDescription": "打开存有备份的文件夹，选择要恢复的日期。",
+  "chatRestoreChooseFolder": "选择恢复来源",
+  "chatRestoreRefresh": "刷新列表",
+  "chatRestoreSelected": "恢复所选备份",
+  "chatRestoreAction": "恢复",
+  "chatRestoreCancel": "取消",
+  "chatRestoreEmpty": "此文件夹中没有数据库备份。",
+  "chatRestoreConfirmTitle": "恢复这份数据库备份？",
+  "chatRestoreConfirmDescription": "将用 {name} 直接覆盖当前数据库文件，数据库中的全部数据都会被替换。请先停止正在运行的对话。恢复后将以这份数据库建立新的同步基线，覆盖其他设备的旧数据。",
+  "@chatRestoreConfirmDescription": {"placeholders": {"name": {"type": "String"}}},
+  "chatRestoreSuccess": "数据库已恢复。下次同步将以这份数据为准。",
+  "chatRestoreOnboardingTitle": "从以前的备份恢复",
+  "chatRestoreOnboardingDescription": "找回重装前或卸载前保存在外部目录的聊天记录",
+  "chatBackupExternalDescription": "请选择应用外的文件夹，确保卸载后备份仍保留。iPhone 和 iPad 请在 iCloud Drive 或其他外部文件提供者中选择目录。",
+  "chatBackupChoose": "选择备份目录",
+  "chatBackupLater": "稍后设置",
+  "chatBackupChange": "更改备份目录",
+  "chatBackupMissing": "尚未设置备份目录，或原目录已不存在、无法访问。请选择目录以开启每日聊天备份。",
+  "chatBackupDirectoryUnavailable": "无法使用所选文件夹。请在可用的文件夹（如“文档”或“下载”）下新建目录，并选择该目录。",
+  "chatBackupReady": "备份目录已就绪。应用启动、回到前台及运行期间会检查每日备份。",
+  "chatBackupNow": "立即备份聊天",
+  "chatBackupNever": "尚无成功备份",
+  "chatBackupLastSuccess": "最近成功备份：{time}",
+  "@chatBackupLastSuccess": {"placeholders": {"time": {"type": "String"}}}
 }

@@ -1,16 +1,17 @@
+use operit_store::ExtensionStore::ExtensionStore;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use operit_host_api::FileSystemHost;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 use operit_host_api::HostManager::HostManager;
 use operit_store::RuntimeStorePaths::RuntimeStorePaths;
 
 #[derive(Clone)]
 pub struct MCPLocalServer {
     storePaths: RuntimeStorePaths,
-    fileSystemHost: Arc<dyn FileSystemHost>,
+    filesystem: Arc<VisualFileSystem>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +34,8 @@ pub struct ServerConfig {
     pub r#type: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(rename = "bearerToken", default)]
+    pub bearerToken: Option<String>,
     #[serde(default)]
     pub disabled: bool,
     #[serde(rename = "autoApprove", default)]
@@ -89,18 +92,15 @@ impl MCPLocalServer {
     pub fn getInstance(context: &HostManager) -> Self {
         Self::new(
             RuntimeStorePaths::default(),
-            context
-                .fileSystemHost
-                .clone()
-                .expect("MCPLocalServer requires a FileSystemHost"),
+            Arc::new(context.vfs().expect("MCPLocalServer requires VFS")),
         )
     }
 
     /// Creates an MCP local server with explicit storage-path mapping and file host access.
-    pub fn new(storePaths: RuntimeStorePaths, fileSystemHost: Arc<dyn FileSystemHost>) -> Self {
+    pub fn new(storePaths: RuntimeStorePaths, filesystem: Arc<VisualFileSystem>) -> Self {
         let server = Self {
             storePaths,
-            fileSystemHost,
+            filesystem,
         };
         let _ = server.ensureMcpPluginsDirectory();
         let _ = server.loadAllConfigurations();
@@ -192,6 +192,7 @@ impl MCPLocalServer {
                 url: None,
                 r#type: None,
                 headers: BTreeMap::new(),
+                bearerToken: None,
                 disabled,
                 autoApprove: autoApprove
                     .into_iter()
@@ -231,14 +232,14 @@ impl MCPLocalServer {
 
         let pluginDir = self.pluginDirectoryPath(serverId)?;
         let pluginEntry = self
-            .fileSystemHost
+            .filesystem
             .fileExists(&pluginDir)
             .map_err(|error| error.to_string())?;
         if pluginEntry.exists {
             if !pluginEntry.isDirectory {
                 return Err(format!("MCP plugin path is not a directory: {pluginDir}"));
             }
-            self.fileSystemHost
+            self.filesystem
                 .deleteFile(&pluginDir, true)
                 .map_err(|error| format!("Failed to remove MCP plugin files: {error}"))?;
         }
@@ -286,6 +287,12 @@ impl MCPLocalServer {
     #[allow(non_snake_case)]
     pub fn getMCPServer(&self, serverId: &str) -> Option<ServerConfig> {
         self.readMCPConfig().ok()?.mcpServers.get(serverId).cloned()
+    }
+
+    /// Reads definitions without treating corrupted data as a request to remove every server.
+    #[allow(non_snake_case)]
+    pub fn getAllMCPServersChecked(&self) -> Result<BTreeMap<String, ServerConfig>, String> {
+        Ok(self.readMCPConfig()?.mcpServers)
     }
 
     /// Returns every configured MCP server keyed by server id.
@@ -467,8 +474,17 @@ impl MCPLocalServer {
         self.storePaths
             .mcp_plugins_dir()
             .join(pluginId.split('/').last().unwrap_or(pluginId))
-            .to_string_lossy()
-            .to_string()
+            .to_string_lossy().replace('\\', "/")
+    }
+
+    /// Creates the validated working directory through the file-system host before launch.
+    #[allow(non_snake_case)]
+    pub fn preparePluginRuntimeDirectory(&self, pluginId: &str) -> Result<String, String> {
+        let directory = self.pluginDirectoryPath(pluginId)?;
+        self.filesystem
+            .makeDirectory(&directory, true)
+            .map_err(|error| format!("Failed to prepare MCP working directory: {error}"))?;
+        Ok(directory)
     }
 
     /// Exports one plugin server config as a pretty JSON document.
@@ -593,6 +609,7 @@ impl MCPLocalServer {
             url,
             r#type: transportType,
             headers: cleanEnv(serverConfig.headers),
+            bearerToken: serverConfig.bearerToken,
             disabled: serverConfig.disabled,
             autoApprove: serverConfig
                 .autoApprove
@@ -657,38 +674,111 @@ impl MCPLocalServer {
         }
     }
 
+    /// Reads each MCP definition from its independent installation owner.
     #[allow(non_snake_case)]
     fn readMCPConfig(&self) -> Result<MCPConfig, String> {
-        let path = self.getConfigFilePath();
-        if !self
-            .fileSystemHost
-            .fileExists(&path)
-            .map_err(|error| error.to_string())?
-            .exists
-        {
-            return Ok(MCPConfig::default());
+        let mut config = MCPConfig::default();
+        for record in ExtensionStore::default().activeRecords("mcp")? {
+            let server = serde_json::from_value(record.settings["server"].clone())
+                .map_err(|e| e.to_string())?;
+            config.mcpServers.insert(record.id.clone(), server);
+            let metadata = serde_json::from_value(record.settings["metadata"].clone())
+                .map_err(|e| e.to_string())?;
+            config.pluginMetadata.insert(record.id, metadata);
         }
-        let text = self
-            .fileSystemHost
-            .readFile(&path)
-            .map_err(|error| error.to_string())?;
-        serde_json::from_str::<MCPConfig>(&text).map_err(|error| error.to_string())
+        Ok(config)
     }
 
+    /// Writes MCP config per owner and never synchronizes a local executable deployment.
     #[allow(non_snake_case)]
     fn writeMCPConfig(&self, config: &MCPConfig) -> Result<(), String> {
-        self.ensureMcpPluginsDirectory()?;
-        let text = serde_json::to_string_pretty(config).map_err(|error| error.to_string())?;
-        self.fileSystemHost
-            .writeFile(&self.getConfigFilePath(), &text, false)
-            .map_err(|error| error.to_string())
+        let config = self.autoFillMissingMetadata(config.clone());
+        let store = ExtensionStore::default();
+        let records = store.activeRecords("mcp")?;
+        for record in &records {
+            if let Some(server) = config.mcpServers.get(&record.id) {
+                if record.scope == "space"
+                    && (server.url.as_ref().is_none_or(|url| url.trim().is_empty())
+                        || !server.command.trim().is_empty())
+                {
+                    return Err(format!(
+                        "Local MCP can only belong to this device: {}",
+                        record.id
+                    ));
+                }
+            }
+        }
+        for (id, server) in &config.mcpServers {
+            let metadata = config
+                .pluginMetadata
+                .get(id)
+                .ok_or("MCP metadata is missing")?;
+            let settings = serde_json::json!({"server": server, "metadata": metadata});
+            if records.iter().any(|record| record.id == *id) {
+                store.setSettings("mcp", id, settings)?;
+            } else {
+                store.registerDevice("mcp", id, "", settings)?;
+            }
+        }
+        for record in &records {
+            if !config.mcpServers.contains_key(&record.id) {
+                store.delete("mcp", &record.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates all imported entries before adding new servers to the selected installation location.
+    #[allow(non_snake_case)]
+    pub fn mergeConfigFromJsonWithScope(
+        &self,
+        jsonConfig: &str,
+        scope: &str,
+    ) -> Result<usize, String> {
+        ExtensionStore::root("mcp", scope)?;
+        let config: MCPConfig = serde_json::from_str(jsonConfig).map_err(|e| e.to_string())?;
+        if config.mcpServers.is_empty() {
+            return Err("MCP configuration has no servers".to_string());
+        }
+        let current = self.readMCPConfig()?;
+        for (id, server) in &config.mcpServers {
+            if current.mcpServers.contains_key(id) {
+                return Err(format!("MCP already exists: {id}"));
+            }
+            let command = !server.command.trim().is_empty();
+            let remote = server
+                .url
+                .as_ref()
+                .is_some_and(|url| !url.trim().is_empty());
+            if command == remote {
+                return Err(format!(
+                    "MCP must declare exactly one deployment type: {id}"
+                ));
+            }
+            if scope == "space" && command {
+                return Err(format!("Local MCP can only belong to this device: {id}"));
+            }
+        }
+        let config = self.autoFillMissingMetadata(config);
+        let count = config.mcpServers.len();
+        let mut merged = current;
+        merged.mcpServers.extend(config.mcpServers.clone());
+        merged.pluginMetadata.extend(config.pluginMetadata);
+        self.writeMCPConfig(&merged)?;
+        for id in config.mcpServers.keys() {
+            if scope == "space" {
+                ExtensionStore::default().moveScope("mcp", id, scope)?;
+            }
+        }
+        self.initializeMissingServerStatus()?;
+        Ok(count)
     }
 
     #[allow(non_snake_case)]
     fn readServerStatus(&self) -> Result<BTreeMap<String, ServerStatus>, String> {
         let path = storagePathString(&self.storePaths.mcp_server_status_path());
         if !self
-            .fileSystemHost
+            .filesystem
             .fileExists(&path)
             .map_err(|error| error.to_string())?
             .exists
@@ -696,7 +786,7 @@ impl MCPLocalServer {
             return Ok(BTreeMap::new());
         }
         let text = self
-            .fileSystemHost
+            .filesystem
             .readFile(&path)
             .map_err(|error| error.to_string())?;
         serde_json::from_str::<BTreeMap<String, ServerStatus>>(&text)
@@ -707,7 +797,7 @@ impl MCPLocalServer {
     fn writeServerStatus(&self, status: &BTreeMap<String, ServerStatus>) -> Result<(), String> {
         self.ensureMcpPluginsDirectory()?;
         let text = serde_json::to_string_pretty(status).map_err(|error| error.to_string())?;
-        self.fileSystemHost
+        self.filesystem
             .writeFile(
                 &storagePathString(&self.storePaths.mcp_server_status_path()),
                 &text,
@@ -719,7 +809,7 @@ impl MCPLocalServer {
     /// Creates the host-owned MCP plugin storage directory.
     #[allow(non_snake_case)]
     fn ensureMcpPluginsDirectory(&self) -> Result<(), String> {
-        self.fileSystemHost
+        self.filesystem
             .makeDirectory(&self.getConfigDirectory(), true)
             .map_err(|error| error.to_string())
     }

@@ -13,11 +13,15 @@ import '../../../core/logging/ClientLogger.dart';
 import '../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../../core/runtime/RuntimeBootstrapManager.dart';
+import '../../../core/backup/ChatBackupService.dart';
 import '../../../core/snapshot/SnapshotImportUploader.dart';
 import '../../../l10n/generated/app_localizations.dart';
+import '../../common/StorageDirectorySelectionError.dart';
 import '../../common/DeviceSpaceDiscoveryPanel.dart';
 import '../../common/OperitLogoMark.dart';
 import '../../common/RuntimeBootstrapScreen.dart';
+import '../../common/ChatBackupDirectoryPanel.dart';
+import '../../common/ChatBackupRestorePanel.dart';
 import '../../common/components/CommonNetworkErrorView.dart';
 import '../../main/navigation/StartupRouteStrategy.dart';
 import '../../theme/OperitFormStyles.dart';
@@ -26,11 +30,13 @@ enum _AiSetupPage {
   intro,
   agreement,
   storage,
+  backup,
   mode,
   permission,
   model,
   import,
   deviceSpace,
+  restore,
 }
 
 const String _operit1SnapshotImportLogTag = 'Operit1SnapshotImport';
@@ -87,8 +93,8 @@ class OnboardingStartupRouteStrategy extends StartupRouteStrategy {
       return false;
     }
     return switch (value) {
-      'true' => true,
-      'false' => false,
+      true => true,
+      false => false,
       _ => throw FormatException('invalid ai setup guide flag: $value'),
     };
   }
@@ -97,7 +103,7 @@ class OnboardingStartupRouteStrategy extends StartupRouteStrategy {
     return _clients.preferencesPreferenceStorageManager.setPreference(
       fileName: _preferencesFileName,
       key: _guideSeenKey,
-      value: 'true',
+      value: true,
     );
   }
 
@@ -156,19 +162,18 @@ class OnboardingStartupRouteStrategy extends StartupRouteStrategy {
     return _providerHasApiKey(boundProvider);
   }
 
+  /// Checks the credential source selected by the provider configuration.
   static bool _providerHasApiKey(core_proxy.ProviderProfile provider) {
-    if (provider.apiKey.trim().isNotEmpty) {
-      return true;
-    }
     if (!provider.useMultipleApiKeys) {
-      return false;
+      return provider.apiKey.trim().isNotEmpty;
     }
-    for (final key in provider.apiKeyPool) {
-      if (key is String && key.trim().isNotEmpty) {
-        return true;
-      }
-    }
-    return false;
+    return provider.apiKeyPool.any(
+      (entry) =>
+          entry.isEnabled &&
+          entry.key.trim().isNotEmpty &&
+          entry.availabilityStatus !=
+              core_proxy.ApiKeyAvailabilityStatus.unavailable,
+    );
   }
 }
 
@@ -204,6 +209,10 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
   bool _agreementAccepted = false;
   Future<void>? _coreSetupFuture;
   bool _storageConfirmed = false;
+
+  /// Base roots are chosen once for the machine. A later identity must not
+  /// select them again after the runtime has already mounted them.
+  late final bool _storageSelectionRequired;
   bool _loadingStoragePaths = false;
   bool _savingStorage = false;
   bool _savingModel = false;
@@ -213,6 +222,8 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
   bool _requestingPermission = false;
   bool _preparingLocalSetup = false;
   bool _deviceSpaceDiscoveryBusy = false;
+  bool _chatBackupRestored = false;
+  bool _chatRestoreBusy = false;
   StreamSubscription<core_proxy.Operit1SnapshotImportProgress>?
   _operit1ImportProgressSubscription;
   String? _selectedProviderTypeId;
@@ -268,7 +279,8 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
     final commonPages = <_AiSetupPage>[
       _AiSetupPage.intro,
       if (widget.agreementRequired) _AiSetupPage.agreement,
-      _AiSetupPage.storage,
+      if (_storageSelectionRequired) _AiSetupPage.storage,
+      _AiSetupPage.backup,
       _AiSetupPage.mode,
     ];
     return switch (_selectedStartMode) {
@@ -287,12 +299,24 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
         ...commonPages,
         _AiSetupPage.deviceSpace,
       ],
+      _AiSetupStartMode.chatRestore => <_AiSetupPage>[
+        ...commonPages,
+        _AiSetupPage.restore,
+        _AiSetupPage.permission,
+        _AiSetupPage.model,
+      ],
     };
   }
 
   /// Reports whether the agreement page is currently visible.
   bool get _isAgreementPage => _currentPage == _agreementPageIndex;
   bool get _isStoragePage => _currentPage == _storagePageIndex;
+
+  /// Reports whether directory authorization is the current onboarding step.
+  bool get _isBackupPage => _pages[_currentPage] == _AiSetupPage.backup;
+
+  /// Reports whether the previous-installation recovery step is visible.
+  bool get _isRestorePage => _pages[_currentPage] == _AiSetupPage.restore;
   bool get _isModePage => _currentPage == _modePageIndex;
   bool get _isModelPage => _currentPage == _modelPageIndex;
   bool get _isImportPage => _currentPage == _importPageIndex;
@@ -325,6 +349,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
   @override
   void initState() {
     super.initState();
+    ChatBackupService.instance.addListener(_backupChanged);
     _agreementAccepted = !widget.agreementRequired;
     _agreementWaitSeconds = widget.agreementRequired ? 5 : 0;
     WidgetsBinding.instance.addObserver(this);
@@ -337,6 +362,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
       duration: const Duration(milliseconds: 760),
     );
     final localStorage = RuntimeBootstrapManager.instance.config;
+    _storageSelectionRequired = !localStorage.confirmed;
     _storageConfirmed = localStorage.confirmed;
     if (_storageConfirmed) {
       _runtimeRootController.text = localStorage.runtimeRoot;
@@ -354,6 +380,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
 
   @override
   void dispose() {
+    ChatBackupService.instance.removeListener(_backupChanged);
     WidgetsBinding.instance.removeObserver(this);
     final session = _operit1SnapshotSession;
     if (session != null) {
@@ -369,6 +396,11 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
     _runtimeRootController.dispose();
     _workspaceRootController.dispose();
     super.dispose();
+  }
+
+  /// Refreshes the onboarding continue button after directory validation changes.
+  void _backupChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -502,7 +534,9 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
         .operit1SnapshotImportProgressFlow()
         .listen(
           (progress) {
-            if (!mounted) {
+            if (!mounted ||
+                !_importingOperit1Snapshot ||
+                progress.stage == 'idle') {
               return;
             }
             setState(() {
@@ -558,7 +592,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
         _agreementAccepted = true;
         _setupError = null;
       });
-      await _animateToPage(_storagePageIndex);
+      await _animateToPage(_agreementPageIndex + 1);
     } catch (error) {
       if (!mounted) {
         return;
@@ -593,6 +627,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
   }
 
   Future<void> _goToPreviousPage() async {
+    if (_chatRestoreBusy) return;
     if (_currentPage == 0) {
       return;
     }
@@ -609,11 +644,20 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
       return;
     }
     if (_currentPage == _modePageIndex) {
-      await _animateToPage(_storagePageIndex);
+      final previousIndex = _modePageIndex - 1;
+      if (previousIndex == _introPageIndex) {
+        await _returnToIntro();
+        return;
+      }
+      await _animateToPage(previousIndex);
       return;
     }
     if (_currentPage == _permissionPageIndex) {
-      await _animateToPage(_modePageIndex);
+      await _animateToPage(
+        _selectedStartMode == _AiSetupStartMode.chatRestore
+            ? _pages.indexOf(_AiSetupPage.restore)
+            : _modePageIndex,
+      );
       return;
     }
     if (_currentPage == _modelPageIndex) {
@@ -635,6 +679,11 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
   }
 
   Future<void> _goToNextPage() async {
+    if (_chatRestoreBusy) return;
+    if (_isRestorePage) {
+      if (_chatBackupRestored) await _openPermissionSetup();
+      return;
+    }
     if (_currentPage == _introPageIndex) {
       await _advanceFromIntro();
       return;
@@ -644,7 +693,8 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
       return;
     }
     if (_isPermissionPage) {
-      if (_selectedStartMode == _AiSetupStartMode.quickStart) {
+      if (_selectedStartMode == _AiSetupStartMode.quickStart ||
+          _selectedStartMode == _AiSetupStartMode.chatRestore) {
         await _animateToPage(_modelPageIndex);
       } else if (_selectedStartMode == _AiSetupStartMode.operit1Import) {
         await _animateToPage(_importPageIndex);
@@ -655,9 +705,19 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
       await _confirmStorageLocation();
       return;
     }
+    if (_isBackupPage) {
+      if (ChatBackupService.instance.directory == null ||
+          ChatBackupService.instance.needsDirectory) {
+        return;
+      }
+      await _animateToPage(_modePageIndex);
+      return;
+    }
     if (_isModePage) {
       if (_selectedStartMode == _AiSetupStartMode.deviceSpace) {
         await _animateToPage(_deviceSpacePageIndex);
+      } else if (_selectedStartMode == _AiSetupStartMode.chatRestore) {
+        await _animateToPage(_pages.indexOf(_AiSetupPage.restore));
       } else if (_selectedStartMode != null) {
         await _openPermissionSetup();
       }
@@ -681,28 +741,36 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
     );
   }
 
-  /// Lets the user select the runtime data directory.
-  Future<void> _selectRuntimeRoot() async {
-    final path = await OperitFolderAccess.pickDirectory();
-    if (!mounted || path == null || path.trim().isEmpty) {
-      return;
-    }
-    _runtimeRootController.text = path.trim();
-    setState(() {
-      _setupError = null;
-    });
-  }
+  /// Selects a new runtime root directory.
+  Future<void> _selectRuntimeRoot() =>
+      _selectStorageRoot(_runtimeRootController);
 
-  /// Lets the user select the workspace data directory.
-  Future<void> _selectWorkspaceRoot() async {
-    final path = await OperitFolderAccess.pickDirectory();
-    if (!mounted || path == null || path.trim().isEmpty) {
-      return;
+  /// Selects a new workspace root directory.
+  Future<void> _selectWorkspaceRoot() =>
+      _selectStorageRoot(_workspaceRootController);
+
+  /// Keeps picker failures in the storage UI instead of the unhandled zone.
+  Future<void> _selectStorageRoot(TextEditingController controller) async {
+    try {
+      final path = await OperitFolderAccess.pickDirectory();
+      if (!mounted || path == null || path.trim().isEmpty) {
+        return;
+      }
+      setState(() {
+        controller.text = path.trim();
+        _setupError = null;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _setupError = storageDirectorySelectionErrorMessage(
+          AppLocalizations.of(context)!,
+          error,
+        );
+      });
     }
-    _workspaceRootController.text = path.trim();
-    setState(() {
-      _setupError = null;
-    });
   }
 
   /// Clears storage errors after either editable path changes.
@@ -751,7 +819,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
         await widget.onComplete();
         return;
       }
-      await _animateToPage(_modePageIndex);
+      await _animateToPage(_pages.indexOf(_AiSetupPage.backup));
     } catch (error) {
       if (!mounted) {
         return;
@@ -874,8 +942,6 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
           customHeaders: provider.customHeaders,
           requestLimitPerMinute: provider.requestLimitPerMinute,
           maxConcurrentRequests: provider.maxConcurrentRequests,
-          thinkingConfigurations: provider.thinkingConfigurations,
-          thinkingOptionId: provider.thinkingOptionId,
           models: provider.models,
         ),
       );
@@ -945,9 +1011,15 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
         }
       }
       if (!selectedModelExists) {
+        final selectedModel = _availableModels.firstWhere(
+          (model) => model.modelId == modelId,
+          orElse: () => throw StateError(
+            'selected model $modelId is not among the fetched models',
+          ),
+        );
         await modelManager.addProviderModelFromAvailable(
           providerId: providerId,
-          modelId: modelId,
+          model: selectedModel,
         );
       }
       await functionManager.setModelForFunction(
@@ -975,15 +1047,22 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
   Future<void> _pickOperit1Snapshot() async {
     final previousSession = _operit1SnapshotSession;
     SnapshotImportSession? stagedSession;
-    ClientLogger.i(
+    ClientLogger.v(
       'snapshot selection started',
       tag: _operit1SnapshotImportLogTag,
+      verboseLevel: VerboseLevel.level2,
     );
     setState(() {
       _readingOperit1Snapshot = true;
       _setupError = null;
       _operit1Snapshot = null;
-      _operit1ImportProgress = null;
+      _operit1ImportProgress = const core_proxy.Operit1SnapshotImportProgress(
+        stage: 'select',
+        title: '选择快照',
+        detail: '请在文件选择器中选择 Operit1 快照。',
+        progress: 0,
+        active: true,
+      );
       _operit1SnapshotSession = null;
       _operit1SnapshotFileName = null;
     });
@@ -991,19 +1070,61 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
       if (previousSession != null) {
         await previousSession.discard();
       }
-      final file = await SnapshotImportFile.pick();
+      final file = await SelectedFileInput.pickSnapshot();
       if (file == null) {
         return;
       }
-      ClientLogger.i(
+      ClientLogger.v(
         'snapshot selected name=${file.name} bytes=${file.byteLength}',
         tag: _operit1SnapshotImportLogTag,
+        verboseLevel: VerboseLevel.level2,
       );
-      final session = await SnapshotImportUploader(widget.clients).stage(file);
+      if (!mounted) {
+        await file.close();
+        return;
+      }
+      setState(() {
+        _operit1SnapshotFileName = file.name;
+      });
+      var lastUploadPercent = -1;
+      final session = await SnapshotImportUploader(widget.clients).stage(
+        file,
+        onProgress: (uploadedBytes, totalBytes) {
+          final uploadPercent = totalBytes <= 0
+              ? 0
+              : (uploadedBytes * 100 / totalBytes).floor().clamp(0, 100);
+          if (!mounted || uploadPercent == lastUploadPercent) {
+            return;
+          }
+          lastUploadPercent = uploadPercent;
+          setState(() {
+            _operit1ImportProgress = core_proxy.Operit1SnapshotImportProgress(
+              stage: 'upload',
+              title: '上传快照',
+              detail: '正在读取并上传快照文件（$uploadPercent%）。',
+              progress: uploadPercent / 100,
+              active: true,
+            );
+          });
+        },
+      );
       stagedSession = session;
-      ClientLogger.i(
+      if (mounted) {
+        setState(() {
+          _operit1ImportProgress =
+              const core_proxy.Operit1SnapshotImportProgress(
+                stage: 'inspect',
+                title: '检查快照',
+                detail: '正在检查 Operit1 快照内容，请稍候。',
+                progress: 0,
+                active: true,
+              );
+        });
+      }
+      ClientLogger.v(
         'snapshot upload completed bytes=${session.byteLength}; inspection started',
         tag: _operit1SnapshotImportLogTag,
+        verboseLevel: VerboseLevel.level3,
       );
       final snapshot = await session.completeOperit1();
       ClientLogger.i(
@@ -1040,6 +1161,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
       if (mounted) {
         setState(() {
           _readingOperit1Snapshot = false;
+          _operit1ImportProgress = null;
         });
       }
     }
@@ -1056,6 +1178,13 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
 
     setState(() {
       _importingOperit1Snapshot = true;
+      _operit1ImportProgress = const core_proxy.Operit1SnapshotImportProgress(
+        stage: 'prepare',
+        title: '准备导入',
+        detail: '正在准备迁移 Operit1 快照内容，请稍候。',
+        progress: 0,
+        active: true,
+      );
       _setupError = null;
     });
     try {
@@ -1172,6 +1301,8 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
     final importReady = !_isImportPage || _operit1Snapshot != null;
     final deviceSpaceReady = !_isDeviceSpacePage || !_deviceSpaceDiscoveryBusy;
     final canGoForward =
+        !_chatRestoreBusy &&
+        (!_isRestorePage || _chatBackupRestored) &&
         !_savingModel &&
         !_loadingModels &&
         !_readingOperit1Snapshot &&
@@ -1185,6 +1316,9 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
         modeReady &&
         modelReady &&
         importReady &&
+        (!_isBackupPage ||
+            (ChatBackupService.instance.directory != null &&
+                !ChatBackupService.instance.needsDirectory)) &&
         deviceSpaceReady;
     final introActive = _currentPage == _introPageIndex;
     final showChrome = !introActive;
@@ -1255,6 +1389,19 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
                                     onPathChanged: _handleStoragePathChanged,
                                     errorText: _setupError,
                                   );
+                                case _AiSetupPage.backup:
+                                  return Center(
+                                    child: SingleChildScrollView(
+                                      padding: const EdgeInsets.all(16),
+                                      child: ChatBackupDirectoryPanel(
+                                        onDeferred: () =>
+                                            _animateToPage(_modePageIndex),
+                                        onSelected: () {
+                                          if (mounted) setState(() {});
+                                        },
+                                      ),
+                                    ),
+                                  );
                                 case _AiSetupPage.mode:
                                   return _AiSetupModePage(
                                     selectedMode: _selectedStartMode,
@@ -1264,6 +1411,26 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
                                         _setupError = null;
                                       });
                                     },
+                                  );
+                                case _AiSetupPage.restore:
+                                  return SingleChildScrollView(
+                                    padding: const EdgeInsets.all(16),
+                                    child: ChatBackupRestorePanel(
+                                      onRestored: () {
+                                        if (mounted) {
+                                          setState(
+                                            () => _chatBackupRestored = true,
+                                          );
+                                        }
+                                      },
+                                      onBusyChanged: (busy) {
+                                        if (mounted) {
+                                          setState(
+                                            () => _chatRestoreBusy = busy,
+                                          );
+                                        }
+                                      },
+                                    ),
                                   );
                                 case _AiSetupPage.model:
                                   return _AiSetupModelPage(
@@ -1293,7 +1460,7 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
                                     errorText: _setupError,
                                   );
                                 case _AiSetupPage.import:
-                                  return _AiSetupImportPage(
+                                  return OnboardingSnapshotImportPage(
                                     snapshot: _operit1Snapshot,
                                     fileName: _operit1SnapshotFileName,
                                     reading: _readingOperit1Snapshot,
@@ -1327,7 +1494,13 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
                       pageCount: _pageCount,
                       progressLabel: _progressLabel,
                       primaryActionLabel: _primaryActionLabel,
-                      canSkip: _agreementAccepted && _storageConfirmed,
+                      canSkip:
+                          !_chatRestoreBusy &&
+                          _agreementAccepted &&
+                          _storageConfirmed &&
+                          ((ChatBackupService.instance.directory != null &&
+                                  !ChatBackupService.instance.needsDirectory) ||
+                              ChatBackupService.instance.promptDeferred),
                       isAgreementPage: _isAgreementPage,
                       isPermissionPage: _isPermissionPage,
                       onBack: _goToPreviousPage,
@@ -1387,6 +1560,8 @@ class _AiSetupGuidePageState extends State<_AiSetupGuidePage>
   }
 
   String get _progressLabel {
+    if (_isRestorePage) return AppLocalizations.of(context)!.chatRestoreTitle;
+    if (_isBackupPage) return AppLocalizations.of(context)!.chatBackupTitle;
     if (_isAgreementPage) {
       return '用户协议';
     }
@@ -2011,7 +2186,7 @@ class _AiSetupModePage extends StatelessWidget {
                 icon: Icons.route_rounded,
                 eyebrow: '启动方式',
                 title: '选择上手方式',
-                description: '可以配置新环境、导入 Operit1 数据，或加入已有设备空间直接同步配置和数据。',
+                description: '可以配置新环境、导入 Operit1 数据、加入已有设备空间，或从以前的备份恢复聊天记录。',
               ),
               const SizedBox(height: 22),
               _SetupModeTile(
@@ -2036,6 +2211,16 @@ class _AiSetupModePage extends StatelessWidget {
                 subtitle: '扫描附近设备空间，加入后直接同步模型和数据',
                 selected: selectedMode == _AiSetupStartMode.deviceSpace,
                 onTap: () => onModeChanged(_AiSetupStartMode.deviceSpace),
+              ),
+              const SizedBox(height: 10),
+              _SetupModeTile(
+                icon: Icons.restore_rounded,
+                title: AppLocalizations.of(context)!.chatRestoreOnboardingTitle,
+                subtitle: AppLocalizations.of(
+                  context,
+                )!.chatRestoreOnboardingDescription,
+                selected: selectedMode == _AiSetupStartMode.chatRestore,
+                onTap: () => onModeChanged(_AiSetupStartMode.chatRestore),
               ),
             ],
           ),
@@ -2074,7 +2259,7 @@ class _AiSetupDeviceSpacePage extends StatelessWidget {
                 icon: Icons.cloud_sync_rounded,
                 eyebrow: '设备空间',
                 title: '加入设备空间',
-                description: '扫描附近设备空间并选择一台设备。完成配对后会先同步模型、配置和数据，再结束引导。',
+                description: '点击添加设备，选择附近的设备并完成配对。管理员批准加入后，才会同步配置和数据。',
               ),
               const SizedBox(height: 22),
               DeviceSpaceDiscoveryPanel(
@@ -2110,6 +2295,10 @@ class _AiSetupAgreementPage extends StatelessWidget {
       fontWeight: FontWeight.w800,
       letterSpacing: 0,
     );
+    final boldBodyStyle = bodyStyle?.copyWith(fontWeight: FontWeight.w700);
+
+    final l10n = AppLocalizations.of(context)!;
+    final isEnglish = l10n.localeName.startsWith('en');
 
     return Align(
       alignment: Alignment.topCenter,
@@ -2121,15 +2310,21 @@ class _AiSetupAgreementPage extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                const _SetupSectionHeader(
+                _SetupSectionHeader(
                   icon: Icons.description_outlined,
-                  eyebrow: '用户协议',
-                  title: '用户协议与隐私政策',
-                  description: '请阅读本协议。确认同意后，才能继续完成设备设置。',
+                  eyebrow: isEnglish ? 'User Agreement' : '用户协议',
+                  title: isEnglish
+                      ? 'User Agreement and Privacy Policy'
+                      : '用户协议与隐私政策',
+                  description: isEnglish
+                      ? 'Please read this agreement. Confirming agreement is required to continue device setup.'
+                      : '请阅读本协议。确认同意后，才能继续完成设备设置。',
                 ),
                 const SizedBox(height: 12),
                 Text(
-                  '版本：${OnboardingStartupRouteStrategy._currentAgreementVersion}',
+                  isEnglish
+                      ? 'Version: ${OnboardingStartupRouteStrategy._currentAgreementVersion}'
+                      : '版本：${OnboardingStartupRouteStrategy._currentAgreementVersion}',
                   style: textTheme.labelMedium?.copyWith(
                     color: colorScheme.onSurfaceVariant,
                     letterSpacing: 0,
@@ -2138,7 +2333,9 @@ class _AiSetupAgreementPage extends StatelessWidget {
                 if (waitSeconds > 0) ...<Widget>[
                   const SizedBox(height: 8),
                   Text(
-                    '阅读确认将在 $waitSeconds 秒后开放。',
+                    isEnglish
+                        ? 'Confirmation will be available in $waitSeconds seconds.'
+                        : '阅读确认将在 $waitSeconds 秒后开放。',
                     style: textTheme.labelMedium?.copyWith(
                       color: colorScheme.primary,
                       letterSpacing: 0,
@@ -2157,72 +2354,17 @@ class _AiSetupAgreementPage extends StatelessWidget {
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text('人话版协议（非法律版本）', style: headingStyle),
-                      const SizedBox(height: 10),
-                      Text(
-                        'Operit 是在您的设备上运行的开源客户端。我们不运营模型推理服务、不托管聊天记录，也不向您提供共享 API Key。您配置云模型、语音、搜索、绘图、MCP 或其他网络功能时，数据会直接发送给相应服务商，并受其条款和隐私政策约束；本地模型在设备内推理。',
-                        style: bodyStyle,
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        '应用可能使用文件、终端、自动化、系统授权、Root、ADB 和扩展等能力。请在执行前核对内容、备份重要数据并谨慎授予权限。因您的操作、配置、第三方服务或第三方扩展造成的设备、数据、账号或其他损失，应由实际操作人依适用法律处理。',
-                        style: bodyStyle,
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        '市场中的插件、脚本、Skill、工具包和其他第三方内容，其著作权及责任归作者或权利人所有。展示或安装不代表 Operit 对其作出保证、背书或取得权利。',
-                        style: bodyStyle,
-                      ),
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 22),
-                        child: Divider(),
-                      ),
-                      Text('严谨版法律协议', style: headingStyle),
-                      const SizedBox(height: 12),
-                      Text(
-                        '1. 适用范围与协议版本\n本协议适用于 Operit 官方发布的客户端及其可选在线功能。使用本应用即表示您已阅读并同意当前版本。应用会记录您确认的版本；协议发生实质更新时，将要求重新确认。开源代码许可由仓库根目录 LICENSE 所载 GNU AGPL-3.0 规定，本协议不排除或缩减适用法律及开源许可证赋予您的权利。',
-                        style: bodyStyle,
-                      ),
-                      const SizedBox(height: 14),
-                      Text(
-                        '2. 产品定位与第三方服务\nOperit 不提供大语言模型推理、共享 API Key、聊天请求中转或聊天记录云端托管。您自行选择、配置和启用第三方服务，并自行判断服务商、模型、端点和扩展的安全性、合法性与适用性，妥善保管凭据。',
-                        style: bodyStyle,
-                      ),
-                      const SizedBox(height: 14),
-                      Text(
-                        '3. 数据处理与隐私\n聊天记录、角色卡、记忆、模型配置和 API Key 通常保存在设备的应用数据中。您主动导出、备份、上传文件、使用第三方网络功能或向外部 HTTP 服务提交请求时，相关数据将依您的操作被复制、传输或披露。市场、公告、更新检查、GitHub 登录和发布等功能会访问 Operit、GitHub 或相关第三方资源。',
-                        style: bodyStyle,
-                      ),
-                      const SizedBox(height: 14),
-                      Text(
-                        '4. 对外部署与运营责任\n外部 HTTP 服务、机器人、自动回复及类似能力由您选择启用。您将其开放给他人或公众使用时，应作为实际部署或运营者负责访问控制、用户授权、内容安全、数据保护、未成年人保护、必要提示和其他适用义务。',
-                        style: bodyStyle,
-                      ),
-                      const SizedBox(height: 14),
-                      Text(
-                        '5. 合法使用与内容责任\n您应遵守适用法律法规、第三方服务规则及平台规则，不得利用本应用、扩展或配置实施违法活动、侵害他人权益、未经授权访问系统或数据，或传播违法有害内容。AI 输出可能包含错误、遗漏或偏差，不构成医疗、法律、金融或其他专业建议。',
-                        style: bodyStyle,
-                      ),
-                      const SizedBox(height: 14),
-                      Text(
-                        '6. 软件按现状提供\n在适用法律允许的范围内，本软件按“现状”和“可用”状态提供。贡献者不对软件或第三方服务的持续可用性、准确性、安全性、适销性、特定用途适用性或不侵权作出明示或默示保证。',
-                        style: bodyStyle,
-                      ),
-                      const SizedBox(height: 14),
-                      Text(
-                        '7. 协议更新与联系\n我们可能因功能、法律或安全要求更新本协议，并在应用内提供当前版本。对用户权益有实质影响的更新，将通过提高协议版本并要求重新确认的方式生效。您可通过项目仓库、应用内反馈入口或公开联系渠道提出问题和意见。',
-                        style: bodyStyle,
-                      ),
-                      const SizedBox(height: 20),
-                      Text(
-                        '人话版仅为便于理解；若与中文严谨版不一致，以中文严谨版为准。',
-                        style: textTheme.bodySmall?.copyWith(
-                          color: colorScheme.onSurfaceVariant,
-                          height: 1.4,
-                        ),
-                      ),
-                    ],
+                    children: isEnglish
+                        ? _buildEnglishAgreementBody(
+                            bodyStyle,
+                            headingStyle,
+                            boldBodyStyle,
+                          )
+                        : _buildChineseAgreementBody(
+                            bodyStyle,
+                            headingStyle,
+                            boldBodyStyle,
+                          ),
                   ),
                 ),
               ],
@@ -2231,6 +2373,153 @@ class _AiSetupAgreementPage extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  List<Widget> _buildChineseAgreementBody(
+    TextStyle? bodyStyle,
+    TextStyle? headingStyle,
+    TextStyle? boldBodyStyle,
+  ) {
+    return <Widget>[
+      Text('人话版协议（非法律版本）', style: headingStyle),
+      const SizedBox(height: 10),
+      Text(
+        '和你一样，我们看到一长串用户协议的时候也会感觉头大，所以我们把中文严谨版协议压缩成这份相对来说更便于理解的版本。',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 12),
+      Text('若这份"人话版协议"与中文严谨版不一致，以中文严谨版为准。', style: boldBodyStyle),
+      const SizedBox(height: 12),
+      Text(
+        'Operit 2 是在您的设备上运行的开源客户端。我们不运营模型推理服务、不托管聊天记录，也不向您提供共享 API Key。您配置云模型、语音、搜索、绘图、MCP 或其他网络功能时，数据会直接发送给相应服务商，并受其条款和隐私政策约束；本地模型在设备内推理。',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 12),
+      Text(
+        '应用可能使用文件、终端、自动化、系统授权、Root、ADB 和扩展等能力。请在执行前核对内容、备份重要数据并谨慎授予权限。因您的操作、配置、第三方服务或第三方扩展造成的设备、数据、账号或其他损失，应由实际操作人依适用法律处理。',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 12),
+      Text(
+        '市场中的插件、脚本、Skill、工具包和其他第三方内容，其著作权及责任归作者或权利人所有。展示或安装不代表 Operit 2 对其作出保证、背书或取得权利。',
+        style: bodyStyle,
+      ),
+      const Padding(
+        padding: EdgeInsets.symmetric(vertical: 22),
+        child: Divider(),
+      ),
+      Text('严谨版法律协议', style: headingStyle),
+      const SizedBox(height: 12),
+      Text(
+        '1. 适用范围与协议版本\n本协议适用于 Operit 2 官方发布的客户端及其可选在线功能。使用本应用即表示您已阅读并同意当前版本。应用会记录您确认的版本；协议发生实质更新时，将要求重新确认。开源代码许可由仓库根目录 LICENSE 所载 GNU AGPL-3.0 规定，本协议不排除或缩减适用法律及开源许可证赋予您的权利。',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '2. 产品定位与第三方服务\nOperit 2 不提供大语言模型推理、共享 API Key、聊天请求中转或聊天记录云端托管。您自行选择、配置和启用第三方服务，并自行判断服务商、模型、端点和扩展的安全性、合法性与适用性，妥善保管凭据。',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '3. 数据处理与隐私\n聊天记录、角色卡、记忆、模型配置和 API Key 通常保存在设备的应用数据中。您主动导出、备份、上传文件、使用第三方网络功能或向外部 HTTP 服务提交请求时，相关数据将依您的操作被复制、传输或披露。市场、公告、更新检查、GitHub 登录和发布等功能会访问 Operit 2、GitHub 或相关第三方资源。',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '4. 对外部署与运营责任\n外部 HTTP 服务、机器人、自动回复及类似能力由您选择启用。您将其开放给他人或公众使用时，应作为实际部署或运营者负责访问控制、用户授权、内容安全、数据保护、未成年人保护、必要提示和其他适用义务。',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '5. 合法使用与内容责任\n您应遵守适用法律法规、第三方服务规则及平台规则，不得利用本应用、扩展或配置实施违法活动、侵害他人权益、未经授权访问系统或数据，或传播违法有害内容。AI 输出可能包含错误、遗漏或偏差，不构成医疗、法律、金融或其他专业建议。',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '6. 软件按现状提供\n在适用法律允许的范围内，本软件按“现状”和“可用”状态提供。贡献者不对软件或第三方服务的持续可用性、准确性、安全性、适销性、特定用途适用性或不侵权作出明示或默示保证。',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '7. 协议更新与联系\n我们可能因功能、法律或安全要求更新本协议，并在应用内提供当前版本。对用户权益有实质影响的更新，将通过提高协议版本并要求重新确认的方式生效。您可通过项目仓库、应用内反馈入口或公开联系渠道提出问题和意见。',
+        style: bodyStyle,
+      ),
+    ];
+  }
+
+  List<Widget> _buildEnglishAgreementBody(
+    TextStyle? bodyStyle,
+    TextStyle? headingStyle,
+    TextStyle? boldBodyStyle,
+  ) {
+    return <Widget>[
+      Text('Plain-Language Version (Non-Legal)', style: headingStyle),
+      const SizedBox(height: 10),
+      Text(
+        'Just like you, we also feel overwhelmed when we see a long user agreement. So we\'ve condensed the official Chinese agreement into this easier-to-understand version.',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 12),
+      Text(
+        'If there is any inconsistency between this "plain-language version" and the official Chinese version, the official Chinese version shall prevail.',
+        style: boldBodyStyle,
+      ),
+      const SizedBox(height: 12),
+      Text(
+        'Operit 2 is an open-source client that runs on your device. We do not operate model inference services, host chat records, or provide shared API keys. When you configure cloud models, voice, search, drawing, MCP, or other network features, your data is sent directly to the respective service providers and is governed by their terms and privacy policies; local models run inference on your device.',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 12),
+      Text(
+        'The app may use file, terminal, automation, system authorization, Root, ADB, and extension capabilities. Please verify content before execution, back up important data, and grant permissions cautiously. Any damage to devices, data, accounts, or other losses caused by your actions, configurations, third-party services, or third-party extensions shall be handled by the actual operator in accordance with applicable law.',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 12),
+      Text(
+        'Plugins, scripts, Skills, tool packages, and other third-party content in the marketplace have their copyrights and responsibilities held by their respective authors or rights holders. Displaying or installing them does not imply that Operit 2 warrants, endorses, or acquires rights to them.',
+        style: bodyStyle,
+      ),
+      const Padding(
+        padding: EdgeInsets.symmetric(vertical: 22),
+        child: Divider(),
+      ),
+      Text('Official Legal Agreement', style: headingStyle),
+      const SizedBox(height: 12),
+      Text(
+        '1. Scope and Agreement Version\nThis agreement applies to the officially released Operit 2 client and its optional online features. Using this application constitutes your acknowledgment and agreement to the current version. The application records the version you confirmed; substantive updates to the agreement will require re-confirmation. The open-source license is governed by the GNU AGPL-3.0 as set forth in the LICENSE file at the repository root. This agreement does not exclude or diminish rights granted to you by applicable law and the open-source license.',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '2. Product Positioning and Third-Party Services\nOperit 2 does not provide large language model inference, shared API keys, chat request relay, or cloud hosting of chat records. You choose, configure, and enable third-party services at your own discretion, and you are responsible for assessing the security, legality, and suitability of service providers, models, endpoints, and extensions, and for safeguarding your credentials.',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '3. Data Processing and Privacy\nChat records, character cards, memory, model configurations, and API keys are typically stored in the application\'s data on your device. When you actively export, back up, upload files, use third-party network features, or submit requests to external HTTP services, relevant data may be copied, transmitted, or disclosed as a result of your actions. Marketplace, announcements, update checks, GitHub login, and release features may access Operit 2, GitHub, or related third-party resources.',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '4. External Deployment and Operational Responsibility\nExternal HTTP services, bots, auto-replies, and similar capabilities are enabled at your discretion. When you make them available to others or the public, you act as the actual deployer or operator and are responsible for access control, user authorization, content safety, data protection, minor protection, necessary notices, and other applicable obligations.',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '5. Lawful Use and Content Responsibility\nYou shall comply with applicable laws, regulations, third-party service rules, and platform rules. You must not use this application, extensions, or configurations to conduct illegal activities, infringe on others\' rights, gain unauthorized access to systems or data, or disseminate illegal or harmful content. AI output may contain errors, omissions, or biases and does not constitute medical, legal, financial, or other professional advice.',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '6. Software Provided As-Is\nTo the extent permitted by applicable law, this software is provided on an "as is" and "as available" basis. Contributors make no express or implied warranties regarding the continued availability, accuracy, security, merchantability, fitness for a particular purpose, or non-infringement of the software or third-party services.',
+        style: bodyStyle,
+      ),
+      const SizedBox(height: 14),
+      Text(
+        '7. Agreement Updates and Contact\nWe may update this agreement for functional, legal, or security reasons and provide the current version within the application. Updates with substantive impact on user rights will take effect by incrementing the agreement version and requiring re-confirmation. You may raise questions or feedback through the project repository, in-app feedback channels, or public contact channels.',
+        style: bodyStyle,
+      ),
+    ];
   }
 }
 
@@ -2323,7 +2612,15 @@ class _AiSetupStoragePage extends StatelessWidget {
               ],
               if (errorText != null) ...<Widget>[
                 const SizedBox(height: 12),
-                CommonNetworkErrorView(errorText: errorText!),
+                Semantics(
+                  liveRegion: true,
+                  child: Text(
+                    errorText!,
+                    style: textTheme.bodySmall?.copyWith(
+                      color: colorScheme.error,
+                    ),
+                  ),
+                ),
               ],
             ],
           ),
@@ -2380,8 +2677,10 @@ class _StoragePathField extends StatelessWidget {
   }
 }
 
-class _AiSetupImportPage extends StatelessWidget {
-  const _AiSetupImportPage({
+/// Displays snapshot staging and migration progress in the onboarding flow.
+class OnboardingSnapshotImportPage extends StatelessWidget {
+  const OnboardingSnapshotImportPage({
+    super.key,
     required this.snapshot,
     required this.fileName,
     required this.reading,
@@ -2400,11 +2699,21 @@ class _AiSetupImportPage extends StatelessWidget {
   final String? errorText;
 
   @override
+  /// Builds the current-format snapshot preview and import error details.
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
     final preview = snapshot;
-    final importProgress = importing ? progress : null;
+    final importProgress = reading || importing
+        ? progress ??
+              const core_proxy.Operit1SnapshotImportProgress(
+                stage: 'prepare',
+                title: '准备导入',
+                detail: '正在准备 Operit1 快照，请稍候。',
+                progress: 0,
+                active: true,
+              )
+        : null;
     return Align(
       alignment: Alignment.topCenter,
       child: SingleChildScrollView(
@@ -2418,7 +2727,8 @@ class _AiSetupImportPage extends StatelessWidget {
                 icon: Icons.move_to_inbox_rounded,
                 eyebrow: '导入配置',
                 title: '从 Operit1 导入',
-                description: '选择旧版快照，将配置、聊天、角色卡、资源等数据迁移到 Operit2。',
+                description:
+                    '请使用最新版 Operit1 导出的快照，将配置、聊天、角色卡、资源等数据迁移到 Operit2。',
               ),
               const SizedBox(height: 22),
               Align(
@@ -2443,6 +2753,13 @@ class _AiSetupImportPage extends StatelessWidget {
                   style: textTheme.bodyMedium?.copyWith(
                     color: colorScheme.onSurfaceVariant,
                   ),
+                ),
+              ],
+              if (importProgress != null) ...<Widget>[
+                const SizedBox(height: 18),
+                Semantics(
+                  liveRegion: true,
+                  child: _Operit1ImportProgressPanel(progress: importProgress),
                 ),
               ],
               if (preview != null) ...<Widget>[
@@ -2517,14 +2834,27 @@ class _AiSetupImportPage extends StatelessWidget {
                     height: 1.36,
                   ),
                 ),
-                if (importProgress != null) ...<Widget>[
-                  const SizedBox(height: 14),
-                  _Operit1ImportProgressPanel(progress: importProgress),
-                ],
               ],
               if (errorText != null) ...<Widget>[
                 const SizedBox(height: 12),
-                CommonNetworkErrorView(errorText: errorText!),
+                Semantics(
+                  liveRegion: true,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: colorScheme.errorContainer,
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Text(
+                        '快照导入失败\n$errorText',
+                        style: textTheme.bodyMedium?.copyWith(
+                          color: colorScheme.onErrorContainer,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               ],
             ],
           ),
@@ -2544,6 +2874,11 @@ class _Operit1ImportProgressPanel extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
     final value = progress.progress.clamp(0.0, 1.0).toDouble();
+    final indeterminate = const <String>{
+      'select',
+      'prepare',
+      'inspect',
+    }.contains(progress.stage);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2566,22 +2901,24 @@ class _Operit1ImportProgressPanel extends StatelessWidget {
                 ),
               ),
             ),
-            const SizedBox(width: 12),
-            Text(
-              '${(value * 100).round()}%',
-              style: textTheme.labelMedium?.copyWith(
-                color: colorScheme.primary,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 0,
+            if (!indeterminate) ...<Widget>[
+              const SizedBox(width: 12),
+              Text(
+                '${(value * 100).round()}%',
+                style: textTheme.labelMedium?.copyWith(
+                  color: colorScheme.primary,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0,
+                ),
               ),
-            ),
+            ],
           ],
         ),
         const SizedBox(height: 8),
         ClipRRect(
           borderRadius: BorderRadius.circular(999),
           child: LinearProgressIndicator(
-            value: value,
+            value: indeterminate ? null : value,
             minHeight: 6,
             backgroundColor: colorScheme.surfaceContainerHighest.withValues(
               alpha: 0.72,
@@ -3207,7 +3544,7 @@ String? _requiredField(String? value) {
   return null;
 }
 
-enum _AiSetupStartMode { quickStart, operit1Import, deviceSpace }
+enum _AiSetupStartMode { quickStart, operit1Import, deviceSpace, chatRestore }
 
 class _OnboardingRequirement {
   const _OnboardingRequirement({

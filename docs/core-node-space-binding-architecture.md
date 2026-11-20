@@ -1,7 +1,7 @@
 # CoreNode and Binding Architecture
 
 本文档定义 Operit 多设备协作的最终架构。目标是让 CLI、桌面端、移动端和其他运行
-Operit Core 的应用共同组成一个设备空间。设备空间内的所有设备持续拥有同一份持久化
+Operit Core 的应用共同组成一个设备空间。设备空间内获得 `storage.provide` 授权且提供 Core 存储服务的节点持续同步持久化
 业务数据，Agent 可以在工具调用边界把后续执行切换到任意设备。
 
 ## 0. 用户身份
@@ -74,8 +74,9 @@ Space 只负责三件事：
 确定持久化数据应当在哪些 CoreNode 之间持续同步
 ```
 
-Space 不表达执行位置，也不表达数据归属。加入同一 Space 的 CoreNode 都保存完整的
-业务数据副本。
+Space 不表达执行位置，也不表达数据归属。业务副本由具备 `storage.provide` 且实际
+提供 Core 存储服务的成员保存和同步。Edge 的控制状态、自身配置和业务使用边界见
+[Edge 架构](edge-architecture.md)。
 
 ### 2.1 发现与加入
 
@@ -93,6 +94,19 @@ Space 不表达执行位置，也不表达数据归属。加入同一 Space 的 
 `space/join-request` 一类协议路径；它们是 `RuntimeRemoteLinkService` 上的普通 service
 call。配对只建立两个节点之间的直接可信连接。Space 成员关系使请求可以经过其他成员逐跳
 到达目标节点，但不会把中间节点与目标节点伪装成直接配对关系。
+
+加入申请只允许合并一个与目标不同的源空间。申请人发现目标与其本地 `spaceId` 相同时，
+无论本地是否出现在对方快照中都不再提交申请：成员一致说明已经是成员，成员不一致则是
+成员表分裂，走对账而不是全新的 `AdmitSpace` 审批。网关侧同样拒绝
+`sourceSpaceId == targetSpaceId` 的提交（存量记录仍可取消）。此外，所有本地控制命令
+在写入同步日志前先做字段校验，避免一条无法回放的命令永久破坏该空间的控制面状态物化。
+
+成员表分裂通过共享空间对账（`node.space/reconcileSharedSpace`）收敛。控制日志是唯一
+权威：双方交换各自持有的该空间控制操作，只接受**对方自源**（`originDeviceId` 为对端）
+且属于该空间的操作，去重后并入本地日志，再各自重放合并日志得到一致的策略状态。收敛后
+每端把**对端**的成员记录改写到策略一致（本机自己的成员身份不因网络消息改写：发起方在
+策略排除自己时按显式退出处理，宿主侧只报告收敛结果）。之后正常流程即可继续：策略仍
+承认该设备时无需任何新审批，策略已排除时设备以干净状态重新走标准加入流程。
 
 退出设备空间只重写本机成员记录，保留完整业务数据和直接配对记录，并创建新的单设备
 空间。直接配对设备会先双向交换设备空间投影；只有双方 `spaceId` 相同，才继续交换聊天、
@@ -131,7 +145,7 @@ Binding {
 Binding 层不知道 key 是否来自聊天、任务或其他业务对象。聊天路由直接使用现有 `chatId`
 作为 key，但该含义只存在于 Chat 业务代码和方法注解中。Binding 不表示业务数据位于目标
 节点；Agent、聊天、消息、记忆、工具结果、配置和 Binding 本身都由 Space 持久化同步
-服务复制到所有成员。
+服务复制到获准参与业务存储的成员。
 
 同一个 Agent 的不同聊天可以绑定不同 CoreNode。切换 Binding 不会移动 Agent，也不会
 移动其对话。Agent 在当前工具调用上下文中已经拥有 `chatId`，因此切换工具只需要目标
@@ -143,11 +157,23 @@ switch_core(nodeId)
 ```
 
 `list_core_nodes` 只读取本机已经同步的 Space 成员视图。Agent 使用它获得精确节点 ID，
-不引入 EnvRegistry、设备选择器或新的绑定概念。
+不引入 EnvRegistry、设备选择器或新的绑定概念。每个成员的 `reachable` 与设备面板同源：
+只要当前 Peer Link 图能解析出路由计划（含直连的 1 跳）即为可达；`relayHops`/`relayPath`
+仅对多跳成员填充。
+
+`switch_core` 在调用时按同一份路由视图校验目标：目标不是 Space 成员或当前不可达时，
+工具直接返回失败，而不是让切换在回合结束后异步落空。目标引用可以是完整节点 ID，
+也可以是成员名、用户名或唯一 ID 前缀：解析按精确 ID、精确名称、大小写不敏感名称、
+唯一前缀的顺序进行，重名或前缀歧义时返回候选列表而不猜测；校验通过时工具返回解析后
+的规范 `node_id` 标记，真正的 Binding 提交与目标端续跑发生在本回合完成之后。
 
 每个需要路由的业务 key 必须有一条 Binding。创建可执行聊天时，Chat 仓库单独写入
 `Binding(chatId)`。每次比较写入成功后 `generation` 单调递增，它同时标识目标节点即将
 执行的 continuation。Binding 缺失或指向非 Space 成员时，请求返回明确错误。
+
+Flutter 聊天输入框在当前设备执行对话时不显示设备后缀；远程执行时显示目标平台和
+离线状态。该提示来自 `BindingRouteStatus`，表示对话的执行节点，不表示模型推理位置
+或请求是否需要联网。
 
 Binding 的冲突顺序复用持久化同步操作的设备序列和向量时钟。同步元数据不是 Binding
 的业务字段。
@@ -156,8 +182,24 @@ Binding 的冲突顺序复用持久化同步操作的设备序列和向量时钟
 
 ### 4.1 持久化同步
 
-`SpacePersistenceSyncService` 是 CoreNode 启动后长期运行的服务。它在每条直接 Peer
-Link 上持续交换本地操作日志和向量时钟：
+成员资格、网络可达性和存储授权是三件不同的事。内置 `admin`（通过 `*`）、`user` 和 `relay` 角色均具有 `storage.provide`。
+新成员采用默认 `user` 角色后即可参与业务副本同步。业务副本同步（聊天、配置、Binding
+日志、对象与文件）只在双方都具备 `storage.provide` 且实际提供 Core 存储服务时运行；
+后台任务和接收端均检查当前授权。中继同样保存业务副本，撤权后不能继续接收
+业务副本或 blob。
+
+授权变更通过独立的同空间控制交换传播，不依赖业务存储授权，也不推进业务同步
+时钟，避免非存储节点先收到较新的权限命令，日后授权时漏取较早的业务记录。
+Edge 保留设备身份、配对凭证和必要的成员/权限/审批本地状态；这些不构成空间业务
+副本，亦不自动生成业务同步日志、设备索引或同步时钟。旧 Edge 日志只有在确认
+全部属于成员展示元数据和权限命令、且权限已持久保存后，才允许精确退役；遇到
+未知或业务记录不自动删除。显示聊天的按需读取/内存缓存不等于申请存储角色。
+受限 Edge 的后续职责收窄见 [Core 托管入口方案](edge-core-entry-protocol.md)。当前同步已
+接入版本/报文上限协商、endpoint 逐条权限导出和发送预检，仍声明 `localReplay`。
+托管授权与权威移交尚未完成，本节所述控制交换和本地校验仍然适用。
+
+
+`SpacePersistenceSyncService` 是 CoreNode 启动后长期运行的服务。它经认证路由与可达成员持续交换本地操作日志和向量时钟：
 
 ```text
 preferences
@@ -171,6 +213,30 @@ execution completion records
 
 节点断开后保留自己的操作日志；重新连接时从双方时钟差异继续同步。同步不是由用户
 触发的一次事务，也不依赖当前 Binding。
+
+全量交换由变更门控调度，空闲设备不重复搬运未变化的状态。每个同步周期对每个可达
+成员先发送一次常量大小的 `syncClockDigest` 探针（本机写出操作的时钟摘要）；不支持该
+方法的旧对端回退到完整 `syncClock` 探针并做同样的摘要比较。仅当下列任一条件成立
+才执行投影交换、控制交换和业务复制：对端时钟摘要相对上次完成的交换发生变化；本
+节点自身状态摘要（本机写出的复制日志时钟、被投影的控制操作计数、设备偏好 revision）
+发生变化——被投影的操作不推进日志时钟，该计数保证中继学到的授权变更由投影方主动
+推送给其余成员；或上一次与该对端的交换失败且退避已到期。应用对端操作只会推进该
+origin 在本地的已知序列，不计入这两个摘要：否则任一成员写入都会让所有邻居重开一轮
+没有内容可交换的全量 pass。成员之间按可达路由直接同步，失联期间落后的成员在重新
+可达后从持有该 origin 的成员处拉取。Space 快照导入的拓扑记录只落盘、不以本地 origin
+重新发布，避免每轮快照交换把各成员公告互相回写成新操作；本机直连公告在任一链路临近
+过期时整组刷新并只写一条记录。插件存储句柄的打开/关闭不写入数据，因此不作为变更
+信号。探针仅发往存储复制已获准的对端，非存储成员保持直接交换以继续接收授权。失败按
+对端指数退避（2 秒起、60 秒封顶），成功后复位，避免版本不匹配或缺 blob 的节点按周期
+重付全量代价。
+
+同步页按字节与条数双重上限导出：单侧一页最多 `DEFAULT_SYNC_PAGE_BYTES`（4 MiB）；
+插件存储只物化被选中的载荷，所以一次导出不会随积压大小放大。一次
+`SyncApplyOperations` 的合并操作集仍可能超过连接的编码消息上限，发送前按操作边界再切成
+多条消息（事务不拆开）。一个同步回合持续换页直到某次交换为空，历史完成标记只由这条空页
+携带；单回合页数有上限，持续写入的设备不会把一回合无限拉长。单条操作自身超过上限时，
+本端直接以 `SYNC_OPERATION_TOO_LARGE` 报错；链路层把超限与鉴权失败分开报告为
+`PEER_MESSAGE_TOO_LARGE`，不再伪装成安全错误。
 
 Runtime 文件的归属由 `RuntimeStorageLayout` 中的路径定义直接声明：
 
@@ -193,6 +259,7 @@ CoreNode 身份私钥
 两两配对密钥和 session
 HostManager 平台状态
 本机监听地址
+应用界面缩放（Ctrl + / - / 0，通过 RuntimeStorageRepository 保存为 CoreNode 本地状态）
 本机平台能力和临时交互句柄
 ```
 
@@ -237,33 +304,25 @@ origin -> next peer -> ... -> target CoreNode
 origin <- next peer <- ... <- target CoreNode
 ```
 
-响应沿正在等待的逐跳调用链返回。现有 `requestId`、`subscriptionId` 和 `pushId` 继续
+响应沿正在等待的逐跳调用链返回。标准 Link 的 `requestId` 和 `pushId` 继续
 标识逻辑调用与流，不建立第二套流身份。
 
 ### 5.1 RouteTable
 
-每个 CoreNode 保存 Space 内同步得到的连接拓扑，并在实际转发时只允许当前活跃的直接
-Peer Link 作为第一跳：
+每个 CoreNode 保存 Space 拓扑，第一跳必须是当前活跃且获准承载该 Space 流量的直接
+Peer Link。心跳过期、连接关闭或策略断开时撤销对应连接与本机拓扑边；本机只发布自身
+连接事实，远端公告不能证明本机第一跳在线。
 
-```text
-(spaceId, targetNodeId) -> nextPeer
-```
+链路公告包含方向、生命周期和质量测量。路由按有效边计算加权最短路径，等价路径使用
+确定的第一跳顺序。具体代价、公告校验与共享订阅规则见
+[路由与分发](device-net-routing-distribution.md)。
 
-同步拓扑用于计算最短路径，Peer Link 注册表用于证明第一跳此刻在线。HTTP 长响应流完成
-握手后 Peer Link 才进入注册表；双向心跳持续刷新连接活性，心跳过期或 carrier 关闭时立即
-撤销直接 Peer Link，并把新的本机连接投影作为持久化操作同步给其他设备。
+路由结果随设备投影与 `list_core_nodes` 暴露给上层。非本机直连的状态标记为
+`Announced`，表示由其他成员宣告。`ttl` 每转发一次减一；无有效路径、TTL 用尽或目标
+不属于 Space 时属于路由失败。当前实现与目标约束的差异统一记录在
+[Link 架构的实现待清理项](link-access-architecture.md#9-当前实现的待清理项)。
 
-`ttl` 每转发一次减一。`ttl` 到零、目标不属于 Space、nextPeer 不存在或 nextPeer 等于
-上一跳时返回明确的路由错误。Binding 路由在发送前发现目标不可达时，使用
-`expectedRemote -> localNodeId` 的比较写入由当前设备接管；比较冲突时重新读取已经提交的
-Binding。中间设备返回明确的不可达错误时执行同一接管规则。显式指定设备的控制调用不
-修改 Binding。
-
-旧设备恢复在线后只恢复持久化双向同步，不自动夺回 Binding。下一次执行继续服从已经同步
-收敛的新 Binding。
-
-转发期间不得持有 Core、路由表或连接集合的互斥锁等待下游网络响应。每一跳先复制所需
-路由和连接句柄，释放锁后再执行网络调用。
+转发期间先取得路由和连接句柄，释放互斥锁后再等待网络响应。
 
 ### 5.2 Call
 
@@ -303,6 +362,12 @@ Flutter / CLI / App
 聊天历史读取、配置编辑和其他持久化数据操作在本地 Core 执行，由持续同步传播。只有
 模型执行、工具循环、取消当前执行和实时执行状态进入 Binding 路由。
 
+整段会话删除属于本地持久化操作，不要求存在 Binding，也不要求执行节点在线。退出 Space
+不删除业务历史；退出后本地提交的删除在重新加入时通过既有 SQL 操作日志传播。会话 ID
+的删除是终态，由 SQL owner 在同一事务内删除历史并记录删除事实。迟到的消息、快照或
+Binding 不能重建该 ID；新建或恢复会话必须使用新 ID。收到同步删除的节点停止该会话
+的本地生成且不保存半段回复，清除选中状态和待发送队列，不影响其他会话的执行。
+
 请求类型由真实 Core 方法上的 `#[operit_core_route(...)]` 声明，经 typed Core codegen
 生成，不通过对象名、方法名或路径字符串猜测业务含义。Flutter、CLI 和其他客户端仍调用
 普通 Core 方法，不创建 Binding 引用路径。请求显式携带 Binding key 时直接使用；未携带
@@ -310,6 +375,8 @@ Flutter / CLI / App
 再选择 Binding 目标。未标注的方法始终留在本地 Core。
 
 ## 7. 工具边界切换 CoreNode
+
+切换 CoreNode 直接携带当前运行上下文续接，不触发会话总结或上下文压缩，也不以压缩成功作为切换前提。切换前的生命周期只检查执行所有权；上下文压缩仍由独立的自动阈值或用户手动操作触发。
 
 当前模型工具循环在同一个进程内从工具结果直接进入下一轮模型请求。CoreNode 切换必须
 发生在下面这个边界：
@@ -370,57 +437,23 @@ Binding 打开下一段 continuation，并把事件继续写入同一个上游 s
 
 ## 8. 现有模块职责
 
-### 8.1 operit-store
+| 模块 | 职责 |
+| --- | --- |
+| `operit-store` | 操作日志、收据、Binding 与各存储 owner 的提交；拓扑记录与确定性路由计算 |
+| `operit-link` | Call、Watch、Push、事件、错误和流的协议契约 |
+| `node/peer-link` | 认证连接承载、心跳、请求关联和连接生命周期 |
+| `node/runtime` | 配对与成员策略、CoreNodeRouter、逐跳转发、共享 Watch 与同步调度 |
+| `operit-proxy-local` | 本机类型化代理与业务分发 |
+| `runtime/application` | 单节点业务运行时、模型工具循环与 handoff |
+| `application/core` | 组装 Core、Proxy、Node 与 Host 的应用树 |
 
-负责持久化操作日志、向量时钟、Binding 存储以及各业务域操作的应用。它不知道网络
-拓扑和实时 Core 调用。
+路由分类、Binding resolver、transition 和 resume 由真实 Core 方法注解声明。
+transition / resume 仅进入内部 dispatch 与路由元数据。Router 处理不透明的 Binding key
+和 Link 请求，业务方法及 continuation 内容由业务 owner 解释。
 
-### 8.2 operit-link
-
-继续定义 call、watch、push、event、error、stream 和 route context 的协议语义。它不读取
-Binding 存储，也不知道配对、Space 拓扑或任何 Chat 业务类型。
-
-### 8.3 operit-access-runtime
-
-负责现有配对、认证、session 和 Peer Link 承载，并增加：
-
-```text
-通过普通 call 交换设备空间投影
-成员与路由拓扑发布
-RoutedLink 承载
-逐跳 call/watch/push 转发
-```
-
-### 8.4 operit-proxy-local
-
-本机 `CoreNodeRouter` 负责：
-
-```text
-执行 codegen 生成的 call/watch/push 路由分类
-从本机 Core 解析当前 Binding key
-读取 Binding
-选择本地 Core 或 Space 路由
-保持 execution 的上游响应流
-执行 codegen 生成的通用 Binding watch transition 门控
-在业务恢复调用前安装 Link 携带的 Binding route context
-```
-
-具体 routed call/watch、resolver、transition 和 resume 方法由真实 Core 方法注解声明。
-transition 和 resume 钩子只进入内部 dispatch 与路由元数据，不生成 Flutter、CLI 或 Rust
-公共客户端方法。
-`CoreNodeRouter` 只处理 route、Binding record 和 Link 调用，不包含 Chat 方法名、字段或
-ContinueTurn 业务分支。
-
-`SpacePersistenceSyncService` 遍历每个直接出站配对，先交换双方设备空间投影，再根据
-`spaceId` 决定是否执行持久化业务同步。现有配对和 session 存储继续由 Link Access 持有。
-
-### 8.5 operit-runtime
-
-保持单个 `OperitApplication` 和 `HostManager`。模型工具循环在处理工具结果后识别
-`switch_core` 的控制结果，生成 handoff 并停止本地下一轮模型请求。
-
-跨平台差异继续全部通过 Host API 和现有 Flutter bridge 表达。普通 Rust 和 Dart 业务
-代码不增加平台分支。
+同步服务先交换认证的空间控制投影，再对可达成员执行获准的数据交换；接收、物化与提交
+规则见 [持久化同步](sync-architecture.md)。跨平台能力通过 Host API 与既有 Flutter
+bridge 提供。
 
 ## 9. 安全与成员边界
 
@@ -444,7 +477,7 @@ payload 类型允许在该 Peer Link 上转发
 
 ```text
 一个 CoreNode 只有一个 OperitApplication 和一个 HostManager
-Space 内所有持久化业务数据持续同步
+获准提供 Core 存储服务的 Space 成员之间持续同步持久化业务数据
 Binding 只决定 chat 的下一步执行节点
 Binding 改变不移动数据
 工具结果持久化完成后才能交接下一轮模型调用

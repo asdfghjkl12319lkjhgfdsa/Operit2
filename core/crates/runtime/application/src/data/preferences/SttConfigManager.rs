@@ -22,10 +22,23 @@ pub struct SttConfigManager {
 }
 
 impl SttConfigManager {
+    /// Opens this owner's versioned store through the supplied runtime storage host.
+    pub(crate) fn preferenceStore(
+        storage: std::sync::Arc<dyn operit_host_api::RuntimeStorageHost>,
+        path: impl Into<String>,
+    ) -> PreferencesDataStore {
+        PreferencesDataStore::newWithStorage(storage, path)
+            .withMigration(Self::PREFERENCES_VERSION, Self::migration)
+    }
+
+    const PREFERENCES_VERSION: u32 = 2;
     /// Creates an STT configuration manager backed by explicit runtime paths.
     pub fn new(paths: RuntimeStorePaths) -> Self {
         Self {
-            dataStore: PreferencesDataStore::newEncrypted(paths.stt_configs_preferences_path()),
+            dataStore: Self::preferenceStore(
+                operit_store::RuntimeStorageHost::defaultRuntimeStorageHost(),
+                operit_store::RuntimeStorageHost::runtimeStoragePath(&paths.stt_configs_preferences_path()),
+            ),
             paths,
         }
     }
@@ -76,13 +89,16 @@ impl SttConfigManager {
     /// Reads the selected STT configuration id when a selection exists.
     pub fn getSelectedSttConfigId(&self) -> Result<Option<String>, String> {
         let preferences = self.dataStore.data().map_err(|error| error.to_string())?;
-        let Some(id) = preferences.get(&Self::currentConfigIdKey()) else {
+        let Some(id) = preferences
+            .getTyped::<String>(&Self::currentConfigIdKey())
+            .map_err(|error| error.to_string())?
+        else {
             return Ok(None);
         };
         if id.trim().is_empty() {
             return Err("selected STT config id is empty".to_string());
         }
-        self.getSttConfig(id)?;
+        self.getSttConfig(&id)?;
         Ok(Some(id.to_string()))
     }
 
@@ -119,9 +135,6 @@ impl SttConfigManager {
         self.validateLocalModelSelection(&config)?;
         self.dataStore
             .try_edit_result(|preferences| -> Result<(), PreferencesDataStoreError> {
-                let mut ids = readConfigList(preferences)?;
-                ids.push(config.id.clone());
-                writeConfigList(preferences, &ids)?;
                 writeConfig(preferences, &config)?;
                 Ok(())
             })
@@ -152,13 +165,10 @@ impl SttConfigManager {
         self.getSttConfig(id)?;
         self.dataStore
             .try_edit_result(|preferences| -> Result<(), PreferencesDataStoreError> {
-                let mut ids = readConfigList(preferences)?;
-                ids.retain(|current| current != id);
-                writeConfigList(preferences, &ids)?;
                 preferences.remove(&configKey(id));
                 if preferences
-                    .get(&Self::currentConfigIdKey())
-                    .map(String::as_str)
+                    .getTyped::<String>(&Self::currentConfigIdKey())?
+                    .as_deref()
                     == Some(id)
                 {
                     preferences.remove(&Self::currentConfigIdKey());
@@ -167,6 +177,49 @@ impl SttConfigManager {
             })
             .map_err(|error| error.to_string())?;
         Ok(true)
+    }
+
+    /// Initializes schema bookkeeping and migrates encoded STT records in version one.
+    fn migration(
+        from: u32,
+        context: &mut operit_store::Transaction::migration::Context,
+    ) -> Result<(), PreferencesDataStoreError> {
+        if from == 1 {
+            operit_store::Transaction::Rule::DropKey {
+                key: "stt_config_list".into(),
+            }
+            .apply(context)
+            .map_err(PreferencesDataStoreError::Message)?;
+        }
+        context.map_preferences(from, &|version, preferences| match version {
+            0 => Ok(()),
+            1 => {
+                let records = preferences
+                    .iterEntries()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix("stt_config_")?.strip_suffix("_json")?;
+                        Some((key.to_owned(), value.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (key, value) in records {
+                    let encoded = serde_json::from_value::<String>(value)?;
+                    let record: serde_json::Value = serde_json::from_str(&encoded)?;
+                    let config: SttConfig = serde_json::from_value(record.clone())?;
+                    let id = key
+                        .strip_prefix("stt_config_")
+                        .and_then(|id| id.strip_suffix("_json"))
+                        .expect("configuration record key selected by this migration");
+                    if config.id != id {
+                        return Err(PreferencesDataStoreError::Message(format!(
+                            "Configuration record identity mismatch: {key}"
+                        )));
+                    }
+                    preferences.set(&stringPreferencesKey(&key), record);
+                }
+                Ok(())
+            }
+            from => Err(PreferencesDataStoreError::MissingMigration { from, to: from + 1 }),
+        })
     }
 
     /// Returns every built-in STT provider catalog entry.
@@ -234,7 +287,13 @@ fn normalizeConfig(config: SttConfig) -> Result<SttConfig, String> {
     let providerType = SttProviderType::normalize(&config.providerType);
     SttCatalog::provider(&providerType)?;
     let name = requiredText(&config.name, "STT config name")?;
-    let model = requiredText(&config.model, "STT model")?;
+    let model = if providerType == SttProviderType::LOCAL_MODEL
+        || !config.modelFieldName.trim().is_empty()
+    {
+        requiredText(&config.model, "STT model")?
+    } else {
+        config.model.trim().to_string()
+    };
     if providerType == SttProviderType::LOCAL_MODEL {
         if !config.endpoint.trim().is_empty() {
             return Err("LOCAL_MODEL STT endpoint must be empty".to_string());
@@ -278,7 +337,6 @@ fn validateRemoteConfig(config: &SttConfig) -> Result<(), String> {
         scheme => return Err(format!("unsupported STT endpoint scheme: {scheme}")),
     }
     requiredText(&config.fileFieldName, "STT file field name")?;
-    requiredText(&config.modelFieldName, "STT model field name")?;
     requiredText(&config.responseTextJsonPath, "STT response text JSON path")?;
     Ok(())
 }
@@ -311,24 +369,30 @@ fn configKey(id: &str) -> operit_store::PreferencesDataStore::PreferencesKey {
     stringPreferencesKey(&format!("stt_config_{}_json", id.trim()))
 }
 
-/// Reads the ordered STT configuration id list.
+/// Derives STT membership from complete records and validates their identities.
 fn readConfigList(preferences: &Preferences) -> Result<Vec<String>, PreferencesDataStoreError> {
-    match preferences.get(&SttConfigManager::configListKey()) {
-        Some(encoded) => serde_json::from_str(encoded).map_err(Into::into),
-        None => Ok(Vec::new()),
+    let mut configs = Vec::new();
+    for (key, value) in preferences.iterEntries() {
+        let Some(id) = key
+            .strip_prefix("stt_config_")
+            .and_then(|id| id.strip_suffix("_json"))
+        else {
+            continue;
+        };
+        let config: SttConfig = serde_json::from_value(value.clone())?;
+        if config.id != id {
+            return Err(PreferencesDataStoreError::Message(format!(
+                "STT record identity mismatch: {key}"
+            )));
+        }
+        configs.push(config);
     }
-}
-
-/// Writes the ordered STT configuration id list.
-fn writeConfigList(
-    preferences: &mut Preferences,
-    ids: &[String],
-) -> Result<(), PreferencesDataStoreError> {
-    preferences.set(
-        &SttConfigManager::configListKey(),
-        serde_json::to_string(ids)?,
-    );
-    Ok(())
+    configs.sort_by(|left, right| {
+        left.createdAt
+            .cmp(&right.createdAt)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(configs.into_iter().map(|config| config.id).collect())
 }
 
 /// Reads one existing STT configuration from preferences.
@@ -340,7 +404,7 @@ fn readExistingConfig(
     let encoded = preferences
         .get(&configKey(id))
         .ok_or_else(|| PreferencesDataStoreError::Message(format!("STT config not found: {id}")))?;
-    serde_json::from_str(encoded).map_err(Into::into)
+    serde_json::from_value(encoded.clone()).map_err(Into::into)
 }
 
 /// Writes one STT configuration to preferences.
@@ -348,6 +412,52 @@ fn writeConfig(
     preferences: &mut Preferences,
     config: &SttConfig,
 ) -> Result<(), PreferencesDataStoreError> {
-    preferences.set(&configKey(&config.id), serde_json::to_string(config)?);
+    preferences.set(&configKey(&config.id), serde_json::to_value(config)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Creates an unsaved STT configuration from its production catalog entry.
+    fn catalogConfig(provider: &str) -> SttConfig {
+        let entry = SttCatalog::provider(provider).unwrap();
+        SttConfig {
+            id: String::new(),
+            name: entry.displayName,
+            providerType: entry.providerTypeId,
+            endpoint: entry.defaultEndpoint,
+            apiKey: "test-key".into(),
+            model: entry.defaultModel,
+            fileFieldName: entry.defaultFileFieldName,
+            modelFieldName: entry.defaultModelFieldName,
+            languageFieldName: entry.defaultLanguageFieldName,
+            responseTextJsonPath: entry.defaultResponseTextJsonPath,
+            headers: entry.defaultHeaders,
+            createdAt: 0,
+            updatedAt: 0,
+        }
+    }
+
+    /// Accepts file-only recognition while retaining required models for other providers.
+    #[test]
+    fn validatesModelAccordingToDeclaredMultipartField() {
+        let deepseek = normalizeConfig(catalogConfig("DEEPSEEK_STT")).unwrap();
+        assert!(deepseek.model.is_empty());
+        assert!(deepseek.modelFieldName.is_empty());
+        assert!(deepseek.languageFieldName.is_empty());
+        for provider in [
+            "OPENAI_COMPATIBLE", "GROQ_STT", "SILICONFLOW_STT", "ZHIPU_STT",
+        ] {
+            let mut config = catalogConfig(provider);
+            assert!(normalizeConfig(config.clone()).is_ok(), "{provider}");
+            config.model.clear();
+            assert_eq!(
+                normalizeConfig(config).unwrap_err(),
+                "STT model is empty",
+                "{provider}"
+            );
+        }
+    }
 }

@@ -42,12 +42,22 @@ pub mod ToolPkgChatViewHookBridge;
 
 #[path = "ToolPkgChatMessageHookBridge.rs"]
 pub mod ToolPkgChatMessageHookBridge;
+#[path = "ToolPkgMessageTransformBridge.rs"]
+pub mod ToolPkgMessageTransformBridge;
+#[path = "NativeTextTransform.rs"]
+pub mod NativeTextTransform;
 
 #[path = "ToolPkgChatRuntimeHookBridge.rs"]
 pub mod ToolPkgChatRuntimeHookBridge;
+#[path = "ToolPkgChatResponseHookBridge.rs"]
+pub mod ToolPkgChatResponseHookBridge;
 
 #[path = "ToolPkgInputMenuToggleBridge.rs"]
 pub mod ToolPkgInputMenuToggleBridge;
 
 #[path = "ToolPkgChatComposerSlotBridge.rs"]
 pub mod ToolPkgChatComposerSlotBridge;
+
+/// Exposes the strict awaited generic chat creation lifecycle bridge.
+#[path = "ToolPkgChatLifecycleHookBridge.rs"]
+pub mod ToolPkgChatLifecycleHookBridge;

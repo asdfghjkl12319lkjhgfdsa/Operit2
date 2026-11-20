@@ -32,7 +32,8 @@ class _WorkspaceSettingsPanelState extends State<WorkspaceSettingsPanel> {
   }
 
   Future<_WorkspaceSettingsData> _load() async {
-    final summary = await widget.clients.servicesWorkspaceService
+    final summary = await widget.clients.application
+        .workspaceService()
         .workspaceManagementSummary();
 
     return _WorkspaceSettingsData(
@@ -93,9 +94,9 @@ class _WorkspaceSettingsPanelState extends State<WorkspaceSettingsPanel> {
     final targets = Set<String>.from(_selectedWorkspaceNames);
     setState(() => _deleteInProgress = true);
     try {
-      await widget.clients.servicesWorkspaceService.deleteUnboundWorkspaces(
-        workspaceNames: targets.toList(),
-      );
+      await widget.clients.application
+          .workspaceService()
+          .deleteUnboundWorkspaces(workspaceNames: targets.toList());
       if (!mounted) {
         return;
       }
@@ -145,7 +146,7 @@ class _WorkspaceSettingsPanelState extends State<WorkspaceSettingsPanel> {
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
-    return FutureBuilder<_WorkspaceSettingsData>(
+    final content = FutureBuilder<_WorkspaceSettingsData>(
       future: _future,
       builder: (context, snapshot) {
         if (snapshot.hasError) {
@@ -186,6 +187,7 @@ class _WorkspaceSettingsPanelState extends State<WorkspaceSettingsPanel> {
         );
       },
     );
+    return content;
   }
 }
 

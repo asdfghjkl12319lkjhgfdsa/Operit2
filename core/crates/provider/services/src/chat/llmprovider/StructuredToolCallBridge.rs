@@ -26,6 +26,8 @@ struct ToolResultRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OpenToolCall {
     pub(crate) id: String,
+    /// Provider-visible function name, kept separate from the executable target.
+    pub(crate) function_name: String,
     pub(crate) matching_name: String,
 }
 
@@ -135,7 +137,7 @@ impl StructuredToolCallBridge {
             | "history_end" => "后续对话历史已到达，但未返回执行结果",
             _ => "调用在未返回执行结果时结束",
         };
-        format!("工具结果缺失：{toolLabel} {detail}。这不是用户取消。")
+        format!("工具结果缺失：{toolLabel} {detail}。历史记录无法确定执行状态或结束原因，请勿视为执行成功。")
     }
 
     pub fn buildToolsJson(toolPrompts: Option<&[ToolPrompt]>) -> Option<String> {
@@ -166,10 +168,29 @@ impl StructuredToolCallBridge {
         preserveThinkInHistory: bool,
         useToolCall: bool,
     ) -> String {
+        Self::buildMessagesValueForProvider(history, preserveThinkInHistory, useToolCall).to_string()
+    }
+
+    /// Builds provider messages as a JSON value, compiling history blocks exactly once.
+    pub fn buildMessagesValueForProvider(
+        history: &[PromptTurn],
+        preserveThinkInHistory: bool,
+        useToolCall: bool,
+    ) -> Value {
+        let compiledHistory = Self::compileHistoryForProvider(history, useToolCall);
+        Self::buildMessagesValueFromCompiled(compiledHistory, preserveThinkInHistory, useToolCall)
+    }
+
+    /// Builds provider messages from already-compiled history without recompiling blocks.
+    pub fn buildMessagesValueFromCompiled(
+        compiledHistory: Vec<PromptTurn>,
+        preserveThinkInHistory: bool,
+        useToolCall: bool,
+    ) -> Value {
         if useToolCall {
-            Self::buildStructuredMessages(history, preserveThinkInHistory).to_string()
+            Self::buildCompiledStructuredMessages(compiledHistory, preserveThinkInHistory)
         } else {
-            Self::buildXmlModeMessages(history, preserveThinkInHistory).to_string()
+            Self::buildCompiledXmlModeMessages(compiledHistory, preserveThinkInHistory)
         }
     }
 
@@ -385,6 +406,13 @@ impl StructuredToolCallBridge {
 
     fn buildStructuredMessages(history: &[PromptTurn], preserveThinkInHistory: bool) -> Value {
         let mergedHistory = Self::compileHistoryForProvider(history, true);
+        Self::buildCompiledStructuredMessages(mergedHistory, preserveThinkInHistory)
+    }
+
+    fn buildCompiledStructuredMessages(
+        mergedHistory: Vec<PromptTurn>,
+        preserveThinkInHistory: bool,
+    ) -> Value {
         let mut messagesArray = Vec::new();
         let mut queuedAssistantToolText: Option<String> = None;
         let mut queuedToolCalls = Vec::new();
@@ -422,6 +450,11 @@ impl StructuredToolCallBridge {
                 queuedToolCalls.push(clonedToolCall);
                 queuedOpenToolCalls.push(OpenToolCall {
                     id: callId,
+                    function_name: toolCall
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     matching_name: matchingName,
                 });
             }
@@ -491,7 +524,7 @@ impl StructuredToolCallBridge {
             let content = if !preserveThinkInHistory && turn.kind == PromptTurnKind::ASSISTANT {
                 removeThinkingContent(&turn.content)
             } else {
-                turn.content.clone()
+                turn.content
             };
 
             match turn.kind {
@@ -633,11 +666,6 @@ impl StructuredToolCallBridge {
                             toolMessage.insert("role".to_string(), json!("tool"));
                             toolMessage
                                 .insert("tool_call_id".to_string(), json!(matchedCall.call.id));
-                            if let Some(name) = &result.name {
-                                if !name.trim().is_empty() {
-                                    toolMessage.insert("name".to_string(), json!(name));
-                                }
-                            }
                             toolMessage.insert(
                                 "content".to_string(),
                                 json!(Self::nonEmptyContent(&result.content)),
@@ -685,6 +713,13 @@ impl StructuredToolCallBridge {
 
     fn buildXmlModeMessages(history: &[PromptTurn], preserveThinkInHistory: bool) -> Value {
         let mergedHistory = Self::compileHistoryForProvider(history, false);
+        Self::buildCompiledXmlModeMessages(mergedHistory, preserveThinkInHistory)
+    }
+
+    fn buildCompiledXmlModeMessages(
+        mergedHistory: Vec<PromptTurn>,
+        preserveThinkInHistory: bool,
+    ) -> Value {
         let messagesArray = mergedHistory
             .into_iter()
             .map(|turn| {
@@ -935,7 +970,7 @@ impl StructuredToolCallBridge {
         }))
     }
 
-    fn parseXmlToolCalls(content: &str) -> (String, Option<Vec<Value>>) {
+    pub(crate) fn parseXmlToolCalls(content: &str) -> (String, Option<Vec<Value>>) {
         let matches = ChatMarkupRegex::tool_call_matches(content);
         if matches.is_empty() {
             return (content.to_string(), None);
@@ -957,7 +992,16 @@ impl StructuredToolCallBridge {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                params.insert(paramName, json!(paramValue));
+                // Rebuild the object schema when replaying proxy calls from stored XML.
+                let value = if matches!(toolMatch.name.as_str(), PACKAGE_PROXY_TOOL_NAME | CLI_PROXY_TOOL_NAME)
+                    && paramName == "params" {
+                    serde_json::from_str::<Map<String, Value>>(&paramValue)
+                        .map(Value::Object)
+                        .unwrap_or_else(|_| json!(paramValue))
+                } else {
+                    json!(paramValue)
+                };
+                params.insert(paramName, value);
             }
             let toolNamePart = Self::sanitizeToolCallId(&toolMatch.name);
             let hashPart = Self::stableIdHashPart(&format!(
@@ -1287,7 +1331,34 @@ mod tests {
         );
     }
 
-    /// Verifies package proxy results match the proxied executable tool name.
+    /// Script text and nested parameter types survive native calls and stored history.
+    #[test]
+    fn proxy_json_objects_round_trip_through_history() {
+        let parameters = serde_json::json!({
+            "command": "python3 - <<'PY'\nimport json\nprint(\"<tag>&\\path\")\nPY\n\n",
+            "enabled": true,
+            "nested": {"items": [1, null, "0012"]},
+        });
+        for name in ["package_proxy", "proxy"] {
+            let calls = vec![serde_json::json!({"function": {
+                "name": name,
+                "arguments": serde_json::json!({"tool_name": "files:write", "params": parameters}).to_string(),
+            }})];
+            let markup = StructuredToolCallBridge::convertToolCallsToXml(&calls);
+            let history = vec![PromptTurn::new(PromptTurnKind::TOOL_CALL, markup)];
+            let messages = StructuredToolCallBridge::buildMessagesValueForProvider(&history, true, true);
+            let arguments: Value = serde_json::from_str(messages[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(arguments["params"], parameters);
+        }
+        let calls = vec![serde_json::json!({"function": {
+            "name": "files:write", "arguments": parameters.to_string(),
+        }})];
+        let wrapped = StructuredToolCallBridge::wrapPackageToolCallsWithProxy(&calls);
+        let arguments: Value = serde_json::from_str(wrapped[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["params"], parameters);
+    }
+
+    /// Matches results by executable name while replying with the provider-visible name.
     #[test]
     fn packageProxyResultMatchesTargetToolName() {
         let history = vec![
@@ -1337,14 +1408,146 @@ mod tests {
             messages[1].get("tool_call_id").and_then(Value::as_str),
             Some(call_id)
         );
-        assert_eq!(
-            messages[1].get("name").and_then(Value::as_str),
-            Some("daily_life:get_current_date")
-        );
+        assert!(messages[1].get("name").is_none());
         assert!(!messages[1]
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or("")
             .contains("工具结果缺失"));
+    }
+
+    /// Explicit proxies, legacy package calls, and ordinary tools preserve their wire names.
+    #[test]
+    fn tool_result_names_match_provider_calls() {
+        for (stored_name, params, result_name, wire_name) in [
+            (
+                "package_proxy",
+                r#"<param name="tool_name">character_memory:create_memory</param><param name="params">{}</param>"#,
+                "character_memory:create_memory",
+                "package_proxy",
+            ),
+            (
+                "proxy",
+                r#"<param name="tool_name">character_memory:create_memory</param><param name="params">{}</param>"#,
+                "character_memory:create_memory",
+                "proxy",
+            ),
+            (
+                "character_memory:create_memory",
+                "",
+                "character_memory:create_memory",
+                "package_proxy",
+            ),
+            (
+                "read_file",
+                r#"<param name="path">notes.txt</param>"#,
+                "read_file",
+                "read_file",
+            ),
+        ] {
+            let history = vec![
+                PromptTurn::new(
+                    PromptTurnKind::ASSISTANT,
+                    format!(r#"<tool name="{stored_name}">{params}</tool>"#),
+                ),
+                PromptTurn::new(
+                    PromptTurnKind::TOOL_RESULT,
+                    format!(
+                        r#"<tool_result name="{result_name}"><content>done</content></tool_result>"#
+                    ),
+                ),
+            ];
+            let messages =
+                StructuredToolCallBridge::buildMessagesValueForProvider(&history, true, true);
+            assert_eq!(messages.as_array().unwrap().len(), 2, "{stored_name}");
+            assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], wire_name);
+            assert!(messages[1].get("name").is_none(), "{stored_name}");
+            assert_eq!(
+                messages[1]["tool_call_id"],
+                messages[0]["tool_calls"][0]["id"]
+            );
+            assert_eq!(messages[1]["content"], "done");
+
+            // Missing results must still refer to the original call ID without a name field.
+            let missing =
+                StructuredToolCallBridge::buildMessagesValueForProvider(&history[..1], true, true);
+            assert!(missing[1].get("name").is_none(), "{stored_name}");
+            assert_eq!(
+                missing[1]["tool_call_id"],
+                missing[0]["tool_calls"][0]["id"]
+            );
+        }
+    }
+
+    /// Multiple proxy calls still match by target and keep the correct call IDs.
+    #[test]
+    fn proxy_result_names_preserve_target_matching() {
+        let history = vec![
+            PromptTurn::new(
+                PromptTurnKind::ASSISTANT,
+                concat!(
+                    r#"<tool name="package_proxy"><param name="tool_name">character_memory:create_memory</param><param name="params">{}</param></tool>"#,
+                    r#"<tool name="package_proxy"><param name="tool_name">character_memory:query_memory</param><param name="params">{}</param></tool>"#,
+                    r#"<tool name="package_proxy"><param name="tool_name">character_memory:create_memory</param><param name="params">{}</param></tool>"#,
+                ),
+            ),
+            PromptTurn::new(
+                PromptTurnKind::TOOL_RESULT,
+                concat!(
+                    r#"<tool_result name="character_memory:query_memory"><content>found</content></tool_result>"#,
+                    r#"<tool_result name="character_memory:create_memory"><content>created first</content></tool_result>"#,
+                    r#"<tool_result name="character_memory:create_memory"><content>created second</content></tool_result>"#,
+                ),
+            ),
+        ];
+        let messages =
+            StructuredToolCallBridge::buildMessagesValueForProvider(&history, true, true);
+        assert_eq!(messages.as_array().unwrap().len(), 4);
+        for (result_index, call_index, content) in [
+            (1, 1, "found"),
+            (2, 0, "created first"),
+            (3, 2, "created second"),
+        ] {
+            assert!(messages[result_index].get("name").is_none());
+            assert_eq!(
+                messages[result_index]["tool_call_id"],
+                messages[0]["tool_calls"][call_index]["id"]
+            );
+            assert_eq!(messages[result_index]["content"], content);
+        }
+    }
+
+    /// Retains one native result per call after large same-name results pass through finalized markup.
+    #[test]
+    fn large_same_name_tool_results_remain_protocol_complete() {
+        use operit_tools::ConversationMarkupManager::ToolResult;
+        use operit_tools::ToolExecutionManager::ToolExecutionBatch;
+        use operit_tools::tools::ToolResultDataClasses::stringResultData;
+
+        let batch = ToolExecutionBatch::new(
+            ["a".repeat(100_000), "证".repeat(100_000)].into_iter().map(|text| ToolResult {
+                toolName: "grep_code".to_string(), success: true,
+                result: stringResultData(text), error: None,
+            }).collect(), None,
+        );
+        let history = vec![
+            PromptTurn::new(PromptTurnKind::ASSISTANT, concat!(
+                "<tool name=\"grep_code\"><param name=\"path\">/operitapp/data</param><param name=\"pattern\">first</param></tool>",
+                "<tool name=\"grep_code\"><param name=\"path\">/operitapp/data</param><param name=\"pattern\">second</param></tool>",
+            )),
+            PromptTurn::new(PromptTurnKind::TOOL_RESULT, batch.message.clone()),
+        ];
+        let messages: Value = serde_json::from_str(&StructuredToolCallBridge::buildMessagesJsonForProvider(&history, true, true)).unwrap();
+        let messages = messages.as_array().unwrap();
+        let calls = messages[0].get("tool_calls").unwrap().as_array().unwrap();
+        let results = messages.iter().filter(|message| message.get("role").and_then(Value::as_str) == Some("tool")).collect::<Vec<_>>();
+        let blocks = operit_util::ChatMarkupRegex::ChatMarkupRegex::tool_result_blocks(&batch.message);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(results.len(), calls.len());
+        for ((call, result), block) in calls.iter().zip(results).zip(blocks) {
+            assert_eq!(result.get("tool_call_id"), call.get("id"));
+            let expected = block.body.strip_prefix("<content>").unwrap().strip_suffix("</content>").unwrap();
+            assert_eq!(result.get("content").and_then(Value::as_str), Some(expected));
+        }
     }
 }

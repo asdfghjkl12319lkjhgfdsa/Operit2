@@ -19,19 +19,11 @@ static DISPATCHED_MANIFEST_EXTENSIONS: OnceLock<Mutex<BTreeSet<String>>> = OnceL
 pub struct ToolPkgManifestExtensionBridge;
 
 impl ToolPkgManifestExtensionBridge {
-    /// Registers the runtime listener that synchronizes manifest extension handlers.
-    pub fn register(runtime: ToolPkgBridgeRuntime) {
-        let manager = runtime.package_manager();
-        manager.addToolPkgRuntimeChangeListener(std::sync::Arc::new(move |activeContainers| {
-            Self::syncAndDispatch(&runtime, activeContainers);
-        }));
-    }
-
     /// Synchronizes active handlers and dispatches each newly visible manifest extension once.
     #[allow(non_snake_case)]
     pub fn syncAndDispatch(
         runtime: &ToolPkgBridgeRuntime,
-        activeContainers: Vec<ToolPkgContainerRuntime>,
+        activeContainers: &[ToolPkgContainerRuntime],
     ) {
         let handlers = activeContainers
             .iter()
@@ -76,102 +68,120 @@ fn dispatchManifestExtension(
     handler: &ToolPkgManifestExtensionRegistration,
     target: &ToolPkgContainerRuntime,
 ) {
-    let extension = target
-        .manifestExtensions
-        .get(&handler.extensionKey)
-        .cloned()
-        .expect("manifest extension target must contain the selected key");
-    let dispatchKey = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
-        handler.containerPackageName,
-        handler.extensionKey,
-        handler.functionName,
-        handler.functionSource.as_deref().unwrap_or_default(),
-        target.packageName,
-        target.version,
-        target.sourcePath,
-        serde_json::to_string(&extension)
-            .expect("manifest extension must remain JSON serializable")
-    );
-    {
-        let dispatched = DISPATCHED_MANIFEST_EXTENSIONS
-            .get_or_init(|| Mutex::new(BTreeSet::new()))
-            .lock()
-            .expect("toolpkg manifest extension dispatch mutex poisoned");
-        if dispatched.contains(&dispatchKey) {
-            return;
-        }
-    }
+    let runtime = runtime.to_owned();
+    let handler = handler.to_owned();
+    let target = target.to_owned();
+    super::ToolPkgHookBridgeSupport::scheduleToolPkgNotification(
+        "operit-toolpkg-notification",
+        move || {
+            Box::pin(async move {
+                let runtime = &runtime;
+                let handler = &handler;
+                let target = &target;
+                let extension = target
+                    .manifestExtensions
+                    .get(&handler.extensionKey)
+                    .cloned()
+                    .expect("manifest extension target must contain the selected key");
+                let dispatchKey = format!(
+                    "{}:{}:{}:{}:{}:{}:{}:{}",
+                    handler.containerPackageName,
+                    handler.extensionKey,
+                    handler.functionName,
+                    handler.functionSource.as_deref().unwrap_or_default(),
+                    target.packageName,
+                    target.version,
+                    target.sourcePath,
+                    serde_json::to_string(&extension)
+                        .expect("manifest extension must remain JSON serializable")
+                );
+                {
+                    let dispatched = DISPATCHED_MANIFEST_EXTENSIONS
+                        .get_or_init(|| Mutex::new(BTreeSet::new()))
+                        .lock()
+                        .expect("toolpkg manifest extension dispatch mutex poisoned");
+                    if dispatched.contains(&dispatchKey) {
+                        return;
+                    }
+                }
 
-    let mut payload = Map::new();
-    payload.insert(
-        "extensionKey".to_string(),
-        Value::String(handler.extensionKey.clone()),
-    );
-    payload.insert(
-        "sourceToolPkgId".to_string(),
-        Value::String(target.packageName.clone()),
-    );
-    payload.insert(
-        "sourceVersion".to_string(),
-        Value::String(target.version.clone()),
-    );
-    payload.insert("extension".to_string(), extension);
-    payload.insert(
-        "manifestExtensions".to_string(),
-        serde_json::to_value(&target.manifestExtensions)
-            .expect("manifest extensions must remain JSON serializable"),
-    );
+                let mut payload = Map::new();
+                payload.insert(
+                    "extensionKey".to_string(),
+                    Value::String(handler.extensionKey.clone()),
+                );
+                payload.insert(
+                    "sourceToolPkgId".to_string(),
+                    Value::String(target.packageName.clone()),
+                );
+                payload.insert(
+                    "sourceVersion".to_string(),
+                    Value::String(target.version.clone()),
+                );
+                payload.insert("extension".to_string(), extension);
+                payload.insert(
+                    "manifestExtensions".to_string(),
+                    serde_json::to_value(&target.manifestExtensions)
+                        .expect("manifest extensions must remain JSON serializable"),
+                );
 
-    let manager = runtime.package_manager();
-    ChainLogger::info(
-        PLUGIN_CHAIN,
-        "plugin.toolpkg.manifest_extension.dispatch.start",
-        &[
-            ("handler", handler.containerPackageName.clone()),
-            ("extension", handler.extensionKey.clone()),
-            ("source", target.packageName.clone()),
-        ],
+                let manager = runtime.package_manager();
+                ChainLogger::verbose_with_level(
+                    PLUGIN_CHAIN,
+                    "plugin.toolpkg.manifest_extension.dispatch.start",
+                    &[
+                        ("handler", handler.containerPackageName.clone()),
+                        ("extension", handler.extensionKey.clone()),
+                        ("source", target.packageName.clone()),
+                    ],
+                    operit_util::AppLogger::VERBOSE_LEVEL_3,
+                );
+                match manager
+                    .runToolPkgMainHook(
+                        &handler.containerPackageName,
+                        &handler.functionName,
+                        "toolpkg_manifest_extension",
+                        Some("toolpkg_manifest_extension"),
+                        Some(&handler.extensionKey),
+                        handler.functionSource.as_deref(),
+                        Value::Object(payload),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        DISPATCHED_MANIFEST_EXTENSIONS
+                            .get_or_init(|| Mutex::new(BTreeSet::new()))
+                            .lock()
+                            .expect("toolpkg manifest extension dispatch mutex poisoned")
+                            .insert(dispatchKey);
+                        ChainLogger::verbose_with_level(
+                            PLUGIN_CHAIN,
+                            "plugin.toolpkg.manifest_extension.dispatch.done",
+                            &[
+                                ("handler", handler.containerPackageName.clone()),
+                                ("extension", handler.extensionKey.clone()),
+                                ("source", target.packageName.clone()),
+                            ],
+                            operit_util::AppLogger::VERBOSE_LEVEL_3,
+                        );
+                    }
+                    Err(error) => ChainLogger::error(
+                        PLUGIN_CHAIN,
+                        "plugin.toolpkg.manifest_extension.dispatch.error",
+                        &[
+                            ("handler", handler.containerPackageName.clone()),
+                            ("extension", handler.extensionKey.clone()),
+                            ("source", target.packageName.clone()),
+                            ("error", error),
+                        ],
+                    ),
+                }
+            })
+        },
     );
-    match manager.runToolPkgMainHook(
-        &handler.containerPackageName,
-        &handler.functionName,
-        "toolpkg_manifest_extension",
-        Some("toolpkg_manifest_extension"),
-        Some(&handler.extensionKey),
-        handler.functionSource.as_deref(),
-        Value::Object(payload),
-        None,
-        None,
-        None,
-    ) {
-        Ok(_) => {
-            DISPATCHED_MANIFEST_EXTENSIONS
-                .get_or_init(|| Mutex::new(BTreeSet::new()))
-                .lock()
-                .expect("toolpkg manifest extension dispatch mutex poisoned")
-                .insert(dispatchKey);
-            ChainLogger::info(
-                PLUGIN_CHAIN,
-                "plugin.toolpkg.manifest_extension.dispatch.done",
-                &[
-                    ("handler", handler.containerPackageName.clone()),
-                    ("extension", handler.extensionKey.clone()),
-                    ("source", target.packageName.clone()),
-                ],
-            );
-        }
-        Err(error) => ChainLogger::error(
-            PLUGIN_CHAIN,
-            "plugin.toolpkg.manifest_extension.dispatch.error",
-            &[
-                ("handler", handler.containerPackageName.clone()),
-                ("extension", handler.extensionKey.clone()),
-                ("source", target.packageName.clone()),
-                ("error", error),
-            ],
-        ),
-    }
 }
 
 /// Checks one dependency declaration against the required handler package and source version.

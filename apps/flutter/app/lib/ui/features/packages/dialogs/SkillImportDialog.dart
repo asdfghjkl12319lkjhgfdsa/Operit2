@@ -2,6 +2,7 @@
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import '../components/ExtensionScopeControls.dart';
 
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 
@@ -263,10 +264,14 @@ class _SkillImportDialogState extends State<SkillImportDialog> {
       );
       return;
     }
+    final scope = await chooseExtensionScope(context);
+    if (scope == null) return;
     setState(() {
       _busy = true;
     });
     try {
+      final repository = widget.clients.application.skillRepository();
+      final before = await repository.getAvailableSkillPackages();
       final result = await switch (_mode) {
         _SkillImportMode.github =>
           widget.clients.application
@@ -290,6 +295,28 @@ class _SkillImportDialogState extends State<SkillImportDialog> {
                     .toList(growable: false),
               ),
       };
+      final after = await repository.getAvailableSkillPackages();
+      final added = after.keys.toSet().difference(before.keys.toSet());
+      if (added.isEmpty) {
+        if (result.startsWith('Imported skill: ') ||
+            RegExp(r'^Imported [1-9]\d* skills;').hasMatch(result)) {
+          final errors = await repository.getSkillLoadErrors();
+          if (errors.isNotEmpty) {
+            throw StateError(
+              '技能加载失败：\n${errors.entries.map((entry) => '${entry.key}: ${entry.value}').join('\n')}',
+            );
+          }
+          throw StateError('技能文件已导入，但未能加载。请刷新扩展列表并查看技能扫描错误。');
+        }
+        throw StateError('未导入新技能：$result');
+      }
+      for (final skillId in added) {
+        await widget.clients.application.setExtensionScope(
+          kind: 'skill',
+          id: skillId,
+          scope: scope,
+        );
+      }
       if (!mounted) {
         return;
       }
@@ -304,7 +331,7 @@ class _SkillImportDialogState extends State<SkillImportDialog> {
       });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(error.toString()),
+          content: Text(error is StateError ? error.message : error.toString()),
           behavior: SnackBarBehavior.floating,
         ),
       );

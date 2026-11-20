@@ -1,2 +1,2 @@
-pub mod PathMapper;
-pub mod VisualFileSystem;
+pub(crate) mod FileToolRouting;
+pub mod RemoteFileGateway;

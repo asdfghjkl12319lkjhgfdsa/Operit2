@@ -21,14 +21,25 @@ pub struct MessageProcessingExecution<TController> {
     pub stream: MutableSharedStreamImpl<String>,
 }
 
-pub trait MessageProcessingPlugin {
+pub trait MessageProcessingPlugin: Send + Sync {
     fn id(&self) -> &str;
 
     #[allow(non_snake_case)]
-    fn createExecutionIfMatched(
-        &self,
-        params: &MessageProcessingHookParams,
-    ) -> Option<MessageProcessingExecution<Box<dyn MessageProcessingController + Send + Sync>>>;
+    fn createExecutionIfMatched<'a>(
+        &'a self,
+        params: &'a MessageProcessingHookParams,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Option<
+                        MessageProcessingExecution<
+                            Box<dyn MessageProcessingController + Send + Sync>,
+                        >,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
 }
 
 pub struct MessageProcessingPluginRegistry;
@@ -42,10 +53,11 @@ impl MessageProcessingPluginRegistry {
             .expect("message plugin registry mutex poisoned");
         plugins.retain(|item| item.id() != plugin.id());
         plugins.push(plugin);
-        ChainLogger::info(
+        ChainLogger::verbose_with_level(
             PLUGIN_CHAIN,
             "plugin.message_processing.register",
             &[("pluginId", pluginId)],
+            operit_util::AppLogger::VERBOSE_LEVEL_4,
         );
     }
 
@@ -55,15 +67,16 @@ impl MessageProcessingPluginRegistry {
             .lock()
             .expect("message plugin registry mutex poisoned");
         plugins.retain(|item| item.id() != pluginId);
-        ChainLogger::info(
+        ChainLogger::verbose_with_level(
             PLUGIN_CHAIN,
             "plugin.message_processing.unregister",
             &[("pluginId", pluginId.to_string())],
+            operit_util::AppLogger::VERBOSE_LEVEL_4,
         );
     }
 
     #[allow(non_snake_case)]
-    pub fn createExecutionIfMatched(
+    pub async fn createExecutionIfMatched(
         params: MessageProcessingHookParams,
     ) -> Option<MessageProcessingExecution<Box<dyn MessageProcessingController + Send + Sync>>>
     {
@@ -71,7 +84,7 @@ impl MessageProcessingPluginRegistry {
             .lock()
             .expect("message plugin registry mutex poisoned")
             .clone();
-        ChainLogger::info(
+        ChainLogger::verbose_with_level(
             PLUGIN_CHAIN,
             "plugin.message_processing.scan",
             &[
@@ -82,26 +95,29 @@ impl MessageProcessingPluginRegistry {
                 ),
                 ("historyCount", params.chat_history.len().to_string()),
             ],
+            operit_util::AppLogger::VERBOSE_LEVEL_3,
         );
         for plugin in plugins {
             let pluginId = plugin.id().to_string();
-            let execution = plugin.createExecutionIfMatched(&params);
+            let execution = plugin.createExecutionIfMatched(&params).await;
             if execution.is_some() {
-                ChainLogger::info(
+                ChainLogger::verbose_with_level(
                     PLUGIN_CHAIN,
                     "plugin.message_processing.execution",
                     &[("pluginId", pluginId)],
+                    operit_util::AppLogger::VERBOSE_LEVEL_3,
                 );
                 return execution;
             }
         }
-        ChainLogger::info(
+        ChainLogger::verbose_with_level(
             PLUGIN_CHAIN,
             "plugin.message_processing.no_match",
             &[(
                 "messageChars",
                 ChainLogger::lenField(&params.message_content),
             )],
+            operit_util::AppLogger::VERBOSE_LEVEL_3,
         );
         None
     }

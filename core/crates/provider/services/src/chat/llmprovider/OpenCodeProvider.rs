@@ -1,5 +1,6 @@
+use super::ApiKeyProvider::KeyGetter;
 use async_trait::async_trait;
-use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use serde_json::Value;
 use std::ops::{Deref, DerefMut};
 
@@ -10,7 +11,6 @@ use crate::chat::llmprovider::ClaudeProvider::ClaudeProvider;
 use crate::chat::llmprovider::GeminiProvider::GeminiProvider;
 use crate::chat::llmprovider::OpenAIProvider::OpenAIProvider;
 use crate::chat::llmprovider::OpenAIResponsesProvider::OpenAIResponsesProvider;
-use crate::chat::llmprovider::ThinkingConfiguration::ThinkingConfigurationApplier;
 use crate::runtime_support::ProviderRuntimeContext;
 use operit_model::ModelConfigData::{ApiProviderType, ModelBuiltinTool};
 use operit_model::OpenAIModels::ModelOption;
@@ -22,7 +22,8 @@ pub struct OpenCodeProvider {
     base_endpoint: String,
     model_name: String,
     protocol: ApiProviderType,
-    api_key: String,
+    key_getter: KeyGetter,
+
     custom_headers: Vec<(String, String)>,
 }
 
@@ -166,6 +167,30 @@ impl OpenCodeRouting {
         trimmed.ends_with("/zen/go") || trimmed.ends_with("/zen/go/v1")
     }
 
+    /// Applies OpenCode's client identity and stable provider-scoped Go session.
+    pub(crate) fn request_headers(
+        endpoint: &str,
+        provider_id: &str,
+        mut headers: Vec<(String, String)>,
+    ) -> Vec<(String, String)> {
+        let is_go = Self::is_go(endpoint);
+        headers.retain(|(name, _)| {
+            !name.eq_ignore_ascii_case("User-Agent")
+                && !(is_go && name.eq_ignore_ascii_case("x-opencode-session"))
+        });
+        headers.push((
+            "User-Agent".to_string(),
+            format!("Operit/{}", env!("CARGO_PKG_VERSION")),
+        ));
+        if is_go {
+            headers.push((
+                "x-opencode-session".to_string(),
+                format!("operit-{provider_id}"),
+            ));
+        }
+        headers
+    }
+
     /// Returns the API base used by the OpenCode Gemini route.
     pub fn api_base(endpoint: &str) -> String {
         Self::normalized_base(
@@ -192,7 +217,8 @@ impl OpenCodeProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_endpoint: String,
-        api_key: String,
+        provider_id: String,
+        key_getter: KeyGetter,
         model_name: String,
         custom_headers: Vec<(String, String)>,
         protocol: ApiProviderType,
@@ -214,23 +240,13 @@ impl OpenCodeProvider {
         .to_string();
         let endpoint = OpenCodeRouting::endpoint_for(&base_endpoint, &model_name)
             .map_err(AiServiceError::RequestFailed)?;
-        let mut headers = custom_headers;
-        headers.push((
-            "User-Agent".to_string(),
-            format!("Operit/{}", env!("CARGO_PKG_VERSION")),
-        ));
-        if OpenCodeRouting::is_go(&base_endpoint) {
-            headers.push((
-                "x-opencode-session".to_string(),
-                format!("operit-{}", model_name),
-            ));
-        }
+        let headers = OpenCodeRouting::request_headers(&base_endpoint, &provider_id, custom_headers);
         let delegate = match protocol {
             ApiProviderType::OPENAI_RESPONSES_GENERIC => OpenCodeDelegate::Responses(
                 OpenCodeResponsesProvider {
                     inner: OpenAIResponsesProvider::new(
                     endpoint,
-                    api_key.clone(),
+                    key_getter.clone(),
                     model_name.clone(),
                     "OPENCODE".to_string(),
                     headers.clone(),
@@ -246,7 +262,7 @@ impl OpenCodeProvider {
             ApiProviderType::ANTHROPIC_GENERIC => OpenCodeDelegate::Claude(OpenCodeClaudeProvider {
                 inner: ClaudeProvider::new(
                     endpoint,
-                    api_key.clone(),
+                    key_getter.clone(),
                     model_name.clone(),
                     "OPENCODE".to_string(),
                     headers.clone(),
@@ -257,7 +273,7 @@ impl OpenCodeProvider {
                 OpenCodeGeminiProvider {
                     inner: GeminiProvider::new_with_request_options(
                         endpoint,
-                        api_key.clone(),
+                        key_getter.clone(),
                         model_name.clone(),
                         "OPENCODE".to_string(),
                         headers.clone(),
@@ -270,7 +286,7 @@ impl OpenCodeProvider {
             _ => OpenCodeDelegate::Chat(OpenCodeChatProvider {
                 inner: OpenAIProvider::new_with_capabilities_and_reasoning(
                     endpoint,
-                    api_key.clone(),
+                    key_getter.clone(),
                     model_name.clone(),
                     "OPENCODE".to_string(),
                     headers.clone(),
@@ -287,19 +303,16 @@ impl OpenCodeProvider {
             base_endpoint,
             model_name,
             protocol,
-            api_key,
+            key_getter,
             custom_headers: headers,
         })
     }
 
     /// Fetches the OpenCode model catalog using its OpenAI-compatible endpoint.
     async fn get_models_list_internal(&self) -> Result<Vec<ModelOption>, AiServiceError> {
-        let mut request = reqwest::Client::new()
-            .get(OpenCodeRouting::models_endpoint(&self.base_endpoint))
+        let mut request = super::ProviderHttp::get(OpenCodeRouting::models_endpoint(&self.base_endpoint))
+            .key_getter(self.key_getter.clone(), super::ProviderHttp::KeyAuthentication::Bearer)
             .header(CONTENT_TYPE, "application/json");
-        if !self.api_key.trim().is_empty() {
-            request = request.header(AUTHORIZATION, format!("Bearer {}", self.api_key.trim()));
-        }
         for (name, value) in &self.custom_headers {
             request = request.header(
                 HeaderName::from_bytes(name.as_bytes())
@@ -310,13 +323,11 @@ impl OpenCodeProvider {
         }
         let response = request
             .send()
-            .await
-            .map_err(|error| AiServiceError::ConnectionFailed(error.to_string()))?;
+            .await?;
         let status = response.status();
         let body: Value = response
             .json()
-            .await
-            .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?;
+            .await?;
         if !status.is_success() {
             return Err(AiServiceError::RequestFailed(format!(
                 "{status}: {body}"
@@ -408,16 +419,8 @@ impl AIService for OpenCodeProvider {
     /// Sends a request through the selected OpenCode protocol.
     async fn send_message(
         &mut self,
-        mut request: SendMessageRequest,
+        request: SendMessageRequest,
     ) -> Result<Box<dyn RevisableTextStreamLike>, AiServiceError> {
-        let settings = ThinkingConfigurationApplier::describe(
-            "OPENCODE",
-            &self.model_name,
-            &self.base_endpoint,
-            &request.thinking_configurations,
-        )
-        .map_err(AiServiceError::RequestFailed)?;
-        request.enable_thinking = request.enable_thinking || settings.required;
         delegate_provider_method!(self, send_message, request).await
     }
 

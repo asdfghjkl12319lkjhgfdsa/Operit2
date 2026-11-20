@@ -7,8 +7,9 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{
-    Attribute, ExprPath, ImplItemFn, ItemConst, ItemExternCrate, ItemFn, ItemMod, ItemStatic,
-    ItemUse, Lit, Meta, Path as SynPath, Token, TraitItemFn, TypePath, UseTree,
+    Attribute, ExprBlock, ExprPath, ImplItemFn, ItemConst, ItemExternCrate, ItemFn, ItemImpl,
+    ItemMod, ItemStatic, ItemUse, Lit, Meta, Path as SynPath, Token, TraitItemFn, TypePath,
+    UseTree,
 };
 
 use super::SourceRoot;
@@ -199,6 +200,14 @@ impl<'ast> Visit<'ast> for PlatformApiVisitor<'_> {
         syn::visit::visit_item_use(self, item_use);
     }
 
+    /// Skips native-only and test-only expression blocks inside shared functions.
+    fn visit_expr_block(&mut self, expression: &ExprBlock) {
+        if is_excluded_from_wasm(&expression.attrs) {
+            return;
+        }
+        syn::visit::visit_expr_block(self, expression);
+    }
+
     /// Rejects direct fully qualified platform API paths.
     fn visit_expr_path(&mut self, expression: &ExprPath) {
         if let Some(api) = prohibited_path_api(&expression.path) {
@@ -237,6 +246,14 @@ impl<'ast> Visit<'ast> for PlatformApiVisitor<'_> {
             return;
         }
         syn::visit::visit_item_fn(self, item);
+    }
+
+    /// Skips entire implementation blocks excluded from the production Wasm target.
+    fn visit_item_impl(&mut self, item: &ItemImpl) {
+        if is_excluded_from_wasm(&item.attrs) {
+            return;
+        }
+        syn::visit::visit_item_impl(self, item);
     }
 
     /// Skips associated function bodies that cannot be selected for the Wasm target.
@@ -378,4 +395,106 @@ fn parse_cfg_conditions(list: &syn::MetaList) -> Option<Vec<Meta>> {
         .parse2(list.tokens.clone())
         .ok()
         .map(|conditions| conditions.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scans parsed fixture code using the production platform-boundary visitor.
+    fn violations(source: &str) -> Vec<String> {
+        let source_root = SourceRoot::new(PathBuf::from("fixture"), "fixture");
+        let mut result = BTreeSet::new();
+        PlatformApiVisitor::new(&source_root, Path::new("fixture.rs"), &mut result)
+            .visit_file(&syn::parse_file(source).unwrap());
+        result.into_iter().map(|violation| violation.api).collect()
+    }
+
+    /// Excludes test-only and native-only implementation blocks.
+    #[test]
+    fn excluded_implementations_do_not_violate_production_boundaries() {
+        assert!(violations(
+            r#"
+            #[cfg(test)]
+            impl TestStorage { fn read() { std::fs::read("fixture"); } }
+            #[cfg(test)]
+            impl Storage for TestStorage {
+                fn flush() { std::fs::OpenOptions::new(); }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            impl NativeStorage { fn read() { std::fs::read("file"); } }
+        "#
+        )
+        .is_empty());
+    }
+
+    /// Ignores excluded clock branches while still auditing the active Wasm branch.
+    #[test]
+    fn conditional_expression_blocks_preserve_platform_boundaries() {
+        assert!(violations(
+            r#"
+            fn now() {
+                #[cfg(not(target_arch = "wasm32"))]
+                { let _ = std::time::SystemTime::now(); }
+                #[cfg(test)]
+                { tokio::time::sleep(std::time::Duration::from_secs(1)); }
+            }
+        "#
+        )
+        .is_empty());
+        assert_eq!(
+            violations(
+                r#"
+            fn now() {
+                #[cfg(not(target_arch = "wasm32"))]
+                { std::fs::read("native"); }
+                #[cfg(target_arch = "wasm32")]
+                { let _ = std::time::Instant::now(); }
+            }
+        "#
+            ),
+            vec!["std::time clock"]
+        );
+    }
+
+    /// Keeps rejecting filesystem APIs inside production implementation blocks.
+    #[test]
+    fn production_implementations_still_reject_platform_apis() {
+        assert_eq!(
+            violations(
+                r#"
+            impl Storage for ProductionStorage {
+                fn flush() { std::fs::OpenOptions::new(); }
+            }
+        "#
+            ),
+            vec!["std::fs"]
+        );
+        assert_eq!(
+            violations(
+                r#"
+            #[cfg(not(test))]
+            impl ProductionStorage { fn read() { std::fs::read("fixture"); } }
+        "#
+            ),
+            vec!["std::fs"]
+        );
+    }
+
+    /// Retains attribute handling for individual methods within a production impl.
+    #[test]
+    fn test_only_methods_do_not_hide_live_methods() {
+        assert_eq!(
+            violations(
+                r#"
+            impl Storage {
+                #[cfg(test)]
+                fn fixture() { std::fs::read("fixture"); }
+                fn connect() { std::net::TcpStream::connect("localhost:1"); }
+            }
+        "#
+            ),
+            vec!["std::net"]
+        );
+    }
 }

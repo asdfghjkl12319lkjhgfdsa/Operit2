@@ -107,12 +107,8 @@ set(PLUGIN_SOURCES
   "src/webview/webview.cc"
   "src/webview/webview_bridge.cc"
   "src/webview/webview_host.cc"
-  "src/rendering/graphics_context.cc"
-  "src/rendering/texture_bridge.cc"
-  "src/rendering/texture_bridge_gpu.cc"
   "src/platform/webview_platform.cc"
   "src/platform/winrt_runtime.cc"
-  "src/util/direct3d11.interop.cc"
   "src/util/string_converter.cc"
 )
 
@@ -120,7 +116,9 @@ add_library(${PLUGIN_NAME} SHARED ${PLUGIN_SOURCES})
 add_dependencies(${PLUGIN_NAME} ${DEPS_TARGET_NAME})
 
 if(MSVC)
-  target_compile_options(${PLUGIN_NAME} PRIVATE "/await")
+  # Parallel CL processes share the compiler PDB in Debug builds.
+  # Serialize those writes through mspdbsrv to avoid MSVC C1041.
+  target_compile_options(${PLUGIN_NAME} PRIVATE "/await" "/FS")
 endif()
 
 apply_standard_settings(${PLUGIN_NAME})
@@ -135,6 +133,10 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   "${WEBVIEW_LOADER_IMPORT_LIBRARY}"
   flutter
   flutter_wrapper_plugin
+  windowscodecs
+  comctl32
+  ole32
+  shlwapi
 )
 
 target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)

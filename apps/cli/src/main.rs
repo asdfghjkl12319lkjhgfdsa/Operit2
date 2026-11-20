@@ -11,10 +11,14 @@ mod chat_runtime;
 mod cli;
 mod client_paths;
 mod core_proxy;
+mod daemon;
 mod error;
+mod host;
 mod mdns;
+mod rescue;
+#[cfg(test)]
+mod profile_migration_acceptance_tests;
 mod tui;
-mod web_access_assets;
 
 pub(crate) use bootstrap::{
     create_cli_core_application, create_cli_core_application_configured,
@@ -22,15 +26,15 @@ pub(crate) use bootstrap::{
     create_cli_core_application_without_space_sync,
 };
 pub(crate) use chat_runtime::{
-    build_attachment_info, guess_mime_type, initialize_shell_chat, parse_shell_args, ChatSendArgs,
-    ShellArgs,
+    parse_shell_args, ChatSendArgs, ShellArgs,
 };
 
+/// Runs the application with a heap-owned root command state machine.
 #[tokio::main]
 async fn main() -> ExitCode {
     error::install_panic_hook();
     let json_requested = std::env::args().any(|arg| arg == "--json");
-    match std::panic::AssertUnwindSafe(run()).catch_unwind().await {
+    match std::panic::AssertUnwindSafe(Box::pin(run())).catch_unwind().await {
         Ok(Ok(())) => ExitCode::SUCCESS,
         Ok(Err(error)) => {
             if json_requested {
@@ -47,29 +51,40 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Dispatches root commands without embedding their runtime state in this frame.
 async fn run() -> Result<(), CliError> {
     AppLogger::set_enable_console_logging(false);
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
-        return tui::run_tui_command(&[]).await.map_err(CliError::internal);
+        return Box::pin(tui::run_tui_command(&[])).await.map_err(map_tui_error);
     }
 
     match args[0].as_str() {
+        "rescue" => rescue::run(&args[1..]).map_err(CliError::user),
         "help" | "-h" | "--help" => {
             cli::print_root_usage();
             Ok(())
         }
-        "cli" => cli::run_cli_root(&args[1..]).await.map_err(CliError::user),
-        "tui" => tui::run_tui_command(&args[1..])
-            .await
-            .map_err(CliError::internal),
-        "install" | "uninstall" => cli::run_cli_root(&args).await.map_err(CliError::user),
-        value if value.starts_with('-') => tui::run_tui_command(&args)
-            .await
-            .map_err(CliError::internal),
+        "cli" => Box::pin(cli::run_cli_root(&args[1..])).await.map_err(CliError::user),
+        "daemon" => Box::pin(daemon::run(&args[1..])).await.map_err(CliError::user),
+        "tui" => Box::pin(tui::run_tui_command(&args[1..])).await.map_err(map_tui_error),
+        "install" | "uninstall" => Box::pin(cli::run_cli_root(&args)).await.map_err(CliError::user),
+        value if value.starts_with('-') => {
+            Box::pin(tui::run_tui_command(&args)).await.map_err(map_tui_error)
+        }
         _ => {
             cli::print_root_usage();
             Ok(())
         }
+    }
+}
+
+/// Classifies TUI startup failures: argument errors surface as user errors,
+/// everything else keeps the internal diagnostics (location and backtrace).
+fn map_tui_error(error: String) -> CliError {
+    if error.starts_with("usage:") {
+        CliError::user(error)
+    } else {
+        CliError::internal(error)
     }
 }

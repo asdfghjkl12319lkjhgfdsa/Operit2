@@ -1,5 +1,11 @@
 #![allow(non_snake_case)]
 
+pub use operit_host_native_common::ServiceDiscovery::ServiceDiscoveryProvider as LinuxServiceDiscoveryHost;
+
+#[cfg(all(feature = "daemon", target_os = "linux"))]
+#[path = "../../unix/daemon.rs"]
+pub mod daemon;
+
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
@@ -16,6 +22,9 @@ pub mod chromium_browser;
 pub mod host_runtime_event;
 pub mod registry;
 pub mod tools;
+#[cfg(target_os = "linux")]
+#[path = "../../common/ui_automation.rs"]
+mod ui_automation;
 
 #[cfg(target_os = "linux")]
 pub use host_runtime_event::LinuxHostRuntimeEventHost;
@@ -50,12 +59,8 @@ pub fn createRuntimeHostManager(
     let archiveStagingHost = Arc::new(operit_host_native_common::NativeArchiveStagingHost::new(
         runtimeRoot.clone(),
     ));
-    let runtimeStorageWriteHost =
-        Arc::new(operit_host_native_common::NativeRuntimeStorageHost::new(
-            runtimeRoot.clone(),
-            workspaceRoot.clone(),
-        ));
     let runtimeStorageHost = Arc::new(LinuxRuntimeStorageHost::new(runtimeRoot, workspaceRoot));
+    let runtimeStorageWriteHost = runtimeStorageHost.clone();
     let runtimeSqliteHost = runtimeStorageHost.clone();
     let hostSecretStore = runtimeStorageHost.clone();
     HostManager::withFileSystemWebVisitSystemOperationAndManagedRuntimeHosts(
@@ -67,8 +72,14 @@ pub fn createRuntimeHostManager(
         runtimeStorageHost,
         runtimeSqliteHost,
     )
+    .withLocalInferenceHost(Arc::new(operit_host_local_inference::NativeLocalInferenceHost::new()))
+    .withUiAutomationHost(Arc::new(ui_automation::ScriptUiAutomationHost::new(
+        "python3", &["-c", include_str!("ui_automation.py")],
+    )))
     .withHostSecretStore(hostSecretStore)
     .withWebSocketHost(Arc::new(LinuxHttpHost::new()))
+    .withHttpServerHost(Arc::new(operit_host_native_common::NativeHttpServerHost))
+    .withTcpHost(Arc::new(operit_host_native_common::NativeTcpHost))
     .withSerialPortHost(Arc::new(operit_host_native_common::NativeSerialPortHost))
     .withArchiveStagingHost(archiveStagingHost)
     .withRuntimeStorageWriteHost(runtimeStorageWriteHost)

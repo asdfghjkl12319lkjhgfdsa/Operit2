@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 
 import '../../../../core/bridge/OperitRuntimeBridge.dart';
 import '../../../../core/bridge/ProxyCoreRuntimeBridge.dart';
+import '../../../../core/host/SelectedFileInput.dart';
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import 'WorkspaceFileModels.dart';
@@ -63,6 +64,12 @@ class PastedImageAttachmentPayload {
   }
 }
 
+/// Canonical submit actions returned by the Core chat input hook bridge.
+const String chatInputActionAllow = 'Allow';
+const String chatInputActionBlock = 'Block';
+const String chatInputActionConsume = 'Consume';
+const String chatInputActionReplace = 'Replace';
+
 class ChatInputSubmitDecision {
   const ChatInputSubmitDecision({
     required this.action,
@@ -72,10 +79,20 @@ class ChatInputSubmitDecision {
     required this.timedOut,
   });
 
-  /// Parses the JSON decision returned by the Core ToolPkg chat input bridge.
+  /// Decodes exactly the canonical submit actions declared by the Core bridge.
   factory ChatInputSubmitDecision.fromJson(Map<String, Object?> json) {
+    final action = switch (json['action']) {
+      chatInputActionAllow => chatInputActionAllow,
+      chatInputActionBlock => chatInputActionBlock,
+      chatInputActionConsume => chatInputActionConsume,
+      chatInputActionReplace => chatInputActionReplace,
+      final value => throw FormatException(
+        'Unsupported chat input submit action',
+        value,
+      ),
+    };
     return ChatInputSubmitDecision(
-      action: json['action'] as String,
+      action: action,
       text: json['text'] == null ? null : json['text'] as String,
       message: json['message'] == null ? null : json['message'] as String,
       clearInput: json['clearInput'] == null
@@ -93,15 +110,37 @@ class ChatInputSubmitDecision {
 }
 
 class ChatViewModel {
+  /// Creates a chat model whose selection and observations use the same runtime.
   ChatViewModel({
     this.bridge = const ProxyCoreRuntimeBridge(),
+    OperitRuntimeBridge? attachmentSourceBridge,
     GeneratedChatRuntimeHolderMainCoreProxy? chat,
-  }) : clients = GeneratedCoreProxyClients(bridge),
-       _chat = chat ?? GeneratedCoreProxyClients(bridge).chatRuntimeHolderMain;
+  }) : _attachmentSourceClients = GeneratedCoreProxyClients(
+         attachmentSourceBridge ?? const ProxyCoreRuntimeBridge(),
+       ),
+       clients = GeneratedCoreProxyClients(bridge),
+       _chat = chat ?? GeneratedCoreProxyClients(bridge).chatRuntimeHolderMain {
+    _observationChat = _chat;
+  }
+
+  /// Keeps local selection separate from the runtime that owns live generation.
+  ChatViewModel.withChatObservation({
+    required this.bridge,
+    required GeneratedChatRuntimeHolderMainCoreProxy chat,
+    required GeneratedChatRuntimeHolderMainCoreProxy observationChat,
+    OperitRuntimeBridge? attachmentSourceBridge,
+  }) : _attachmentSourceClients = GeneratedCoreProxyClients(
+         attachmentSourceBridge ?? const ProxyCoreRuntimeBridge(),
+       ),
+       clients = GeneratedCoreProxyClients(bridge),
+       _chat = chat,
+       _observationChat = observationChat;
 
   final OperitRuntimeBridge bridge;
   final GeneratedCoreProxyClients clients;
+  final GeneratedCoreProxyClients _attachmentSourceClients;
   final GeneratedChatRuntimeHolderMainCoreProxy _chat;
+  late final GeneratedChatRuntimeHolderMainCoreProxy _observationChat;
 
   /// The chat runtime scoped to this view model's window.
   GeneratedChatRuntimeHolderMainCoreProxy get chatCore => _chat;
@@ -116,14 +155,21 @@ class ChatViewModel {
     return clients.serverCoreNodeRouter.bindingRouteStatusFlow(key: chatId);
   }
 
+  /// Moves a chat with missing route metadata onto the device running this UI.
+  Future<void> claimMissingBindingLocal(String chatId) {
+    return clients.serverRuntimeRemoteLinkService.claimMissingBindingLocal(
+      chatId: chatId,
+    );
+  }
+
   /// Watches messages for one explicit main-runtime chat id.
   Stream<List<ChatUiMessage>> watchMessages(String chatId) {
-    return _chat.chatMessagesFlow(chatId: chatId);
+    return _observationChat.chatMessagesFlow(chatId: chatId);
   }
 
   /// Watches runtime state for one explicit main-runtime chat id.
   Stream<core_proxy.ChatState> watchChatState(String chatId) {
-    return _chat.chatStateFlow(chatId: chatId);
+    return _observationChat.chatStateFlow(chatId: chatId);
   }
 
   /// Sends a decision for a permission request through the owning chat route.
@@ -151,7 +197,7 @@ class ChatViewModel {
     final attachments = await _chat.attachments();
     await _chat.sendUserMessage(
       promptFunctionType: core_proxy.PromptFunctionType.chat,
-      roleCardIdOverride: null,
+      participantId: null,
       chatIdOverride: chatIdOverride,
       messageText: text,
       proxySenderNameOverride: null,
@@ -164,6 +210,7 @@ class ChatViewModel {
         notifyReply: null,
         hideUserMessage: false,
         disableWarning: false,
+        continuation: null,
         chatInputSubmitRequestedHandled: true,
       ),
     );
@@ -194,14 +241,16 @@ class ChatViewModel {
     required String text,
     required int selectionStart,
     required int selectionEnd,
-    required int attachmentCount,
+    required List<AttachmentInfo> attachments,
+    required int? replyToMessageTimestamp,
   }) async {
     final result = await _chat.dispatchChatInputSubmitRequested(
       chatIdOverride: chatId,
       messageText: text,
       selectionStart: selectionStart,
       selectionEnd: selectionEnd,
-      attachmentCount: attachmentCount,
+      attachments: attachments,
+      replyToMessageTimestamp: replyToMessageTimestamp,
     );
     if (result == null) {
       return null;
@@ -212,6 +261,14 @@ class ChatViewModel {
   /// Cancels generation for the specified chat without changing the active UI selection.
   Future<void> cancelMessage(String chatId) {
     return _chat.cancelMessage(chatId: chatId);
+  }
+
+  /// Guides the active turn without cancelling its current model or tool round.
+  Future<void> steerMessage({
+    required String chatId,
+    required String messageText,
+  }) {
+    return _chat.steerMessage(chatId: chatId, messageText: messageText);
   }
 
   /// Adds a message to the runtime-owned queue for one chat.
@@ -287,6 +344,115 @@ class ChatViewModel {
     return _chat.handleAttachment(filePath: filePath);
   }
 
+  /// Streams a selection to the receiving Host, then registers only committed metadata.
+  Future<void> attachSelectedFile(
+    SelectedFileInput file, {
+    required String? expectedChatId,
+    bool Function()? isCancelled,
+  }) async {
+    final transfer = clients.servicesAttachmentTransferManager;
+    final sourceTransfer =
+        _attachmentSourceClients.servicesAttachmentTransferManager;
+    void checkCancellation() {
+      if (isCancelled?.call() ?? false) {
+        throw StateError('Attachment upload was cancelled');
+      }
+    }
+
+    try {
+      checkCancellation();
+      if (expectedChatId == null || expectedChatId.trim().isEmpty) {
+        throw StateError('File attachments require a selected chat');
+      }
+      final policy =
+          jsonDecode(
+                await transfer.selectedAttachmentPolicy(chatId: expectedChatId),
+              )
+              as Map<String, dynamic>;
+      final fileLimit = policy['maxFileBytes'] as int;
+      final totalLimit = policy['maxTotalBytes'] as int;
+      final limit = fileLimit < totalLimit ? fileLimit : totalLimit;
+      final large = file.byteLength == null || file.byteLength! > limit;
+      final core_proxy.AttachmentInfo attachment;
+      if (large && file.sourceJson != null && file.byteLength != null) {
+        final reference = await sourceTransfer.registerAttachmentSource(
+          sourceJson: file.sourceJson!,
+          fileName: file.name,
+          expectedByteLength: file.byteLength!,
+        );
+        checkCancellation();
+        attachment = await transfer.createReferenceAttachment(
+          chatId: expectedChatId,
+          referenceJson: reference,
+        );
+      } else {
+        if (large && file.byteLength != null && file.byteLength! > totalLimit) {
+          throw StateError(
+            'This file has no reusable source and exceeds the retention limit in .operit/sync.json.',
+          );
+        }
+        Stream<Uint8List> checkedChunks() async* {
+          await for (final chunk in file.chunks()) {
+            checkCancellation();
+            yield chunk;
+          }
+          checkCancellation();
+          // EOF must be explicit: closing a failed input stream must not commit it.
+          yield Uint8List(0);
+        }
+
+        final uploadId = await transfer.beginAttachmentUpload(
+          fileName: file.name,
+          expectedByteLength: file.byteLength,
+        );
+        if (large) {
+          await sourceTransfer.writeAttachmentSource(
+            uploadId: uploadId,
+            fileName: file.name,
+            expectedByteLength: file.byteLength,
+            maxBytes: totalLimit,
+            bytes: checkedChunks(),
+          );
+          final reference = await sourceTransfer.completeAttachmentSource(
+            uploadId: uploadId,
+            fileName: file.name,
+            expectedByteLength: file.byteLength,
+          );
+          checkCancellation();
+          attachment = await transfer.createReferenceAttachment(
+            chatId: expectedChatId,
+            referenceJson: reference,
+          );
+        } else {
+          await transfer.writeSelectedAttachment(
+            chatId: expectedChatId,
+            uploadId: uploadId,
+            fileName: file.name,
+            expectedByteLength: file.byteLength,
+            bytes: checkedChunks(),
+          );
+          attachment = await transfer.completeSelectedAttachment(
+            chatId: expectedChatId,
+            uploadId: uploadId,
+            fileName: file.name,
+            expectedByteLength: file.byteLength,
+          );
+        }
+      }
+      checkCancellation();
+      await _chat.attachUploadedFile(
+        attachment: attachment,
+        expectedChatId: expectedChatId,
+      );
+    } finally {
+      try {
+        await file.close();
+      } catch (cleanup) {
+        debugPrint('Failed to close selected file input: $cleanup');
+      }
+    }
+  }
+
   /// Adds pasted text through the runtime's virtual plain-text attachment path.
   Future<void> attachPastedText(String text) {
     return handleAttachment('$_pastedTextAttachmentPrefix$text');
@@ -305,21 +471,6 @@ class ChatViewModel {
     return _chat.clearAttachments();
   }
 
-  String createAttachmentReference(AttachmentInfo attachment) {
-    final buffer = StringBuffer('<attachment ');
-    buffer.write('id="${attachment.filePath}" ');
-    buffer.write('filename="${attachment.fileName}" ');
-    buffer.write('type="${attachment.mimeType}" ');
-    if (attachment.fileSize > 0) {
-      buffer.write('size="${attachment.fileSize}" ');
-    }
-    if (attachment.content.isNotEmpty) {
-      buffer.write('content="${attachment.content}" ');
-    }
-    buffer.write('/>');
-    return buffer.toString();
-  }
-
   /// Splits Markdown with the runtime surface that owns this chat.
   Future<List<ChatResponseStreamEvent>> splitMarkdownContent(String content) {
     return _chat.splitMarkdownContent(content: content);
@@ -333,6 +484,7 @@ class ChatViewModel {
     return _chat.clearToastEvent();
   }
 
+  /// Reads global message positions and bounded previews through the dedicated index API.
   Future<List<ChatMessageLocatorPreview>> loadChatMessageLocatorPreviews(
     String chatId,
     String query,
@@ -426,7 +578,8 @@ class ChatViewModel {
   }
 
   /// Previews workspace changes associated with a message timestamp.
-  Future<List<WorkspaceFileChange>> previewWorkspaceChangesForMessage(
+  /// Returns null when the snapshot for that message is no longer retained.
+  Future<List<WorkspaceFileChange>?> previewWorkspaceChangesForMessage(
     String chatId,
     int messageTimestamp,
   ) {
@@ -472,15 +625,33 @@ class ChatViewModel {
     return _chat.bindChatToWorkspace(chatId: chatId, workspace: workspace);
   }
 
+  /// Detaches this chat without deleting the workspace or its files.
+  Future<void> unbindChatFromWorkspace(String chatId) {
+    return _chat.unbindChatFromWorkspace(chatId: chatId);
+  }
+
   Future<List<WorkspaceFileEntry>> listWorkspaceFiles(
     String relativePath,
   ) async {
     final chatId = await _requiredCurrentChatId();
-    final entries = await clients.servicesWorkspaceService.listWorkspaceFiles(
-      chatId: chatId,
-      relativePath: relativePath,
-    );
+    final entries = await clients.application
+        .workspaceService()
+        .listWorkspaceFiles(chatId: chatId, relativePath: relativePath);
     return entries;
+  }
+
+  Future<void> mutateWorkspaceFile(
+    WorkspaceFileOperation operation,
+    String path,
+    String? destinationPath,
+  ) async {
+    final chatId = await _requiredCurrentChatId();
+    await clients.application.workspaceService().mutateWorkspaceFile(
+      chatId: chatId,
+      operation: operation.name,
+      relativePath: path,
+      destinationPath: destinationPath,
+    );
   }
 
   /// Lists workspace entries ranked for the active @ mention query.
@@ -488,7 +659,8 @@ class ChatViewModel {
     String searchQuery,
   ) async {
     final chatId = await _requiredCurrentChatId();
-    final entries = await clients.servicesWorkspaceService
+    final entries = await clients.application
+        .workspaceService()
         .listMentionWorkspaceSuggestions(
           chatId: chatId,
           searchQuery: searchQuery,
@@ -499,14 +671,15 @@ class ChatViewModel {
   Future<List<WorkspaceFileEntry>> listWorkspaceBindingDirectories(
     String path,
   ) async {
-    final entries = await clients.servicesWorkspaceService
+    final entries = await clients.application
+        .workspaceService()
         .listWorkspaceBindingDirectories(path: path);
     return entries;
   }
 
   Future<String> readWorkspaceTextFile(String relativePath) async {
     final chatId = await _requiredCurrentChatId();
-    return clients.servicesWorkspaceService.readWorkspaceTextFile(
+    return clients.application.workspaceService().readWorkspaceTextFile(
       chatId: chatId,
       relativePath: relativePath,
     );
@@ -514,10 +687,9 @@ class ChatViewModel {
 
   Future<Uint8List> readWorkspaceFileBytes(String relativePath) async {
     final chatId = await _requiredCurrentChatId();
-    final bytes = await clients.servicesWorkspaceService.readWorkspaceFileBytes(
-      chatId: chatId,
-      relativePath: relativePath,
-    );
+    final bytes = await clients.application
+        .workspaceService()
+        .readWorkspaceFileBytes(chatId: chatId, relativePath: relativePath);
     return base64Decode(bytes.base64Content);
   }
 
@@ -526,7 +698,7 @@ class ChatViewModel {
     Uint8List bytes,
   ) async {
     final chatId = await _requiredCurrentChatId();
-    await clients.servicesWorkspaceService.writeWorkspaceFileBytes(
+    await clients.application.workspaceService().writeWorkspaceFileBytes(
       chatId: chatId,
       relativePath: relativePath,
       base64Content: base64Encode(bytes),
@@ -535,7 +707,7 @@ class ChatViewModel {
 
   Future<void> openWorkspaceFile(String relativePath) async {
     final chatId = await _requiredCurrentChatId();
-    await clients.servicesWorkspaceService.openWorkspaceFile(
+    await clients.application.workspaceService().openWorkspaceFile(
       chatId: chatId,
       relativePath: relativePath,
     );
@@ -556,6 +728,11 @@ typedef ChatUiMessage = core_proxy.ChatMessage;
 
 /// Exposes chat presentation helpers directly on the generated Core message state.
 extension ChatMessagePresentation on core_proxy.ChatMessage {
+  /// Identifies automatic user turns whose source is only shown on request.
+  bool get isHiddenUserPlaceholder =>
+      sender == 'user' &&
+      displayMode == core_proxy.ChatMessageDisplayMode.hiddenPlaceholder;
+
   /// Returns the legacy variant-preview flag for a normal Core message.
   bool get isVariantPreview => false;
 
@@ -591,6 +768,10 @@ extension ChatMessagePresentation on core_proxy.ChatMessage {
             ..write(part.content)
             ..write('</think>');
         case core_proxy.MessagePartKind.toolCall:
+          if (part.content.isNotEmpty) {
+            markup.write(part.content);
+            continue;
+          }
           markup
             ..write('<tool name="')
             ..write(_escapeProtocolAttribute(part.toolName!))
@@ -609,10 +790,14 @@ extension ChatMessagePresentation on core_proxy.ChatMessage {
           }
           markup.write('</tool>');
         case core_proxy.MessagePartKind.toolResult:
-          markup
-            ..write('<tool_result name="')
-            ..write(_escapeProtocolAttribute(part.toolName!))
-            ..write('"');
+          markup.write('<tool_result');
+          final toolName = part.toolName;
+          if (toolName != null) {
+            markup
+              ..write(' name="')
+              ..write(_escapeProtocolAttribute(toolName))
+              ..write('"');
+          }
           final toolCallId = part.toolCallId;
           if (toolCallId != null) {
             markup
@@ -641,7 +826,7 @@ extension ChatMessagePresentation on core_proxy.ChatMessage {
   String get editableText {
     return switch (sender) {
       'ai' => assistantProtocolMarkup,
-      'user' => displayText,
+      'user' || 'summary' => displayText,
       _ => throw StateError('Message sender cannot be edited: $sender'),
     };
   }

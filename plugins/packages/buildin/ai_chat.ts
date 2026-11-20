@@ -1,5 +1,6 @@
 /* METADATA
 {
+    "api_version": "2.0.0",
   "name": "ai_chat",
 
   "display_name": {
@@ -14,6 +15,7 @@
   "category": "Chat",
   "tools": [{
     "name": "chat_completion",
+    "display": {"label": {"zh": "调用 AI 对话", "en": "Request AI completion"}},
     "description": {
       "zh": "发送消息给AI模型并获取回复。支持超时保护（默认30秒）。从根源上禁止分点列表输出。",
       "en": "Send messages to an AI model and get responses. Includes timeout protection (default: 30s). Enforces non-bulleted output from the source."

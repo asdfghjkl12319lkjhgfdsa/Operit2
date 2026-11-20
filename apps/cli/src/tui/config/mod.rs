@@ -9,7 +9,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use operit_runtime::data::preferences::ModelConfigManager::ModelConfigManager;
 
 use operit_model::ModelConfigData::{
-    ModelCapabilities, ModelContextSpec, ProviderProfile, ResolvedModelConfig,
+    ModelCapabilities, ModelContextSpec, ProviderModelSummary, ProviderProfile,
+    ResolvedModelConfig,
 };
 
 
@@ -48,6 +49,8 @@ impl ConfigState {
 pub(crate) struct ConfigUi {
     pub(crate) state: ConfigState,
     pub(crate) providers: Vec<ProviderProfile>,
+    /// Settings every configured model runs with, catalog values included.
+    pub(crate) model_summaries: Vec<ProviderModelSummary>,
     pub(crate) search: String,
     pub(crate) filtered_indices: Vec<usize>,
     pub(crate) selected_index: usize,
@@ -67,6 +70,9 @@ pub(crate) struct ConfigUi {
     pub(crate) add_model_filtered: Vec<usize>,
     pub(crate) add_model_index: usize,
     pub(crate) available_models: Vec<operit_model::ModelConfigData::AvailableProviderModel>,
+    /// Content rect of the topmost config overlay, recorded during render for
+    /// mouse selection.
+    pub(crate) selection_rect: Option<Rect>,
 }
 
 pub(crate) enum ConfirmAction {
@@ -85,6 +91,7 @@ impl ConfigUi {
         Self {
             state: ConfigState::ProviderList,
             providers: Vec::new(),
+            model_summaries: Vec::new(),
             search: String::new(),
             filtered_indices: Vec::new(),
             selected_index: 0,
@@ -104,6 +111,7 @@ impl ConfigUi {
             add_model_filtered: Vec::new(),
             add_model_index: 0,
             available_models: Vec::new(),
+            selection_rect: None,
         }
     }
 
@@ -119,7 +127,16 @@ impl ConfigUi {
             }
             Err(e) => {
                 self.error_message = Some(e.to_string());
+                return;
             }
+        }
+        match core
+            .preferences_model_config_manager()
+            .getAllModelSummaries()
+            .await
+        {
+            Ok(summaries) => self.model_summaries = summaries,
+            Err(e) => self.error_message = Some(e.to_string()),
         }
     }
 
@@ -197,7 +214,7 @@ impl ConfigUi {
         self.add_model_index = 0;
     }
 
-    pub(crate) fn render(&self, frame: &mut Frame, text: TuiText) {
+    pub(crate) fn render(&mut self, frame: &mut Frame, text: TuiText) {
         let popup = centered_rect(72, 70, frame.area());
         frame.render_widget(Clear, popup);
 
@@ -207,6 +224,7 @@ impl ConfigUi {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::ACCENT));
         let inner = block.inner(popup);
+        self.selection_rect = Some(inner);
         frame.render_widget(block, popup);
 
         let areas = Layout::default()
@@ -346,8 +364,14 @@ impl ConfigUi {
                     Span::styled(&model.id, Style::default().add_modifier(Modifier::BOLD)),
                 ];
 
-                // Show capabilities summary from the model profile if available
-                if let Some(caps) = &model.capabilitiesOverride {
+                // Show the capabilities and context the model runs with, catalog values included.
+                let summary = provider.and_then(|p| {
+                    self.model_summaries
+                        .iter()
+                        .find(|summary| summary.providerId == p.id && summary.modelId == model.id)
+                });
+                if let Some(summary) = summary {
+                    let caps = &summary.capabilities;
                     let mut tags = Vec::new();
                     if caps.toolCall {
                         tags.push("⚒");
@@ -368,16 +392,11 @@ impl ConfigUi {
                             Style::default().fg(theme::ACCENT),
                         ));
                     }
-                }
-
-                // Context length from override
-                let ctx_info = model
-                    .contextOverride
-                    .as_ref()
-                    .map(|c| format!("{}k", c.maxContextLength));
-                if let Some(ctx) = ctx_info {
                     line1.push(Span::raw("  "));
-                    line1.push(Span::styled(ctx, Style::default().fg(theme::TEXT_SUBTLE)));
+                    line1.push(Span::styled(
+                        format!("{}k", summary.context.maxContextLength.round()),
+                        Style::default().fg(theme::TEXT_SUBTLE),
+                    ));
                 }
 
                 ListItem::new(Line::from(line1))
@@ -498,7 +517,7 @@ impl ConfigUi {
         ratatui::text::Text::from(lines)
     }
 
-    fn render_confirm_dialog(&self, frame: &mut Frame, parent: Rect, text: TuiText) {
+    fn render_confirm_dialog(&mut self, frame: &mut Frame, parent: Rect, text: TuiText) {
         let w = 40.min(parent.width);
         let h = 6.min(parent.height);
         let x = parent.x + (parent.width.saturating_sub(w)) / 2;
@@ -515,6 +534,7 @@ impl ConfigUi {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::ACCENT_STRONG));
         let inner = block.inner(popup);
+        self.selection_rect = Some(inner);
         frame.render_widget(block, popup);
 
         frame.render_widget(
@@ -527,7 +547,7 @@ impl ConfigUi {
         );
     }
 
-    fn render_add_model_popup(&self, frame: &mut Frame, parent: Rect, text: TuiText) {
+    fn render_add_model_popup(&mut self, frame: &mut Frame, parent: Rect, text: TuiText) {
         let w = 50.min(parent.width);
         let h = 20.min(parent.height);
         let x = parent.x + (parent.width.saturating_sub(w)) / 2;
@@ -544,6 +564,7 @@ impl ConfigUi {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::ACCENT));
         let inner = block.inner(popup);
+        self.selection_rect = Some(inner);
         frame.render_widget(block, popup);
 
         if self.add_model_custom_mode {
@@ -670,6 +691,67 @@ impl ConfigUi {
         );
     }
 
+    /// Routes a bracketed paste payload into the config window's focused text input.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        // Every config input is single-line, so drop line breaks from multi-line pastes.
+        let text: String = text.chars().filter(|ch| *ch != '\n' && *ch != '\r').collect();
+        if text.is_empty() || self.show_confirm_dialog {
+            return;
+        }
+        if self.show_add_model_popup {
+            self.add_model_search.push_str(&text);
+            if !self.add_model_custom_mode {
+                self.update_add_model_filter();
+            }
+            return;
+        }
+        match &mut self.state {
+            ConfigState::ProviderList => {
+                self.search.push_str(&text);
+                self.status_message = None;
+                self.update_filter();
+            }
+            ConfigState::ModelList { .. } => {
+                self.search.push_str(&text);
+                self.update_filter();
+            }
+            ConfigState::ProviderForm(form) => {
+                if form.show_type_selector {
+                    form.type_selector_filter.push_str(&text);
+                    form.update_type_filter();
+                } else if form.editing_field {
+                    if let Some(field) = form.fields.get_mut(form.focus_index) {
+                        let mut cursor = field.cursor;
+                        while cursor > 0 && !field.value.is_char_boundary(cursor) {
+                            cursor -= 1;
+                        }
+                        field.value.insert_str(cursor, &text);
+                        field.cursor = cursor + text.len();
+                    }
+                }
+            }
+            ConfigState::ModelEditor(editor) => {
+                if !editor.editing_field {
+                    return;
+                }
+                match editor.level {
+                    model_editor::EditorLevel::Main => match editor.focused_main_item() {
+                        Some(model_editor::MainFocus::MaxContextLength) => {
+                            push_numeric_text(&mut editor.max_context_length, &text);
+                        }
+                        _ => {}
+                    },
+                    model_editor::EditorLevel::Summary => match editor.focused_summary_item() {
+                        Some(model_editor::SummaryFocus::TokenThreshold) => {
+                            push_numeric_text(&mut editor.summary_token_threshold, &text);
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        }
+    }
+
     pub(crate) async fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -679,6 +761,137 @@ impl ConfigUi {
         use crossterm::event::KeyCode as KC;
 
         match (&mut self.state, key.code) {
+            // Modal overlays must win over the state-specific arms below, otherwise the
+            // underlying list/form keeps consuming keys while the overlay is visible.
+            // Confirm dialog
+            _ if self.show_confirm_dialog => match key.code {
+                KC::Enter => {
+                    let action = std::mem::replace(&mut self.confirm_action, ConfirmAction::None);
+                    self.show_confirm_dialog = false;
+                    match action {
+                        ConfirmAction::DeleteModel {
+                            provider_id,
+                            model_id,
+                        } => {
+                            let _ = core
+                                .preferences_model_config_manager()
+                                .deleteModel(&provider_id, &model_id)
+                                .await;
+                            self.refresh_providers(core).await;
+                            self.state = ConfigState::ProviderList;
+                        }
+                        ConfirmAction::DeleteProvider { provider_id } => {
+                            let _ = core
+                                .preferences_model_config_manager()
+                                .deleteProvider(&provider_id)
+                                .await;
+                            self.refresh_providers(core).await;
+                        }
+                        ConfirmAction::None => {}
+                    }
+                }
+                KC::Esc => {
+                    self.show_confirm_dialog = false;
+                    self.confirm_action = ConfirmAction::None;
+                }
+                _ => {}
+            },
+
+            // Add model popup
+            _ if self.show_add_model_popup => {
+                match key.code {
+                    KC::Up => {
+                        if self.add_model_custom_mode {
+                            // Cursor stays at the end in the single-line custom id input.
+                        } else if self.add_model_index > 0 {
+                            self.add_model_index -= 1;
+                        }
+                    }
+                    KC::Down => {
+                        if self.add_model_custom_mode {
+                            // Cursor stays at the end in the single-line custom id input.
+                        } else if self.add_model_index < self.add_model_filtered.len() {
+                            self.add_model_index += 1;
+                        }
+                    }
+                    KC::Enter => {
+                        let pid = match &self.state {
+                            ConfigState::ModelList { provider_id, .. } => provider_id.clone(),
+                            _ => String::new(),
+                        };
+                        if self.add_model_custom_mode {
+                            let model_id = self.add_model_search.trim().to_string();
+                            if !model_id.is_empty() {
+                                match core
+                                    .preferences_model_config_manager()
+                                    .createProviderModel(&pid, model_id)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        self.show_add_model_popup = false;
+                                        self.add_model_custom_mode = false;
+                                        self.refresh_providers(core).await;
+                                    }
+                                    Err(error) => {
+                                        self.error_message = Some(error.to_string());
+                                    }
+                                }
+                            }
+                        } else if self.add_model_index == self.add_model_filtered.len() {
+                            self.add_model_custom_mode = true;
+                            self.add_model_search.clear();
+                        } else if let Some(&i) = self.add_model_filtered.get(self.add_model_index) {
+                            if let Some(model) = self.available_models.get(i) {
+                                match core
+                                    .preferences_model_config_manager()
+                                    .addProviderModelFromAvailable(&pid, model.clone())
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        self.show_add_model_popup = false;
+                                        self.refresh_providers(core).await;
+                                    }
+                                    Err(error) => {
+                                        self.error_message = Some(error.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KC::Tab | KC::BackTab => {
+                        if !self.add_model_custom_mode {
+                            self.add_model_include_history = !self.add_model_include_history;
+                            self.update_add_model_filter();
+                        }
+                    }
+                    KC::Esc => {
+                        if self.add_model_custom_mode {
+                            self.add_model_custom_mode = false;
+                            self.add_model_search.clear();
+                            self.add_model_index = self.add_model_filtered.len();
+                        } else {
+                            self.show_add_model_popup = false;
+                        }
+                    }
+                    KC::Char(c)
+                        if key.modifiers.is_empty()
+                            || key.modifiers == crossterm::event::KeyModifiers::SHIFT =>
+                    {
+                        self.add_model_search.push(c);
+                        if !self.add_model_custom_mode {
+                            self.update_add_model_filter();
+                        }
+                    }
+                    KC::Backspace => {
+                        self.add_model_search.pop();
+                        if !self.add_model_custom_mode {
+                            self.update_add_model_filter();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             // Provider list
             (ConfigState::ProviderList, KC::Esc) => {
                 return Ok(true);
@@ -776,7 +989,7 @@ impl ConfigUi {
                     };
                     let settings = match core
                         .preferences_model_config_manager()
-                        .getThinkingSettingsForProvider(&pid, &model.id)
+                        .getThinkingSettingsForModel(&pid, &model.id)
                         .await
                     {
                         Ok(settings) => settings,
@@ -791,11 +1004,12 @@ impl ConfigUi {
                         model.id.clone(),
                         &config,
                     );
-                    editor.thinking_options = settings
-                        .options
+                    editor.thinking_levels = settings
+                        .levels
                         .into_iter()
-                        .map(|option| option.id)
+                        .map(|option| option.level)
                         .collect();
+                    editor.thinking_level = settings.current;
                     self.state = ConfigState::ModelEditor(editor);
                 }
             }
@@ -1044,27 +1258,12 @@ impl ConfigUi {
                         .preferences_model_config_manager()
                         .updateSummaryForModel(&pid, &mid, changes.summary)
                         .await;
-                    match core
-                        .preferences_model_config_manager()
-                        .getProviderProfile(&pid)
-                        .await
-                    {
-                        Ok(mut provider) => {
-                            provider.thinkingConfigurations = changes.thinking_configurations;
-                            provider.thinkingOptionId = changes.thinking_option_id;
-                            match core
-                                .preferences_model_config_manager()
-                                .updateProviderProfile(provider)
-                                .await
-                            {
-                                Ok(_) => {}
-                                Err(error) => {
-                                    self.error_message = Some(error.to_string());
-                                    return Ok(false);
-                                }
-                            }
-                        }
-                        Err(error) => {
+                    if let Some(level) = changes.thinking_level {
+                        if let Err(error) = core
+                            .preferences_model_config_manager()
+                            .setThinkingLevelForModel(&pid, &mid, level)
+                            .await
+                        {
                             self.error_message = Some(error.to_string());
                             return Ok(false);
                         }
@@ -1134,9 +1333,8 @@ impl ConfigUi {
                         Some(model_editor::MainFocus::StructuredTools) => {
                             editor.supports_structured_tools = !editor.supports_structured_tools
                         }
-                        Some(model_editor::MainFocus::ThinkingConfigurations)
-                        | Some(model_editor::MainFocus::ThinkingOption) => {
-                            editor.editing_field = !editor.editing_field
+                        Some(model_editor::MainFocus::Thinking) => {
+                            editor.cycle_thinking_level()
                         }
                         Some(model_editor::MainFocus::BuiltinTool(index)) => {
                             if let Some(tool) = editor.builtin_tools.get_mut(index) {
@@ -1151,14 +1349,6 @@ impl ConfigUi {
                             editor.clamp_focus();
                         }
                         Some(model_editor::SummaryFocus::TokenThreshold) => {
-                            editor.editing_field = !editor.editing_field
-                        }
-                        Some(model_editor::SummaryFocus::ByMessageCount) => {
-                            editor.enable_summary_by_message_count =
-                                !editor.enable_summary_by_message_count;
-                            editor.clamp_focus();
-                        }
-                        Some(model_editor::SummaryFocus::MessageCountThreshold) => {
                             editor.editing_field = !editor.editing_field
                         }
                         None => {}
@@ -1177,26 +1367,11 @@ impl ConfigUi {
                             editor.max_context_length.push(c);
                         }
                     }
-                    model_editor::EditorLevel::Main
-                        if editor.focused_main_item()
-                            == Some(model_editor::MainFocus::ThinkingConfigurations) =>
-                    {
-                        editor.thinking_configurations.push(c);
-                    }
-                    model_editor::EditorLevel::Main
-                        if editor.focused_main_item()
-                            == Some(model_editor::MainFocus::ThinkingOption) =>
-                    {
-                        editor.thinking_option_id.push(c);
-                    }
                     model_editor::EditorLevel::Summary => {
                         if c.is_ascii_digit() || c == '.' {
                             match editor.focused_summary_item() {
                                 Some(model_editor::SummaryFocus::TokenThreshold) => {
                                     editor.summary_token_threshold.push(c)
-                                }
-                                Some(model_editor::SummaryFocus::MessageCountThreshold) => {
-                                    editor.summary_message_count_threshold.push(c)
                                 }
                                 _ => {}
                             }
@@ -1214,24 +1389,9 @@ impl ConfigUi {
                         {
                             editor.max_context_length.pop();
                         }
-                        model_editor::EditorLevel::Main
-                            if editor.focused_main_item()
-                                == Some(model_editor::MainFocus::ThinkingConfigurations) =>
-                        {
-                            editor.thinking_configurations.pop();
-                        }
-                        model_editor::EditorLevel::Main
-                            if editor.focused_main_item()
-                                == Some(model_editor::MainFocus::ThinkingOption) =>
-                        {
-                            editor.thinking_option_id.pop();
-                        }
                         model_editor::EditorLevel::Summary => match editor.focused_summary_item() {
                             Some(model_editor::SummaryFocus::TokenThreshold) => {
                                 editor.summary_token_threshold.pop();
-                            }
-                            Some(model_editor::SummaryFocus::MessageCountThreshold) => {
-                                editor.summary_message_count_threshold.pop();
                             }
                             _ => {}
                         },
@@ -1289,134 +1449,6 @@ impl ConfigUi {
                 }
             }
 
-            // Confirm dialog
-            _ if self.show_confirm_dialog => match key.code {
-                KC::Enter => {
-                    let action = std::mem::replace(&mut self.confirm_action, ConfirmAction::None);
-                    self.show_confirm_dialog = false;
-                    match action {
-                        ConfirmAction::DeleteModel {
-                            provider_id,
-                            model_id,
-                        } => {
-                            let _ = core
-                                .preferences_model_config_manager()
-                                .deleteModel(&provider_id, &model_id)
-                                .await;
-                            self.refresh_providers(core).await;
-                            self.state = ConfigState::ProviderList;
-                        }
-                        ConfirmAction::DeleteProvider { provider_id } => {
-                            let _ = core
-                                .preferences_model_config_manager()
-                                .deleteProvider(&provider_id)
-                                .await;
-                            self.refresh_providers(core).await;
-                        }
-                        ConfirmAction::None => {}
-                    }
-                }
-                KC::Esc => {
-                    self.show_confirm_dialog = false;
-                    self.confirm_action = ConfirmAction::None;
-                }
-                _ => {}
-            },
-
-            // Add model popup
-            _ if self.show_add_model_popup => {
-                match key.code {
-                    KC::Up => {
-                        if self.add_model_custom_mode {
-                            // Cursor stays at the end in the single-line custom id input.
-                        } else if self.add_model_index > 0 {
-                            self.add_model_index -= 1;
-                        }
-                    }
-                    KC::Down => {
-                        if self.add_model_custom_mode {
-                            // Cursor stays at the end in the single-line custom id input.
-                        } else if self.add_model_index < self.add_model_filtered.len() {
-                            self.add_model_index += 1;
-                        }
-                    }
-                    KC::Enter => {
-                        let pid = match &self.state {
-                            ConfigState::ModelList { provider_id, .. } => provider_id.clone(),
-                            _ => String::new(),
-                        };
-                        if self.add_model_custom_mode {
-                            let model_id = self.add_model_search.trim().to_string();
-                            if !model_id.is_empty() {
-                                match core
-                                    .preferences_model_config_manager()
-                                    .createProviderModel(&pid, model_id)
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        self.show_add_model_popup = false;
-                                        self.add_model_custom_mode = false;
-                                        self.refresh_providers(core).await;
-                                    }
-                                    Err(error) => {
-                                        self.error_message = Some(error.to_string());
-                                    }
-                                }
-                            }
-                        } else if self.add_model_index == self.add_model_filtered.len() {
-                            self.add_model_custom_mode = true;
-                            self.add_model_search.clear();
-                        } else if let Some(&i) = self.add_model_filtered.get(self.add_model_index) {
-                            if let Some(model) = self.available_models.get(i) {
-                                match core
-                                    .preferences_model_config_manager()
-                                    .addProviderModelFromAvailable(&pid, model.modelId.clone())
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        self.show_add_model_popup = false;
-                                        self.refresh_providers(core).await;
-                                    }
-                                    Err(error) => {
-                                        self.error_message = Some(error.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    KC::Tab | KC::BackTab => {
-                        if !self.add_model_custom_mode {
-                            self.add_model_include_history = !self.add_model_include_history;
-                            self.update_add_model_filter();
-                        }
-                    }
-                    KC::Esc => {
-                        if self.add_model_custom_mode {
-                            self.add_model_custom_mode = false;
-                            self.add_model_search.clear();
-                            self.add_model_index = self.add_model_filtered.len();
-                        } else {
-                            self.show_add_model_popup = false;
-                        }
-                    }
-                    KC::Char(c)
-                        if key.modifiers.is_empty()
-                            || key.modifiers == crossterm::event::KeyModifiers::SHIFT =>
-                    {
-                        self.add_model_search.push(c);
-                        if !self.add_model_custom_mode {
-                            self.update_add_model_filter();
-                        }
-                    }
-                    KC::Backspace => {
-                        self.add_model_search.pop();
-                        if !self.add_model_custom_mode {
-                            self.update_add_model_filter();
-                        }
-                    }
-                    _ => {}
-                }
-            }
             _ => {}
         }
         Ok(false)
@@ -1512,6 +1544,15 @@ impl ConfigUi {
                     None
                 }
             }
+        }
+    }
+}
+
+/// Appends only numeric characters, matching the digit-only model editor fields.
+fn push_numeric_text(target: &mut String, text: &str) {
+    for ch in text.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            target.push(ch);
         }
     }
 }

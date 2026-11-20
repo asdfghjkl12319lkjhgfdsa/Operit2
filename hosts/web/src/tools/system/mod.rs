@@ -1,10 +1,12 @@
-use js_sys::{Array, Reflect};
+use js_sys::{Array, Reflect, Uint8Array};
 use operit_host_api::{
     AppListData, AppOperationData, AppUsageTimeEntry, AppUsageTimeResultData, DeviceInfoData,
-    HostResult, LocationData, NotificationData, NotificationEntry, OCRLanguage, OCRQuality,
+    ClipboardHost, FileSystemHost, HostError, HostResult, LocationData, NotificationData,
+    NotificationEntry, OCRLanguage, OCRQuality,
     SystemNotificationRequest, SystemOperationHost, SystemSettingData, ToastHost,
 };
 use wasm_bindgen::prelude::*;
+use crate::tools::fs::WebFileSystemHost;
 
 use crate::common::{
     app_operation_data, call_system, js_error, js_string_array, js_string_map, read_bool_property,
@@ -29,6 +31,15 @@ impl ToastHost for WebSystemOperationHost {
     fn toast(&self, message: &str) -> HostResult<()> {
         call_system("toast", &[JsValue::from_str(message)])?;
         Ok(())
+    }
+}
+
+impl ClipboardHost for WebSystemOperationHost {
+    /// Writes clipboard text through the browser application host.
+    fn setClipboardText(&self, text: &str) -> HostResult<String> {
+        let result = call_system("setClipboardText", &[JsValue::from_str(text)])?;
+        let stored = read_string_property(&result, "text")?;
+        Ok(stored)
     }
 }
 
@@ -79,8 +90,11 @@ impl SystemOperationHost for WebSystemOperationHost {
         system_setting_data(value)
     }
 
-    fn installApp(&self, path: &str) -> HostResult<AppOperationData> {
-        app_operation_data(call_system("installApp", &[JsValue::from_str(path)])?)
+    /// Installs a VFS file reference using the requested platform execution timing.
+    fn installApp(&self, source: &dyn operit_host_api::FileSource, timing: operit_host_api::AppInstallTiming) -> HostResult<AppOperationData> {
+        timing.requireImmediate()?;
+        let path = source.nativePath()?;
+        app_operation_data(call_system("installApp", &[JsValue::from_str(&path)])?)
     }
 
     fn uninstallApp(&self, packageName: &str) -> HostResult<AppOperationData> {
@@ -231,21 +245,36 @@ impl SystemOperationHost for WebSystemOperationHost {
         })
     }
 
+    /// Persists browser display bytes in the runtime worker's file-system host.
     fn captureScreenshot(&self) -> HostResult<String> {
-        read_string_property(&call_system("captureScreenshot", &[])?, "path")
+        let response = call_system("captureScreenshot", &[])?;
+        let path = read_string_property(&response, "path")?;
+        let value = Reflect::get(&response, &JsValue::from_str("bytes")).map_err(js_error)?;
+        let bytes = Uint8Array::new(&value).to_vec();
+        if bytes.is_empty() {
+            return Err(HostError::new("Browser screen capture returned no image bytes"));
+        }
+        let (directory, _) = path.rsplit_once('/')
+            .ok_or_else(|| HostError::new("Browser screen capture path has no parent directory"))?;
+        let files = WebFileSystemHost::new();
+        files.makeDirectory(directory, true)?;
+        files.writeFileBytes(&path, &bytes)?;
+        Ok(path)
     }
 
+    /// Sends runtime-owned image bytes to the browser UI OCR host.
     fn recognizeText(
         &self,
-        imagePath: &str,
+        imagePath: &dyn operit_host_api::FileSource,
         language: OCRLanguage,
         quality: OCRQuality,
     ) -> HostResult<String> {
+        let bytes = imagePath.readBytes()?;
         read_string_property(
             &call_system(
                 "recognizeText",
                 &[
-                    JsValue::from_str(imagePath),
+                    Uint8Array::from(bytes.as_slice()).into(),
                     JsValue::from_str(language.asHostValue()),
                     JsValue::from_str(quality.asHostValue()),
                 ],

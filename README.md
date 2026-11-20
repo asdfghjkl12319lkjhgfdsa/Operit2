@@ -30,7 +30,7 @@ We hope to gradually deliver an experience like this: start a task on a phone, l
 Each CoreNode can run its own Agent workflow independently. Its capabilities depend on the platform Host, model Provider, and local configuration. The current repository already includes:
 
 - Conversations, session branches, message management, attachments, character cards, character groups, and prompt configuration;
-- Provider configuration, model parameters, tool calls, request queues, and local model directories;
+- Provider configuration, model parameters, tool calls, request queues, and downloadable local chat models using embedded llama.cpp and MNN CPU inference;
 - Workspaces, file operations, project templates, commands, and backup/import/export;
 - Terminal sessions, PTY input, and output streams;
 - Web access, browser automation, workspace browsers, and runtime WebView session projections;
@@ -71,7 +71,9 @@ The plugin author entry point is [`plugins/docs/README.md`](plugins/docs/README.
 
 Web Access lets a browser access a running CoreNode; opening the page does not automatically make the browser an independent node in the Space. The browser Host and the WebAssembly runtime are separate engineering paths, and their capabilities and deployment methods should be considered separately.
 
-See "Web Access Development" below for local development, and [`apps/web_access/README.md`](apps/web_access/README.md) for access and deployment instructions.
+See "Web Access Development" below for local development. The dedicated
+`Deploy Web Experience` GitHub Actions workflow builds this Flutter Web
+frontend and publishes it to `gh-pages`; see [`apps/flutter/app/web/README.md`](apps/flutter/app/web/README.md) for access and deployment instructions.
 
 ### Data Backup and Migration
 
@@ -93,11 +95,11 @@ The exact scope of snapshots, configuration, and identity data is determined by 
 | --- | --- | --- |
 | Flutter App | The primary graphical access surface for mobile and desktop, and it can also host a CoreNode | Host and build conditions differ across Android, Windows, Linux, macOS, iOS, OpenHarmony, and Web |
 | Rust CLI/TUI | Local CoreNode and operations/development entry point | The current CLI Host mainly covers Windows, Linux, and macOS |
-| PB_SBC01_H3 | Linux hardware control entry point for running a complete Core | Uses Linux Host capabilities together with board Host capabilities; the application entry point is `apps/pb_sbc01_h3` |
+| PB_SBC01_H3 | Linux hardware control entry point for running a complete Core | Uses Linux Host capabilities together with board Host capabilities; the application entry point is `edge/boards/pb_sbc01_h3` |
 | Web Access | Browser entry point for accessing a running CoreNode | Not a browser node that automatically joins the Space, and not a centralized Agent Server |
 | WebAssembly/browser Host | Local capability boundary of the browser runtime | Separate from the Web Access surface; exact capabilities depend on the browser and current Web build mode |
 | Linux cloud device | Ordinary CoreNode in a Space | Can handle more tasks when it is always online, but does not thereby gain a central identity |
-| ESP32 Edge Node | Device-side Edge Service capability node | Not a complete CoreNode; it does not hold OperitApplication, Chat, Store, Identity, or Space synchronization |
+| [ESP32 Edge Node](edge/docs/architecture.md) | Native device applications and Edge Services | Owns local configuration and bounded operation, participates in Space control and can consume Core services; no full business replica |
 | Server | Future deployment form and Host direction | The current repository does not yet contain a complete Server product that can be published directly |
 
 The repository contains Host adaptation paths for multiple platforms, but "can build" does not mean that cross-device interoperability has been validated. Follow [`BUILDING.md`](BUILDING.md) and the corresponding workflows for platform build, signing, and release conditions.
@@ -175,7 +177,7 @@ With no arguments, `operit2` enters the TUI by default. View more entry points w
 ```powershell
 cargo run --manifest-path apps/cli/Cargo.toml --bin operit2 -- cli
 cargo run --manifest-path apps/cli/Cargo.toml --bin operit2 -- cli link
-cargo run --manifest-path apps/cli/Cargo.toml --bin operit2 -- cli web
+cargo run --manifest-path apps/cli/Cargo.toml --bin operit2 -- cli web open
 ```
 
 ### Flutter App
@@ -212,7 +214,7 @@ apps/
 ├── cli/                 Rust CLI/TUI entry point
 ├── pb_sbc01_h3/         PB_SBC01_H3 hardware control entry point
 ├── flutter/app/         Flutter App entry point
-├── web_access/          Web Access frontend boundary and shared bundle
+├── flutter/app/web/     Standard Flutter Web frontend for web.operit.app
 └── server/              Reserved directory for the Server form
 
 core/
@@ -236,10 +238,10 @@ docs/                    Architecture, permission, Link, migration, and version 
 - [Link, Access, and Space boundaries](docs/link-access-architecture.md)
 - [Permission, AI capability, and sandbox boundaries](docs/permission-access-architecture.md)
 - [Platform Host implementation boundaries](hosts/README.md)
-- [Web Access frontend and deployment requirements](apps/web_access/README.md)
+- [Web Access frontend and deployment requirements](apps/flutter/app/web/README.md)
 - [Plugin author documentation](plugins/docs/README.md)
 - [Versions, tags, channels, and release assets](docs/release-versioning.md)
-- [Current crate split and migration plan](docs/core-module-crate-layout.md)
+- [Documentation index](docs/README.md)
 
 Architecture documents that are marked as a "target", "plan", or "direction of evolution" do not mean that all platforms have implemented them. To determine current actual behavior, use the source code, command help output, build results, and runtime results on the target platform as the source of truth.
 

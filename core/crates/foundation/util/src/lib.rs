@@ -5,13 +5,18 @@ pub mod ArchiveUtil;
 pub mod AssetCopyUtils;
 pub mod ChainLogger;
 pub mod ChatMarkupRegex;
+#[cfg(feature = "full")]
 pub mod ChatUtils;
 pub mod ColorQrCodeUtil;
 pub mod CrashRecoveryState;
+#[cfg(feature = "full")]
 pub mod DocumentConversionUtil;
 pub mod FFmpegUtil;
 pub mod FileUtils;
 pub mod GithubReleaseUtil;
+pub mod IncrementalUpdate;
+mod UpdateHttp;
+mod UpdateSources;
 pub mod GlobalExceptionHandler;
 pub mod HtmlParserUtil;
 pub mod HttpMultiPartDownloader;
@@ -23,13 +28,15 @@ pub mod LocaleUtils;
 pub mod LocationUtils;
 pub mod MarkdownRenderStream;
 pub mod MediaBase64Limiter;
+pub mod MediaLinkBuilder;
 pub mod MediaPoolManager;
+pub mod MediaRegistration;
 pub mod NetworkUtils;
 pub mod OCRUtils;
 pub mod OperitPaths;
 pub mod PortProcessKiller;
-#[path = "RuntimeStorageLayout.rs"]
-pub mod RuntimeStorageLayout;
+pub mod PluginStoragePaths;
+pub use operit_host_api::RuntimeStorageLayout;
 #[path = "RuntimeStoreRoot.rs"]
 pub mod RuntimeStoreRoot;
 pub mod SerializationSetup;
@@ -37,6 +44,7 @@ pub mod SkillRepoZipPoolManager;
 pub mod StreamingJsonXmlConverter;
 pub mod StructuredAssistantContentParser;
 pub mod TextSegmenter;
+#[cfg(feature = "full")]
 pub mod TokenCacheManager;
 pub mod TtsCleaner;
 pub mod TtsSegmenter;

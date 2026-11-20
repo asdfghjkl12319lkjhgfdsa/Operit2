@@ -1,7 +1,10 @@
-use std::collections::{BTreeMap, VecDeque};
+#[path = "../../../../common/terminal_command.rs"]
+mod terminal_command;
+mod powershell_runtime;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -29,6 +32,14 @@ const PRIMARY_TERMINAL_TYPE: &str = "powershell";
 #[derive(Clone, Default)]
 pub struct WindowsTerminalHost {
     state: Arc<Mutex<TerminalState>>,
+    powershell: PowerShellSource,
+}
+
+#[derive(Clone, Default)]
+enum PowerShellSource {
+    #[default]
+    Bundled,
+    OnDemand(PathBuf),
 }
 
 #[derive(Default)]
@@ -64,8 +75,10 @@ struct PtyCursor {
 type PtyCursorState = Arc<Mutex<PtyCursor>>;
 
 impl Drop for PtySession {
+    /// Reaps the interpreter before releasing a session's workspace and runtime files.
     fn drop(&mut self) {
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -76,13 +89,44 @@ enum TerminalKind {
 }
 
 impl WindowsTerminalHost {
+    /// Creates a terminal host for a standalone package with a bundled interpreter.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an application terminal host with an on-demand interpreter cache.
+    pub fn with_on_demand_powershell(runtime_root: &Path) -> Self {
+        Self {
+            state: Arc::default(),
+            powershell: PowerShellSource::OnDemand(runtime_root.join("cache/powershell")),
+        }
     }
 }
 
 impl TerminalHost for WindowsTerminalHost {
+    /// Resolves native terminal directories through the runtime's host VFS mapper.
+    fn resolveWorkingDirectory(
+        &self,
+        terminal: &str,
+        terminalType: &str,
+        workingDir: &str,
+        resolveHostDirectory: &dyn Fn(&str) -> HostResult<String>,
+    ) -> HostResult<String> {
+        requireNativeTerminal(terminal)?;
+        normalizeTerminalType(terminalType)?;
+        resolveHostDirectory(workingDir)
+    }
+
+    /// Lists supported interpreters without initiating any download.
     fn terminalInfo(&self) -> HostResult<TerminalInfo> {
+        let (powershell_available, powershell_description) = match &self.powershell {
+            PowerShellSource::OnDemand(_) => (true, "PowerShell 7 · downloads on first use".to_string()),
+            PowerShellSource::Bundled => match bundledPowerShellExecutable() {
+                Ok(_) => (true, "Bundled PowerShell 7 terminal".to_string()),
+                Err(error) => (false, error.message),
+            },
+        };
+        let bash = bundledBashExecutable();
         Ok(TerminalInfo {
             platform: PLATFORM.to_string(),
             terminal: TERMINAL.to_string(),
@@ -91,22 +135,26 @@ impl TerminalHost for WindowsTerminalHost {
                 TerminalTypeInfo {
                     terminal: TERMINAL.to_string(),
                     terminalType: PRIMARY_TERMINAL_TYPE.to_string(),
-                    available: commandStarts(
-                        "powershell.exe",
-                        &["-NoProfile", "-Command", "$PSVersionTable.PSVersion"],
-                    ),
-                    description: "Windows PowerShell terminal".to_string(),
+                    available: powershell_available,
+                    description: powershell_description,
                 },
                 TerminalTypeInfo {
                     terminal: TERMINAL.to_string(),
                     terminalType: "bash".to_string(),
-                    available: gitBashExecutable().is_ok(),
-                    description: "Windows Git Bash terminal".to_string(),
+                    available: bash.is_ok(),
+                    description: match bash {
+                        Ok(_) => "Bundled Windows Bash terminal".to_string(),
+                        Err(error) => format!(
+                            "Bundled Windows Bash unavailable: {}. Reinstall the complete Operit Windows package.",
+                            error.message,
+                        ),
+                    },
                 },
             ],
         })
     }
 
+    /// Opens the requested interpreter for a manual terminal session.
     fn startPtySession(
         &self,
         sessionName: &str,
@@ -121,6 +169,7 @@ impl TerminalHost for WindowsTerminalHost {
         let (normalizedTerminalType, kind) = normalizeTerminalType(terminalType)?;
         let workDir = nonBlank(workingDir, "working_directory")?;
         let session = createPtySession(
+            &self.powershell,
             normalizedSessionName,
             normalizedTerminalType,
             kind,
@@ -233,10 +282,19 @@ impl TerminalHost for WindowsTerminalHost {
         Ok(entries)
     }
 
+    /// Creates or reuses a named session in the configured default terminal.
     fn createOrGetSession(&self, sessionName: &str) -> HostResult<TerminalSessionInfo> {
+        self.createOrGetTypedSession(sessionName, PRIMARY_TERMINAL_TYPE)
+    }
+
+    /// Creates or reuses a named session of exactly the requested interpreter type.
+    fn createOrGetTypedSession(
+        &self,
+        sessionName: &str,
+        terminalType: &str,
+    ) -> HostResult<TerminalSessionInfo> {
         let normalizedSessionName = nonBlank(sessionName, "session_name")?;
-        let normalizedTerminalType = PRIMARY_TERMINAL_TYPE.to_string();
-        let kind = TerminalKind::PowerShell;
+        let (normalizedTerminalType, kind) = normalizeTerminalType(terminalType)?;
         let key = sessionKey(&normalizedTerminalType, &normalizedSessionName);
         {
             let mut state = self.lockState()?;
@@ -257,6 +315,7 @@ impl TerminalHost for WindowsTerminalHost {
 
         let workingDir = std::env::current_dir()?.display().to_string();
         let session = createPtySession(
+            &self.powershell,
             normalizedSessionName.clone(),
             normalizedTerminalType.clone(),
             kind,
@@ -284,9 +343,19 @@ impl TerminalHost for WindowsTerminalHost {
         command: &str,
         timeoutMs: u64,
     ) -> HostResult<TerminalCommandOutput> {
+        self.executeInSessionStreaming(sessionId, command, timeoutMs, &mut |_| Ok(()))
+    }
+
+    fn executeInSessionStreaming(
+        &self,
+        sessionId: &str,
+        command: &str,
+        timeoutMs: u64,
+        onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
+    ) -> HostResult<TerminalCommandOutput> {
         let normalizedSessionId = nonBlank(sessionId, "session_id")?;
         let normalizedCommand = nonBlank(command, "command")?;
-        let (terminalType, kind, commandOutput) = {
+        let (terminalType, kind, commandOutput, renderer, commandEcho) = {
             let mut state = self.lockState()?;
             let session = state
                 .ptySessions
@@ -294,37 +363,59 @@ impl TerminalHost for WindowsTerminalHost {
                 .ok_or_else(|| {
                     HostError::new(format!("Terminal session does not exist: {sessionId}"))
                 })?;
-            session.commandRunning = true;
+            let renderer = ptyScreenRenderer(session)?;
+            if session.commandRunning {
+                return Err(HostError::new(
+                    "Terminal session already has a command in progress",
+                ));
+            }
             clearPtyCommandOutput(&session.commandOutput)?;
-            let commandInput = format!("{normalizedCommand}\r");
+            let commandEcho = ptyCommandLine(&normalizedCommand, session.kind);
+            let commandInput = format!("{commandEcho}\r");
             let mut writer = session
                 .writer
                 .lock()
                 .map_err(|_| HostError::new("pty writer mutex poisoned"))?;
             writer.write_all(commandInput.as_bytes())?;
             writer.flush()?;
+            session.commandRunning = true;
             (
                 session.terminalType.clone(),
                 session.kind,
                 session.commandOutput.clone(),
+                renderer,
+                commandEcho,
             )
         };
 
-        let result =
-            executePtyCommandInSession(commandOutput, kind, &normalizedCommand, timeoutMs)?;
+        let result = executePtyCommandInSession(
+            commandOutput,
+            kind,
+            &commandEcho,
+            timeoutMs,
+            renderer,
+            onOutput,
+        );
         {
             let mut state = self.lockState()?;
             if let Some(session) = state.ptySessions.get_mut(&normalizedSessionId) {
-                if result.timedOut {
+                // Release the busy flag even if interrupting a broken PTY fails.
+                // The state lock still excludes new commands during cancellation.
+                session.commandRunning = false;
+                if result.as_ref().map_or(true, |receipt| receipt.timedOut) {
                     if let Some(workingDir) = cancelTimedOutPtyCommand(session)? {
                         session.workingDir = workingDir;
                     }
-                } else if let Some(workingDir) = result.workingDir.clone() {
+                } else if let Some(workingDir) = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|receipt| receipt.workingDir.clone())
+                {
                     session.workingDir = workingDir;
                 }
-                session.commandRunning = false;
             }
         }
+        let result = result?;
         Ok(TerminalCommandOutput {
             command: normalizedCommand,
             output: result.output,
@@ -414,6 +505,23 @@ impl TerminalHost for WindowsTerminalHost {
         })
     }
 
+    fn closeSessionIfIdle(&self, sessionId: &str, sessionName: &str) -> HostResult<TerminalCloseOutput> {
+        let id = nonBlank(sessionId, "session_id")?;
+        let name = nonBlank(sessionName, "session_name")?;
+        let mut state = self.lockState()?;
+        let session = state.ptySessions.get(&id)
+            .ok_or_else(|| HostError::new(format!("Terminal session does not exist: {id}")))?;
+        if !operit_host_api::terminalSessionNameMatches(&session.sessionName, &name) {
+            return Err(HostError::new("Terminal session name does not match"));
+        }
+        if session.commandRunning {
+            return Err(HostError::new("Terminal session has a command in progress"));
+        }
+        state.ptySessions.remove(&id);
+        removeSessionMappings(&mut state, &id);
+        Ok(TerminalCloseOutput { sessionId: id.clone(), success: true, message: format!("Idle terminal session closed: {id}") })
+    }
+
     fn getSessionScreen(&self, sessionId: &str) -> HostResult<TerminalScreenOutput> {
         let normalizedSessionId = nonBlank(sessionId, "session_id")?;
         let mut state = self.lockState()?;
@@ -473,6 +581,7 @@ fn hiddenPtySessionId(
 
     let workingDir = std::env::current_dir()?.display().to_string();
     let session = createPtySession(
+        &host.powershell,
         format!("hidden:{executorLabel}"),
         terminalType.to_string(),
         kind,
@@ -497,7 +606,9 @@ struct SessionCommandResult {
 }
 
 #[allow(non_snake_case)]
+/// Prepares the selected interpreter before allocating its PTY.
 fn createPtySession(
+    powershell: &PowerShellSource,
     sessionName: String,
     terminalType: String,
     kind: TerminalKind,
@@ -505,11 +616,11 @@ fn createPtySession(
     rows: u16,
     cols: u16,
 ) -> HostResult<PtySession> {
+    let command = ptyCommand(powershell, kind, &workingDir)?;
     let ptySystem = native_pty_system();
     let pair = ptySystem
         .openpty(ptySize(rows, cols))
         .map_err(toHostError)?;
-    let command = ptyCommand(kind, &workingDir)?;
     let mut child = pair.slave.spawn_command(command).map_err(toHostError)?;
     let mut reader = pair.master.try_clone_reader().map_err(toHostError)?;
     let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(toHostError)?));
@@ -522,24 +633,29 @@ fn createPtySession(
     let screenOutputForThread = screenOutput.clone();
     let writerForThread = writer.clone();
     let cursorStateForThread = cursorState.clone();
-    thread::spawn(move || {
-        let mut buffer = [0u8; 4096];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let chunk = &buffer[..count];
-                    processPtyTerminalQueries(&writerForThread, &cursorStateForThread, chunk);
-                    let commandChunk = stripPtyDeviceStatusReports(chunk);
-                    let visibleChunk = stripPtyPromptMarkers(&commandChunk);
-                    appendPtyOutput(&outputForThread, &visibleChunk);
-                    appendPtyOutput(&screenOutputForThread, &visibleChunk);
-                    appendPtyCommandOutput(&commandOutputForThread, &commandChunk);
+    let reader_task =
+        operit_host_native_common::scheduleNativeServiceTask("operit-pty-reader", move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let chunk = &buffer[..count];
+                        processPtyTerminalQueries(&writerForThread, &cursorStateForThread, chunk);
+                        let commandChunk = stripPtyDeviceStatusReports(chunk);
+                        let visibleChunk = stripPtyPromptMarkers(&commandChunk);
+                        appendPtyOutput(&outputForThread, &visibleChunk);
+                        appendPtyOutput(&screenOutputForThread, &visibleChunk);
+                        appendPtyCommandOutput(&commandOutputForThread, &commandChunk);
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-    });
+        });
+    if let Err(error) = reader_task {
+        let _ = child.kill();
+        return Err(error);
+    }
     if let Err(error) = waitForInitialPtyPrompt(commandOutput.clone(), Duration::from_millis(10000))
     {
         let _ = child.kill();
@@ -562,13 +678,38 @@ fn createPtySession(
     })
 }
 
+/// Encodes a multiline script as one input line for its selected interactive interpreter.
+#[allow(non_snake_case)]
+fn ptyCommandLine(command: &str, kind: TerminalKind) -> String {
+    match kind {
+        TerminalKind::Bash => terminal_command::posixCommandLine(command),
+        TerminalKind::PowerShell => {
+            if !command.chars().any(char::is_control) {
+                return command.to_string();
+            }
+            let encoded = BASE64_STANDARD.encode(command.as_bytes());
+            format!("Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')))")
+        }
+    }
+}
+
 #[allow(non_snake_case)]
 /// Builds the PTY command for the selected Windows terminal type.
-fn ptyCommand(kind: TerminalKind, workingDir: &str) -> HostResult<CommandBuilder> {
+fn ptyCommand(powershell: &PowerShellSource, kind: TerminalKind, workingDir: &str) -> HostResult<CommandBuilder> {
     match kind {
-        TerminalKind::PowerShell => Ok(windowsPtyCommand(workingDir)),
+        TerminalKind::PowerShell => windowsPtyCommand(powershell, workingDir),
         TerminalKind::Bash => {
-            let mut command = CommandBuilder::new(gitBashExecutable()?);
+            let executable = bundledBashExecutable()?;
+            let root = executable
+                .parent()
+                .and_then(|path| path.parent())
+                .ok_or_else(|| HostError::new("Bundled Bash executable has no runtime root"))?;
+            let mut paths = vec![root.join("bin"), root.join("usr/bin")];
+            if let Some(inherited) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&inherited));
+            }
+            let mut command = CommandBuilder::new(&executable);
+            command.env("PATH", std::env::join_paths(paths).map_err(toHostError)?);
             command.arg("--noprofile");
             command.arg("--norc");
             command.arg("-i");
@@ -579,7 +720,7 @@ fn ptyCommand(kind: TerminalKind, workingDir: &str) -> HostResult<CommandBuilder
             command.env("PS1", "$PWD $ ");
             command.env(
                 "PROMPT_COMMAND",
-                r#"__operit_status=$?; printf '\033]133;OperitPrompt=%s:%s\007' "$(printf '%s' "$PWD" | base64 | tr -d '\n')" "$__operit_status""#,
+                r#"__operit_status=$?; printf '\033]133;OperitPrompt=%s:%s\007' "$__operit_status" "$PWD""#,
             );
             Ok(command)
         }
@@ -587,39 +728,16 @@ fn ptyCommand(kind: TerminalKind, workingDir: &str) -> HostResult<CommandBuilder
 }
 
 #[allow(non_snake_case)]
-/// Resolves the Bash executable from the active Git for Windows installation.
-fn gitBashExecutable() -> HostResult<PathBuf> {
-    let output = Command::new("git")
-        .arg("--exec-path")
-        .output()
-        .map_err(|error| {
-            HostError::new(format!(
-                "Failed to resolve Git for Windows exec path: {error}"
-            ))
-        })?;
-    if !output.status.success() {
-        return Err(HostError::new(format!(
-            "git --exec-path failed with status {}",
-            output.status
-        )));
-    }
-    let execPathText = String::from_utf8(output.stdout)
-        .map_err(|error| HostError::new(format!("Git exec path is not UTF-8: {error}")))?;
-    let execPath = PathBuf::from(execPathText.trim());
-    let gitRoot = execPath
+/// Resolves only the Bash runtime shipped beside the running application.
+fn bundledBashExecutable() -> HostResult<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let root = executable
         .parent()
-        .and_then(|path| path.parent())
-        .and_then(|path| path.parent())
-        .ok_or_else(|| {
-            HostError::new(format!(
-                "Unexpected Git for Windows exec path: {}",
-                execPath.display()
-            ))
-        })?;
-    let bashExecutable = gitRoot.join("bin").join("bash.exe");
+        .ok_or_else(|| HostError::new("Operit executable has no parent directory"))?;
+    let bashExecutable = root.join("bash/bin/bash.exe");
     if !bashExecutable.is_file() {
         return Err(HostError::new(format!(
-            "Git Bash executable does not exist: {}",
+            "Bundled Bash executable does not exist: {}",
             bashExecutable.display()
         )));
     }
@@ -627,9 +745,35 @@ fn gitBashExecutable() -> HostResult<PathBuf> {
 }
 
 #[allow(non_snake_case)]
-/// Builds the Windows PowerShell PTY command.
-fn windowsPtyCommand(workingDir: &str) -> CommandBuilder {
-    let mut command = CommandBuilder::new("powershell.exe");
+/// Resolves the PowerShell 7 runtime shipped beside the running application.
+fn bundledPowerShellExecutable() -> HostResult<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let root = executable
+        .parent()
+        .ok_or_else(|| HostError::new("Operit executable has no parent directory"))?;
+    let powershellExecutable = root.join("powershell/pwsh.exe");
+    if !powershellExecutable.is_file() {
+        return Err(HostError::new(format!(
+            "Bundled PowerShell 7 executable does not exist: {}",
+            powershellExecutable.display()
+        )));
+    }
+    Ok(powershellExecutable)
+}
+
+#[allow(non_snake_case)]
+/// Builds the PowerShell 7 PTY command using the package's selected runtime source.
+fn windowsPtyCommand(powershell: &PowerShellSource, workingDir: &str) -> HostResult<CommandBuilder> {
+    let executable = match powershell {
+        PowerShellSource::Bundled => bundledPowerShellExecutable()?,
+        PowerShellSource::OnDemand(cache) => powershell_runtime::executable(cache)?,
+    };
+    let mut paths = vec![executable.parent().unwrap().to_path_buf()];
+    if let Some(inherited) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&inherited));
+    }
+    let mut command = CommandBuilder::new(&executable);
+    command.env("PATH", std::env::join_paths(paths).map_err(toHostError)?);
     command.arg("-NoLogo");
     command.arg("-NoProfile");
     command.arg("-ExecutionPolicy");
@@ -641,12 +785,13 @@ fn windowsPtyCommand(workingDir: &str) -> CommandBuilder {
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.env("LANG", "C.UTF-8");
-    command
+    Ok(command)
 }
 
 #[allow(non_snake_case)]
+/// Initializes UTF-8 input/output and the session completion prompt.
 fn powershellPtyInitScript() -> &'static str {
-    "$global:__operit_error_count = $global:error.Count; [Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8; function global:prompt { $__operit_success = $?; $__operit_error_changed = $global:error.Count -gt $global:__operit_error_count; $global:__operit_error_count = $global:error.Count; $__operit_location = (Get-Location).Path; $__operit_pwd = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($__operit_location)); $__operit_exit_code = if ($__operit_success -and -not $__operit_error_changed) { 0 } elseif ($LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { [int]$LASTEXITCODE } else { 1 }; ([char]27) + ']133;OperitPrompt=' + $__operit_pwd + ':' + $__operit_exit_code + ([char]7) + 'PS ' + $__operit_location + '> ' }"
+    "$global:__operit_error_count = $global:error.Count; [Console]::InputEncoding = [Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Text.UTF8Encoding]::new($false); function global:prompt { $__operit_success = $?; $__operit_error_changed = $global:error.Count -gt $global:__operit_error_count; $global:__operit_error_count = $global:error.Count; $__operit_location = (Get-Location).Path; $__operit_exit_code = if ($__operit_success -and -not $__operit_error_changed) { 0 } elseif ($__operit_error_changed) { 1 } elseif ($LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { [int]$LASTEXITCODE } else { 1 }; ([char]27) + ']133;OperitPrompt=' + $__operit_exit_code + ':' + $__operit_location + ([char]7) + 'PS ' + $__operit_location + '> ' }"
 }
 
 #[allow(non_snake_case)]
@@ -799,13 +944,21 @@ fn executePtyCommandInSession(
     kind: TerminalKind,
     command: &str,
     timeoutMs: u64,
+    renderer: TerminalTextRenderer,
+    onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
 ) -> HostResult<SessionCommandResult> {
-    let deadline = Instant::now() + Duration::from_millis(timeoutMs);
+    let deadline = (timeoutMs != 0).then(|| Instant::now() + Duration::from_millis(timeoutMs));
     let mut collected = Vec::new();
     let mut promptSeenAt = None;
     let quietPeriod = Duration::from_millis(150);
     loop {
-        let drained = drainPtyCommandOutput(&output, &mut collected, deadline)?;
+        let previousLength = collected.len();
+        let waitDeadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
+        let drained = drainPtyCommandOutput(&output, &mut collected, waitDeadline)?;
+        onOutput(&collected[previousLength..])?;
+        if timeoutMs == 0 && collected.len() > PTY_OUTPUT_LIMIT {
+            collected.drain(..collected.len() - PTY_OUTPUT_LIMIT);
+        }
         if drained > 0 {
             promptSeenAt = None;
         }
@@ -814,11 +967,17 @@ fn executePtyCommandInSession(
                 promptSeenAt = Some(Instant::now());
             }
             if !promptSeenAt.is_some_and(|seenAt| seenAt.elapsed() >= quietPeriod) {
-                if Instant::now() < deadline {
+                if deadline.map_or(true, |deadline| Instant::now() < deadline) {
                     continue;
                 }
             }
-            let output = ptyCommandOutputText(&collected, kind, command, Some(&marker.workingDir))?;
+            let output = ptyCommandOutputText(
+                &collected,
+                kind,
+                command,
+                Some(&marker.workingDir),
+                renderer,
+            )?;
             return Ok(SessionCommandResult {
                 output,
                 exitCode: marker.exitCode,
@@ -826,8 +985,8 @@ fn executePtyCommandInSession(
                 workingDir: Some(marker.workingDir),
             });
         }
-        if Instant::now() >= deadline {
-            let output = ptyCommandOutputText(&collected, kind, command, None)?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let output = ptyCommandOutputText(&collected, kind, command, None, renderer)?;
             return Ok(SessionCommandResult {
                 output,
                 exitCode: -1,
@@ -913,14 +1072,11 @@ fn findLastPtyPromptMarker(data: &[u8]) -> HostResult<Option<PtyPromptMarker>> {
     let payloadEnd = payloadStart + relativeEnd;
     let payload = std::str::from_utf8(&data[payloadStart..payloadEnd])
         .map_err(|error| HostError::new(format!("Invalid PTY prompt marker UTF-8: {error}")))?;
-    let (workingDirText, exitCodeText) = payload
+    // Windows directory names exclude BEL; putting the status first preserves drive colons.
+    let (exitCodeText, workingDir) = payload
         .split_once(':')
         .ok_or_else(|| HostError::new(format!("Invalid PTY prompt marker '{payload}'")))?;
-    let workingDirBytes = BASE64_STANDARD
-        .decode(workingDirText.as_bytes())
-        .map_err(|error| HostError::new(format!("Invalid PTY prompt cwd marker: {error}")))?;
-    let workingDir = String::from_utf8(workingDirBytes)
-        .map_err(|error| HostError::new(format!("Invalid PTY prompt cwd UTF-8: {error}")))?;
+    let workingDir = workingDir.to_string();
     let exitCode = parseExitCode(exitCodeText)?;
     Ok(Some(PtyPromptMarker {
         start,
@@ -950,17 +1106,17 @@ fn findBytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 #[allow(non_snake_case)]
-/// Converts raw PTY output into terminal-specific command output text.
+/// Renders command output from the captured viewport and removes the shell-owned echo and prompt.
 fn ptyCommandOutputText(
     raw: &[u8],
     kind: TerminalKind,
     command: &str,
     workingDir: Option<&str>,
+    mut renderer: TerminalTextRenderer,
 ) -> HostResult<String> {
-    let visibleBytes = stripPtyPromptMarkers(raw);
-    let text = String::from_utf8_lossy(&visibleBytes);
-    let clean = renderTerminalText(&text);
-    let withoutEcho = dropCommandEcho(clean, command);
+    let startRow = renderer.logicalLineStart();
+    renderer.write(&String::from_utf8_lossy(raw));
+    let withoutEcho = dropCommandEcho(renderer.textFrom(startRow), command);
     let Some(workingDir) = workingDir else {
         return Ok(withoutEcho.trim().to_string());
     };
@@ -971,15 +1127,23 @@ fn ptyCommandOutputText(
 }
 
 #[allow(non_snake_case)]
-fn ptyScreenContent(session: &PtySession) -> HostResult<String> {
+/// Reconstructs the terminal viewport and scrollback using the session's actual dimensions.
+fn ptyScreenRenderer(session: &PtySession) -> HostResult<TerminalTextRenderer> {
+    let size = session.master.get_size().map_err(toHostError)?;
     let buffer = session
         .screenOutput
         .lock()
         .map_err(|_| HostError::new("pty screen output mutex poisoned"))?;
     let bytes = buffer.iter().copied().collect::<Vec<_>>();
-    let visibleBytes = stripPtyPromptMarkers(&bytes);
-    let text = String::from_utf8_lossy(&visibleBytes);
-    Ok(renderTerminalText(&text))
+    let mut renderer = TerminalTextRenderer::new(usize::from(size.rows), usize::from(size.cols));
+    renderer.write(&String::from_utf8_lossy(&bytes));
+    Ok(renderer)
+}
+
+#[allow(non_snake_case)]
+/// Returns the rendered session transcript without exposing internal completion markers.
+fn ptyScreenContent(session: &PtySession) -> HostResult<String> {
+    Ok(ptyScreenRenderer(session)?.textFrom(0))
 }
 
 #[allow(non_snake_case)]
@@ -1018,9 +1182,12 @@ fn stripPtyDeviceStatusReports(raw: &[u8]) -> Vec<u8> {
     output
 }
 
-#[derive(Default)]
 struct TerminalTextRenderer {
     lines: Vec<Vec<char>>,
+    wrappedRows: BTreeSet<usize>,
+    viewportStart: usize,
+    rows: usize,
+    cols: usize,
     row: usize,
     col: usize,
     savedRow: usize,
@@ -1028,9 +1195,14 @@ struct TerminalTextRenderer {
 }
 
 impl TerminalTextRenderer {
-    fn new() -> Self {
+    /// Starts a viewport whose absolute cursor coordinates remain separate from scrollback.
+    fn new(rows: usize, cols: usize) -> Self {
         Self {
             lines: vec![Vec::new()],
+            wrappedRows: BTreeSet::new(),
+            viewportStart: 0,
+            rows,
+            cols,
             row: 0,
             col: 0,
             savedRow: 0,
@@ -1038,6 +1210,7 @@ impl TerminalTextRenderer {
         }
     }
 
+    /// Applies terminal output while retaining logical lines that have scrolled out of view.
     fn write(&mut self, value: &str) {
         let chars = value.chars().collect::<Vec<_>>();
         let mut index = 0usize;
@@ -1052,12 +1225,30 @@ impl TerminalTextRenderer {
         }
     }
 
-    fn text(&self) -> String {
-        self.lines
-            .iter()
-            .map(|line| line.iter().collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// Locates the logical start of the current line across automatic terminal wrapping.
+    fn logicalLineStart(&self) -> usize {
+        let mut row = self.row;
+        while row > 0 && self.wrappedRows.contains(&(row - 1)) {
+            row -= 1;
+        }
+        row
+    }
+
+    /// Joins soft-wrapped rows and retains explicit newlines from the requested transcript row.
+    fn textFrom(&self, startRow: usize) -> String {
+        let mut text = String::new();
+        for (row, line) in self.lines.iter().enumerate().skip(startRow) {
+            let content = line.iter().collect::<String>();
+            if self.wrappedRows.contains(&row) || row + 1 == self.lines.len() {
+                text.push_str(&content);
+            } else {
+                text.push_str(content.trim_end());
+                if row + 1 < self.lines.len() {
+                    text.push('\n');
+                }
+            }
+        }
+        text
     }
 
     fn consumeEscape(&mut self, chars: &[char], index: usize) -> usize {
@@ -1111,17 +1302,19 @@ impl TerminalTextRenderer {
         index
     }
 
+    /// Resolves absolute cursor addresses against the visible viewport rather than scrollback.
     fn applyCsi(&mut self, params: &str, command: char) {
         let values = csiParams(params);
         match command {
             'A' => self.moveRowUp(csiValue(&values, 0, 1)),
             'B' => self.moveRowDown(csiValue(&values, 0, 1)),
-            'C' => self.col += csiValue(&values, 0, 1),
+            'C' => self.col = (self.col + csiValue(&values, 0, 1)).min(self.cols - 1),
             'D' => self.col = self.col.saturating_sub(csiValue(&values, 0, 1)),
-            'G' => self.col = csiValue(&values, 0, 1).saturating_sub(1),
+            'G' => self.col = csiValue(&values, 0, 1).saturating_sub(1).min(self.cols - 1),
             'H' | 'f' => {
-                self.row = csiValue(&values, 0, 1).saturating_sub(1);
-                self.col = csiValue(&values, 1, 1).saturating_sub(1);
+                self.row = self.viewportStart
+                    + csiValue(&values, 0, 1).saturating_sub(1).min(self.rows - 1);
+                self.col = csiValue(&values, 1, 1).saturating_sub(1).min(self.cols - 1);
                 self.ensureCursorLine();
             }
             'J' => self.eraseDisplay(csiValue(&values, 0, 0)),
@@ -1140,20 +1333,21 @@ impl TerminalTextRenderer {
         }
     }
 
+    /// Distinguishes explicit line feeds from terminal column wrapping.
     fn writeChar(&mut self, ch: char) {
         match ch {
             '\r' => self.col = 0,
             '\n' => {
-                self.row += 1;
+                self.wrappedRows.remove(&self.row);
+                self.advanceLine();
                 self.col = 0;
-                self.ensureCursorLine();
             }
             '\x08' => {
                 self.col = self.col.saturating_sub(1);
             }
             '\t' => {
-                let nextStop = ((self.col / 8) + 1) * 8;
-                while self.col < nextStop {
+                let spaces = 8 - self.col % 8;
+                for _ in 0..spaces {
                     self.putChar(' ');
                 }
             }
@@ -1162,7 +1356,13 @@ impl TerminalTextRenderer {
         }
     }
 
+    /// Wraps at the right margin and records continuation rows before writing a cell.
     fn putChar(&mut self, ch: char) {
+        if self.col >= self.cols {
+            self.wrappedRows.insert(self.row);
+            self.advanceLine();
+            self.col = 0;
+        }
         self.ensureCursorLine();
         let line = &mut self.lines[self.row];
         while line.len() < self.col {
@@ -1176,33 +1376,47 @@ impl TerminalTextRenderer {
         self.col += 1;
     }
 
+    /// Moves upward within the visible viewport without changing scrollback.
     fn moveRowUp(&mut self, count: usize) {
-        self.row = self.row.saturating_sub(count);
+        self.row = self.row.saturating_sub(count).max(self.viewportStart);
         self.ensureCursorLine();
     }
 
+    /// Moves downward within the visible viewport without scrolling.
     fn moveRowDown(&mut self, count: usize) {
-        self.row += count;
+        self.row = (self.row + count).min(self.viewportStart + self.rows - 1);
         self.ensureCursorLine();
     }
 
+    /// Advances output and moves the viewport when a line passes its bottom margin.
+    fn advanceLine(&mut self) {
+        self.row += 1;
+        if self.row >= self.viewportStart + self.rows {
+            self.viewportStart = self.row + 1 - self.rows;
+        }
+        self.ensureCursorLine();
+    }
+
+    /// Erases the requested screen region while preserving its cursor and scrollback coordinates.
     fn eraseDisplay(&mut self, mode: usize) {
         match mode {
             0 => {
                 self.eraseLine(0);
                 self.lines.truncate(self.row + 1);
+                self.wrappedRows.retain(|row| *row < self.row);
             }
             1 => {
-                for row in 0..self.row {
+                for row in self.viewportStart..self.row {
                     self.lines[row].clear();
                 }
                 self.eraseLine(1);
             }
             2 | 3 => {
-                self.lines.clear();
-                self.lines.push(Vec::new());
-                self.row = 0;
-                self.col = 0;
+                let start = if mode == 3 { 0 } else { self.viewportStart };
+                for row in start..self.lines.len() {
+                    self.lines[row].clear();
+                    self.wrappedRows.remove(&row);
+                }
             }
             _ => {}
         }
@@ -1245,13 +1459,6 @@ impl TerminalTextRenderer {
 }
 
 #[allow(non_snake_case)]
-fn renderTerminalText(value: &str) -> String {
-    let mut renderer = TerminalTextRenderer::new();
-    renderer.write(value);
-    renderer.text()
-}
-
-#[allow(non_snake_case)]
 fn csiParams(params: &str) -> Vec<Option<usize>> {
     let params = params
         .trim_start_matches('?')
@@ -1277,18 +1484,27 @@ fn csiValue(values: &[Option<usize>], index: usize, defaultValue: usize) -> usiz
         .unwrap_or(defaultValue)
 }
 
+/// Removes the submitted command echo across physical terminal line wraps.
 #[allow(non_snake_case)]
 fn dropCommandEcho(value: String, command: &str) -> String {
     let mut lines = value.lines().map(str::to_string).collect::<Vec<_>>();
     while lines.first().is_some_and(|line| line.trim().is_empty()) {
         lines.remove(0);
     }
-    if lines.first().is_some_and(|line| {
-        let line = line.trim_end();
-        let command = command.trim();
-        line == command || line.ends_with(command)
-    }) {
-        lines.remove(0);
+    let command = command.trim();
+    let flattened = lines.join("");
+    if let Some(start) = flattened.find(command) {
+        if lines.first().is_some_and(|line| start < line.len()) {
+            let commandEnd = start + command.len();
+            let mut offset = 0;
+            let echoEnd = lines.iter().position(|line| {
+                offset += line.len();
+                offset == commandEnd
+            });
+            if let Some(index) = echoEnd {
+                lines.drain(..=index);
+            }
+        }
     }
     lines.join("\n").trim().to_string()
 }
@@ -1296,23 +1512,43 @@ fn dropCommandEcho(value: String, command: &str) -> String {
 #[allow(non_snake_case)]
 /// Removes the trailing PowerShell prompt from command output.
 fn dropTrailingPowerShellPrompt(value: &str, workingDir: &str) -> HostResult<String> {
-    let prompt = format!("PS {workingDir}>");
-    let output = value
-        .trim_end()
-        .strip_suffix(&prompt)
-        .ok_or_else(|| HostError::new(format!("Missing PowerShell prompt suffix: {prompt}")))?;
-    Ok(output.trim().to_string())
+    dropTrailingPtyPrompt(value, &format!("PS {workingDir}>"))
 }
 
 #[allow(non_snake_case)]
 /// Removes the trailing Git Bash prompt from command output.
 fn dropTrailingBashPrompt(value: &str, workingDir: &str) -> HostResult<String> {
-    let prompt = format!("{workingDir} $");
-    let output = value
-        .trim_end()
-        .strip_suffix(&prompt)
-        .ok_or_else(|| HostError::new(format!("Missing Git Bash prompt suffix: {prompt}")))?;
-    Ok(output.trim().to_string())
+    dropTrailingPtyPrompt(value, &format!("{workingDir} $"))
+}
+
+/// Matches the shell-owned prompt across physical ConPTY rows without altering command output.
+#[allow(non_snake_case)]
+fn dropTrailingPtyPrompt(value: &str, prompt: &str) -> HostResult<String> {
+    let value = value.trim_end();
+    let mut cells = value
+        .char_indices()
+        .rev()
+        .filter(|(_, ch)| *ch != '\r' && *ch != '\n');
+    let mut start = value.len();
+    for expected in prompt.chars().rev() {
+        match cells.next() {
+            Some((index, actual)) if actual == expected => start = index,
+            _ => {
+                let tail = value
+                    .chars()
+                    .rev()
+                    .take(prompt.chars().count() + 80)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>();
+                return Err(HostError::new(format!(
+                    "Missing terminal prompt suffix: expected={prompt:?}, renderedTail={tail:?}",
+                )));
+            }
+        }
+    }
+    Ok(value[..start].trim().to_string())
 }
 
 #[allow(non_snake_case)]
@@ -1494,11 +1730,6 @@ fn nonBlank(value: &str, paramName: &str) -> HostResult<String> {
 }
 
 #[allow(non_snake_case)]
-fn commandStarts(program: &str, args: &[&str]) -> bool {
-    Command::new(program).args(args).output().is_ok()
-}
-
-#[allow(non_snake_case)]
 fn nextSessionId() -> String {
     Uuid::new_v4().to_string()
 }
@@ -1507,6 +1738,83 @@ fn nextSessionId() -> String {
 mod tests {
     use super::*;
     use operit_host_api::TerminalHost;
+
+    /// Preserves Unicode workspaces and drive colons without spawning an encoder in Bash.
+    #[test]
+    fn terminal_marker_preserves_status_and_native_directory() {
+        for directory in [
+            r"E:\中文 工作区\chat_outputs",
+            "/e/中文 工作区/chat_outputs",
+        ] {
+            let raw = format!("\x1b]133;OperitPrompt=7:{directory}\x07");
+            let marker = findLastPtyPromptMarker(raw.as_bytes()).unwrap().unwrap();
+            assert_eq!(marker.exitCode, 7);
+            assert_eq!(marker.workingDir, directory);
+        }
+    }
+
+    /// Accepts explicit ConPTY row breaks inside the exact prompt while preserving output newlines.
+    #[test]
+    fn terminal_prompt_matches_physical_rows() {
+        let directory = r"E:\operitRuntime\identities\identity-1794309438693-7bda0f99\data\chat_outputs\2026-11-10_20-41-54-933";
+        for prompt in [format!("PS {directory}>"), format!("{directory} $")] {
+            for cols in [20, 40, 80] {
+                let wrapped = prompt
+                    .as_bytes()
+                    .chunks(cols)
+                    .map(|chunk| std::str::from_utf8(chunk).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\r\n");
+                assert_eq!(
+                    dropTrailingPtyPrompt(&format!("first\r\nsecond\r\n{wrapped} "), &prompt).unwrap(),
+                    "first\r\nsecond"
+                );
+            }
+        }
+        assert!(dropTrailingPtyPrompt("hello\nPS wrong>", "PS expected>")
+            .unwrap_err()
+            .message
+            .contains("renderedTail="));
+    }
+
+    /// Exercises the reported long workspace prompt across narrow ConPTY viewports.
+    #[test]
+    fn powershell_long_workspace_prompt_preserves_output() {
+        let directory = std::env::temp_dir()
+            .join(format!("operit-terminal-{}", Uuid::new_v4()))
+            .join(
+                "identities/identity-1794309438693-7bda0f99/data/chat_outputs/2026-11-10_20-41-54-933",
+            );
+        std::fs::create_dir_all(&directory).unwrap();
+        let host = WindowsTerminalHost::new();
+        for cols in [40, 80, 120] {
+            let sessionId = host
+                .startPtySession(
+                    "long-workspace",
+                    TERMINAL,
+                    "powershell",
+                    &directory.display().to_string(),
+                    24,
+                    cols,
+                )
+                .unwrap();
+            for command in ["Write-Host 'hello'", "echo test123"] {
+                let result = host.executeInSession(&sessionId, command, 5000).unwrap();
+                assert_eq!(result.exitCode, 0);
+                assert!(!result.timedOut);
+                assert_eq!(
+                    result.output,
+                    if command.starts_with("Write-Host") {
+                        "hello"
+                    } else {
+                        "test123"
+                    }
+                );
+            }
+            host.closePtySession(&sessionId).unwrap();
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     #[test]
     fn powershell_command_block_completes() {
@@ -1523,6 +1831,7 @@ mod tests {
         assert_eq!(result.output, "hello");
     }
 
+    /// Rejects malformed syntax on PowerShell 7 without waiting for another input line.
     #[test]
     fn powershell_parse_error_returns_without_timeout() {
         let host = WindowsTerminalHost::new();
@@ -1530,7 +1839,7 @@ mod tests {
             .createOrGetSession("terminal_powershell_parse_error")
             .expect("create terminal session");
         let result = host
-            .executeInSession(&session.sessionId, "date /t && time /t", 3000)
+            .executeInSession(&session.sessionId, "Write-Output hello && && Write-Output world", 3000)
             .expect("execute terminal command");
 
         assert!(!result.timedOut);
@@ -1577,6 +1886,35 @@ mod tests {
         assert_eq!(info.terminal, "native");
     }
 
+    /// Runs PowerShell 7 syntax in the packaged interpreter and preserves Unicode output.
+    #[test]
+    fn powershell_7_version_and_pipeline_chains() {
+        let host = WindowsTerminalHost::new();
+        let session = host
+            .createOrGetSession("terminal_powershell_7")
+            .expect("create bundled PowerShell 7 session");
+        let result = host
+            .executeInSession(
+                &session.sessionId,
+                "Write-Output $PSVersionTable.PSVersion.Major; Write-Output $PSVersionTable.PSEdition; Write-Output '中文' && Write-Output 'chain-ok'",
+                5000,
+            )
+            .expect("execute PowerShell 7 pipeline chain");
+        assert!(!result.timedOut);
+        assert_eq!(result.exitCode, 0);
+        assert_eq!(result.output, "7\nCore\n中文\nchain-ok");
+        let nativeError = host
+            .executeInSession(&session.sessionId, "cmd /c exit 7", 3000)
+            .unwrap();
+        assert_eq!(nativeError.exitCode, 7);
+        let parseError = host
+            .executeInSession(&session.sessionId, "Write-Output hello && && Write-Output world", 3000)
+            .unwrap();
+        assert!(!parseError.timedOut);
+        assert_eq!(parseError.exitCode, 1);
+        host.closePtySession(&session.sessionId).unwrap();
+    }
+
     /// Verifies that Windows Git Bash sessions execute through the typed host path.
     #[test]
     fn git_bash_command_block_completes() {
@@ -1599,6 +1937,256 @@ mod tests {
         assert!(!result.timedOut);
         assert_eq!(result.exitCode, 0);
         assert_eq!(result.output, "git-bash-ok");
+    }
+
+    /// Keeps viewport cursor corrections from overwriting rows retained in scrollback.
+    #[test]
+    fn terminal_cursor_addresses_are_relative_to_the_viewport() {
+        let mut renderer = TerminalTextRenderer::new(3, 8);
+        renderer.write("one\r\ntwo\r\n1234567\r\n\x1b[2;8H89abc\r\nnext");
+        assert_eq!(renderer.textFrom(0), "one\ntwo\n123456789abc\nnext");
+    }
+
+    /// Expands a tab at a pending wrap without looping across the terminal margin.
+    #[test]
+    fn terminal_tab_wraps_at_the_right_margin() {
+        let mut renderer = TerminalTextRenderer::new(3, 8);
+        renderer.write("12345678\tend");
+        assert_eq!(renderer.textFrom(0), "12345678        end");
+    }
+
+    /// Preserves PowerShell pipeline output when the completion marker precedes its final display writes.
+    #[test]
+    fn powershell_scrolled_output_preserves_wrapped_lines() {
+        let host = WindowsTerminalHost::new();
+        let session = host
+            .createOrGetSession("terminal_powershell_scrolled")
+            .expect("create PowerShell terminal session");
+        let warmup = host
+            .executeInSession(
+                &session.sessionId,
+                "1..40 | ForEach-Object { \"warmup-$_\" }",
+                5000,
+            )
+            .expect("scroll the PowerShell viewport");
+        assert_eq!(warmup.exitCode, 0);
+        let result = host
+            .executeInSession(
+                &session.sessionId,
+                "1..8 | ForEach-Object { ('x' * 110) + $_ }",
+                5000,
+            )
+            .expect("parse wrapped PowerShell pipeline output");
+        assert!(!result.timedOut);
+        assert_eq!(result.exitCode, 0);
+        assert_eq!(
+            result.output,
+            (1..=8)
+                .map(|index| format!("{}{index}", "x".repeat(110)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Preserves all wrapped output after scrolling and keeps subsequent commands usable.
+    #[test]
+    fn git_bash_scrolled_output_preserves_wrapped_lines_and_session() {
+        let host = WindowsTerminalHost::new();
+        let session = host
+            .createOrGetTypedSession("terminal_git_bash_scrolled", "bash")
+            .expect("create Git Bash terminal session");
+        let warmup = host
+            .executeInSession(&session.sessionId, "printf 'warmup-%s\\n' {1..40}", 5000)
+            .expect("scroll the terminal viewport");
+        assert_eq!(warmup.exitCode, 0);
+        assert_eq!(
+            warmup.output,
+            (1..=40)
+                .map(|index| format!("warmup-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let result = host
+            .executeInSession(&session.sessionId, "printf '%0120d\\n' {1..8}", 5000)
+            .expect("parse wrapped output in a scrolled terminal");
+        assert!(!result.timedOut);
+        assert_eq!(result.exitCode, 0);
+        assert_eq!(
+            result.output,
+            (1..=8)
+                .map(|index| format!("{index:0120}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let failure = host
+            .executeInSession(&session.sessionId, "printf problem; (exit 7)", 5000)
+            .expect("retain command output and its real nonzero status");
+        assert_eq!(failure.output, "problem");
+        assert_eq!(failure.exitCode, 7);
+        let next = host
+            .executeInSession(&session.sessionId, "printf ready", 5000)
+            .expect("execute a subsequent command in the same session");
+        assert_eq!(next.output, "ready");
+        assert_eq!(next.exitCode, 0);
+        assert!(
+            !host
+                .getSessionScreen(&session.sessionId)
+                .unwrap()
+                .commandRunning
+        );
+    }
+
+    /// Submits a multiline script as one command and waits for its final statement.
+    #[test]
+    fn git_bash_multiline_command_waits_for_all_statements() {
+        let host = WindowsTerminalHost::new();
+        let session = host
+            .createOrGetTypedSession("terminal_multiline", "bash")
+            .unwrap();
+        let result = host
+            .executeInSession(
+                &session.sessionId,
+                "OPERIT_V=preserved\nprintf 'first\\n'\nsleep 1\nprintf '%s' \"$OPERIT_V\"",
+                5000,
+            )
+            .unwrap();
+        assert!(!result.timedOut);
+        assert_eq!(result.exitCode, 0);
+        assert_eq!(result.output, "first\npreserved");
+        let next = host
+            .executeInSession(&session.sessionId, "printf '%s' \"$OPERIT_V\"", 3000)
+            .unwrap();
+        assert_eq!(next.output, "preserved");
+    }
+
+    /// Preserves heredocs, Unicode, quotes, and backslashes in one shell submission.
+    #[test]
+    fn git_bash_multiline_heredoc_preserves_script_bytes() {
+        let host = WindowsTerminalHost::new();
+        let session = host
+            .createOrGetTypedSession("terminal_heredoc", "bash")
+            .unwrap();
+        let result = host.executeInSession(
+            &session.sessionId,
+            "OPERIT_V=$(cat <<'EOF'\n中文 'quoted' \\012 $literal\nEOF\n)\nprintf '%s\\n' \"$OPERIT_V\"",
+            5000,
+        ).unwrap();
+        assert!(!result.timedOut);
+        assert_eq!(result.exitCode, 0);
+        assert_eq!(result.output, "中文 'quoted' \\012 $literal");
+    }
+
+    /// Prevents literal script controls from triggering interactive completion or key bindings.
+    #[test]
+    fn git_bash_script_control_characters_reach_the_shell_unchanged() {
+        let host = WindowsTerminalHost::new();
+        let session = host
+            .createOrGetTypedSession("terminal_control_characters", "bash")
+            .unwrap();
+        let result = host
+            .executeInSession(
+                &session.sessionId,
+                "OPERIT_V='a\tb\x1b\u{85}'\nprintf '%s' \"$OPERIT_V\" | base64",
+                5000,
+            )
+            .unwrap();
+        assert!(!result.timedOut);
+        assert_eq!(result.exitCode, 0);
+        assert_eq!(result.output, BASE64_STANDARD.encode("a\tb\x1b\u{85}"));
+    }
+
+    /// Cancels the complete script at its deadline and leaves its session usable.
+    #[test]
+    fn git_bash_multiline_timeout_cancels_remaining_statements() {
+        let host = WindowsTerminalHost::new();
+        let session = host
+            .createOrGetTypedSession("terminal_multiline_timeout", "bash")
+            .unwrap();
+        let started = Instant::now();
+        let result = host
+            .executeInSession(
+                &session.sessionId,
+                "printf 'started\\n'\nsleep 8\nprintf forbidden",
+                800,
+            )
+            .unwrap();
+        assert!(result.timedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let next = host
+            .executeInSession(&session.sessionId, "printf ready", 3000)
+            .unwrap();
+        assert!(!next.timedOut);
+        assert_eq!(next.output, "ready");
+    }
+
+    /// Keeps a quiet child process under the command deadline after multiline submission.
+    #[test]
+    fn git_bash_nested_powershell_timeout_keeps_both_terminal_types_usable() {
+        let host = WindowsTerminalHost::new();
+        let bash = host
+            .createOrGetTypedSession("terminal_nested_powershell", "bash")
+            .unwrap();
+        host.executeInSession(
+            &bash.sessionId,
+            "OPERIT_V=$(cat <<'EOF'\nprepared\nEOF\n)\nprintf '%s\\n' \"$OPERIT_V\"",
+            5000,
+        )
+        .unwrap();
+        let result = host
+            .executeInSession(
+                &bash.sessionId,
+                "powershell -NoProfile -Command 'Start-Sleep -Seconds 8' > /dev/null 2>&1",
+                1800,
+            )
+            .unwrap();
+        assert!(result.timedOut);
+        let next = host
+            .executeInSession(&bash.sessionId, "printf ready", 3000)
+            .unwrap();
+        assert_eq!(next.output, "ready");
+        let powershell = host
+            .createOrGetSession("terminal_after_nested_timeout")
+            .unwrap();
+        let next = host
+            .executeInSession(&powershell.sessionId, "Write-Output ready", 3000)
+            .unwrap();
+        assert_eq!(next.output, "ready");
+    }
+
+    /// Reports the exit status of the last statement in a multiline script.
+    #[test]
+    fn git_bash_multiline_returns_last_exit_status() {
+        let host = WindowsTerminalHost::new();
+        let session = host
+            .createOrGetTypedSession("terminal_multiline_status", "bash")
+            .unwrap();
+        let result = host
+            .executeInSession(&session.sessionId, "printf problem\n(exit 7)", 5000)
+            .unwrap();
+        assert!(!result.timedOut);
+        assert_eq!(result.output, "problem");
+        assert_eq!(result.exitCode, 7);
+    }
+
+    /// Executes every PowerShell statement and retains variables in the session scope.
+    #[test]
+    fn powershell_multiline_command_preserves_session_scope() {
+        let host = WindowsTerminalHost::new();
+        let session = host
+            .createOrGetSession("terminal_powershell_multiline")
+            .unwrap();
+        let result = host.executeInSession(
+            &session.sessionId,
+            "$operit_v = '中文';\nWrite-Output first\nStart-Sleep -Milliseconds 400\nWrite-Output $operit_v",
+            5000,
+        ).unwrap();
+        assert!(!result.timedOut);
+        assert_eq!(result.exitCode, 0);
+        assert_eq!(result.output, "first\n中文");
+        let next = host
+            .executeInSession(&session.sessionId, "Write-Output $operit_v", 3000)
+            .unwrap();
+        assert_eq!(next.output, "中文");
     }
 
     #[test]

@@ -8,14 +8,14 @@ import os
 import zipfile
 from pathlib import Path
 
-from common import DIST_DIR, REPO_ROOT, require_command, run
+from common import DIST_DIR, REPO_ROOT, release_asset_name, require_command, run
 
 
-EDITOR_DIR = REPO_ROOT / "tools" / "esp32-editor"
-FIRMWARE_DIST_DIR = REPO_ROOT / "apps" / "esp32" / "dist"
+EDITOR_DIR = REPO_ROOT / "edge" / "boards" / "esp32" / "editor"
+FIRMWARE_DIST_DIR = REPO_ROOT / "edge" / "boards" / "esp32" / "dist"
 FIRMWARE_MANIFEST = EDITOR_DIR / "generated" / "manifest.json"
-PARTITIONS_FILE = REPO_ROOT / "apps" / "esp32" / "partitions.csv"
-DEFAULT_ARCHIVE_PATH = DIST_DIR / "operit2-esp32-esp32-2432s028.zip"
+PARTITIONS_FILE = REPO_ROOT / "edge" / "boards" / "esp32" / "partitions.csv"
+DEFAULT_ARCHIVE_PATH = DIST_DIR / release_asset_name("firmware", "esp32", "2432s028", "zip")
 IMAGE_SPECS = (
     ("operit-esp32-4mb-full.bin", 0x000000, "initial-flash"),
     ("bootloader.bin", 0x001000, "bootloader"),
@@ -97,7 +97,7 @@ def package_manifest(editor_manifest: dict[str, object], images: list[dict[str, 
         "partitionTable": "partitions.csv",
         "images": images,
     }
-    for key in ("runtimeHash", "sourceHash", "builtAt", "lvgl"):
+    for key in ("runtimeHash", "sourceHash", "builtAt", "renderer"):
         value = editor_manifest.get(key)
         if isinstance(value, str) and value:
             package[key] = value
@@ -119,7 +119,7 @@ def write_archive(archive_path: Path, manifest: dict[str, object]) -> Path:
         "Selective flashing: bootloader.bin at 0x001000, partition-table.bin at 0x008000,\n"
         "and operit-esp32.bin at 0x010000. Use manifest.json for verified offsets and hashes.\n"
         "\n"
-        "Routine UI changes use the ESP32 editor layout deployment and do not reflash this bundle.\n"
+        "The fixed UI requires a firmware rebuild for screen changes; dynamic layout deployment is not supported.\n"
     )
     manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:

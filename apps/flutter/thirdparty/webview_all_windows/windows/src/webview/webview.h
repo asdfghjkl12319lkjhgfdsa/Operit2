@@ -210,9 +210,24 @@ public:
       CookiesRetrievedCallback;
   ~Webview();
 
-  ABI::Windows::UI::Composition::IVisual *const surface() {
-    return surface_.get();
-  }
+  /// Attaches native WebView2 output to an engine-owned DirectComposition visual.
+  bool AttachVisual(IUnknown* visual);
+  /// Updates visibility without enabling any screen capture session.
+  void SetVisible(bool visible);
+  /// Hides native browser windows while their owning application window is hidden.
+  void SetHostVisible(bool visible);
+  /// Transfers keyboard and IME ownership between Flutter and WebView2.
+  bool SetNativeFocus(bool focused);
+  /// Captures a PNG on demand and decodes its pixels to the existing BGRA contract.
+  void CaptureSurfaceFrame(std::function<void(bool, const std::vector<uint8_t>&,
+                                              size_t, size_t)> result);
+
+
+  using LocalResourceReply = std::function<void(int, const std::string&,
+      const std::map<std::string, std::string>&, const std::vector<uint8_t>&)>;
+  using LocalResourceCallback = std::function<void(const std::string&,
+      const std::string&, const std::map<std::string, std::string>&, bool, LocalResourceReply)>;
+  bool SetLocalResourceHandler(LocalResourceCallback callback);
 
   bool IsValid() { return is_valid_; }
 
@@ -344,9 +359,15 @@ public:
   }
 
 private:
+  LocalResourceCallback local_resource_callback_;
+  EventRegistrationToken local_resource_token_{};
+  bool local_resources_registered_ = false;
+
   HWND hwnd_;
   bool owns_window_;
   bool is_valid_ = false;
+  bool content_visible_ = true;
+  bool host_visible_ = true;
   float scale_factor_ = 1.0;
   wil::com_ptr<ICoreWebView2CompositionController> composition_controller_;
   wil::com_ptr<ICoreWebView2Controller3> webview_controller_;
@@ -360,6 +381,7 @@ private:
   VirtualKeyState virtual_keys_;
   WebviewPopupWindowPolicy popup_window_policy_ =
       WebviewPopupWindowPolicy::Allow;
+  bool has_native_focus_ = false;
   bool java_script_alert_dialog_enabled_ = false;
   bool java_script_confirm_dialog_enabled_ = false;
   bool java_script_prompt_dialog_enabled_ = false;
@@ -368,9 +390,7 @@ private:
   size_t surface_width_ = 0;
   size_t surface_height_ = 0;
 
-  winrt::com_ptr<ABI::Windows::UI::Composition::IVisual> surface_;
-  winrt::com_ptr<ABI::Windows::UI::Composition::Desktop::IDesktopWindowTarget>
-      window_target_;
+
 
   WebviewHost *host_;
   EventRegistrations event_registrations_{};
@@ -398,9 +418,7 @@ private:
       wil::com_ptr<ICoreWebView2CompositionController> composition_controller,
       WebviewHost *host, HWND hwnd, bool owns_window, bool offscreen_only);
 
-  bool CreateSurface(
-      winrt::com_ptr<ABI::Windows::UI::Composition::ICompositor> compositor,
-      HWND hwnd, bool offscreen_only);
+
   void RegisterEventHandlers();
   void EnableSecurityUpdates();
   void SendScroll(double offset, bool horizontal, bool control_key_pressed);

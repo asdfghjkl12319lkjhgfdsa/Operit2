@@ -34,11 +34,12 @@ function readLimiterEnabled(): boolean {
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
 }
 
+/** Writes a setting through the owning package environment. */
 async function writeEnvValue(
   key: (typeof ENV_KEYS)[keyof typeof ENV_KEYS],
   value: string
 ): Promise<void> {
-  await Tools.SoftwareSettings.writeEnvironmentVariable(key, value);
+  await Tools.SoftwareSettings.writeEnvironmentVariable("com.operit.context_limiter", key, value);
 }
 
 async function writeFloorLimit(nextLimit: number): Promise<void> {
@@ -49,9 +50,15 @@ async function writeLimiterEnabled(nextEnabled: boolean): Promise<void> {
   await writeEnvValue(ENV_KEYS.enabled, nextEnabled ? "true" : "false");
 }
 
+/** Registers matching send and estimate transformations alongside the settings menu. */
 export function registerToolPkg() {
   ToolPkg.registerPromptFinalizeHook({
     id: HOOK_IDS.finalize,
+    function: onFinalize,
+  });
+
+  ToolPkg.registerPromptEstimateFinalizeHook({
+    id: HOOK_IDS.estimateFinalize,
     function: onFinalize,
   });
 

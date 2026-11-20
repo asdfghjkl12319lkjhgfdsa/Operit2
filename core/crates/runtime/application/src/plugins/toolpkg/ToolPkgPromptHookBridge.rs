@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde_json::Value;
 
 use crate::plugins::toolpkg::ToolPkgHookBridgeSupport::ToolPkgBridgeRuntime;
+use super::ToolPkgToolLifecycleBridge::ToolPkgToolLifecycleBridge;
 use crate::plugins::toolpkg::ToolPkgPreHookTimeout::ToolPkgPreHookTimeout;
 use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
 use operit_plugin_sdk::toolpkg::ToolPkgCommonPluginConstants::{
@@ -17,12 +18,11 @@ use operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgContainerRuntime;
 use operit_providers::chat::hooks::PromptHookRegistry::{
     PromptEstimateFinalizeHook, PromptEstimateHistoryHook, PromptFinalizeHook, PromptHistoryHook,
     PromptHookContext, PromptHookMutation, PromptHookRegistry, PromptInputHook,
-    SystemPromptComposeHook, ToolPromptComposeHook,
+    SystemPromptComposeHook, ToolPromptComposeHook, ToolPromptHookFuture,
 };
-use operit_util::AppLogger::AppLogger;
+use operit_tools::ToolExecutionManager::ToolExecutionManager;
+use operit_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager;
 use operit_util::ChainLogger::{self, PLUGIN_CHAIN};
-
-const TAG: &str = "ToolPkgPromptHookBridge";
 
 static PROMPT_INPUT_HOOKS: OnceLock<Mutex<Vec<ToolPkgPromptHookRegistration>>> = OnceLock::new();
 static PROMPT_HISTORY_HOOKS: OnceLock<Mutex<Vec<ToolPkgPromptHookRegistration>>> = OnceLock::new();
@@ -66,8 +66,9 @@ impl ToolPkgPromptHookBridge {
         ));
     }
 
+    /// Synchronizes this bridge from the committed active package catalog.
     #[allow(non_snake_case)]
-    pub fn syncToolPkgRegistrations(activeContainers: Vec<ToolPkgContainerRuntime>) {
+    pub fn syncToolPkgRegistrations(activeContainers: &[ToolPkgContainerRuntime]) {
         replace_hooks(
             PROMPT_INPUT_HOOKS.get_or_init(|| Mutex::new(Vec::new())),
             activeContainers
@@ -124,18 +125,15 @@ impl ToolPkgPromptHookBridge {
     }
 }
 
+/// Stores prompt hooks in the committed scope and user order.
 fn replace_hooks(
     target: &Mutex<Vec<ToolPkgPromptHookRegistration>>,
-    mut updated: Vec<ToolPkgPromptHookRegistration>,
+    updated: Vec<ToolPkgPromptHookRegistration>,
 ) {
-    updated.sort_by(|left, right| {
-        left.containerPackageName
-            .cmp(&right.containerPackageName)
-            .then(left.hookId.cmp(&right.hookId))
-    });
     *target.lock().expect("toolpkg prompt hook mutex poisoned") = updated;
 }
 
+/// Expands one owner's prompt hooks in manifest order.
 fn registrations(
     container: &ToolPkgContainerRuntime,
     hooks: &[operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgFunctionHookRuntime],
@@ -149,13 +147,6 @@ fn registrations(
             functionSource: hook.functionSource.clone(),
         })
         .collect()
-}
-
-/// Reports a timed-out ToolPkg prompt hook through the active send turn's Toast callback.
-fn report_prompt_hook_timeout(context: &PromptHookContext, hook: &ToolPkgPromptHookRegistration) {
-    if let Some(callback) = context.on_hook_timeout.as_ref() {
-        callback(format!("{}:{}", hook.containerPackageName, hook.hookId));
-    }
 }
 
 struct PromptInputBridge {
@@ -187,13 +178,14 @@ macro_rules! prompt_bridge {
                 $id
             }
 
-            fn on_event(&self, context: &PromptHookContext) -> Option<PromptHookMutation> {
-                dispatch_prompt_hooks(
+            /// Awaits the ToolPkg mutation on the Host-owned execution boundary.
+            fn on_event_async<'a>(&'a self, context: &'a PromptHookContext) -> operit_providers::chat::hooks::PromptHookRegistry::PromptHookFuture<'a> {
+                Box::pin(async move { dispatch_prompt_hooks(
                     &self.runtime,
                     $hooks.get_or_init(|| Mutex::new(Vec::new())),
                     $event,
                     context,
-                )
+                ).await })
             }
         }
     };
@@ -227,13 +219,102 @@ prompt_bridge!(
     SYSTEM_PROMPT_COMPOSE_HOOKS,
     TOOLPKG_EVENT_SYSTEM_PROMPT_COMPOSE
 );
-prompt_bridge!(
-    ToolPromptComposeBridge,
-    ToolPromptComposeHook,
-    "builtin.toolpkg.tool-prompt-compose-bridge",
-    TOOL_PROMPT_COMPOSE_HOOKS,
-    TOOLPKG_EVENT_TOOL_PROMPT_COMPOSE
-);
+impl ToolPromptComposeHook for ToolPromptComposeBridge {
+    /// Identifies the existing ToolPkg bridge for the real tool-prompt policy dispatcher.
+    fn id(&self) -> &str {
+        "builtin.toolpkg.tool-prompt-compose-bridge"
+    }
+
+    /// Awaits enabled owner-isolated policies and propagates any invoked handler failure.
+    fn on_event_async<'a>(&'a self, context: &'a PromptHookContext) -> ToolPromptHookFuture<'a> {
+        let executionContext = ToolExecutionManager::currentToolRuntimeContext();
+        Box::pin(async move {
+            let manager = RuntimePackageManager::readySnapshot(
+                self.runtime.tool_handler().getOrCreatePackageManager(),
+            )
+            .await?;
+            ToolPkgToolLifecycleBridge::validateExecutionContext(
+                &manager,
+                executionContext.as_ref(),
+            )?;
+            let budget = ToolPkgPreHookTimeout::forStage(&context.stage)?;
+            let mut current = context.clone();
+            let mut combined = PromptHookMutation::default();
+            let mut changed = false;
+            for container in manager.getEnabledToolPkgContainerRuntimes() {
+                for hook in container.toolPromptComposeHooks {
+                    let ownerContext = ToolPkgToolLifecycleBridge::executionContextForOwner(
+                        &manager, executionContext.as_ref(), &container.packageName,
+                    )?;
+                    let mut payload = prompt_context_to_value(&current);
+                    payload["metadata"]["executionContext"] = ownerContext;
+                    let raw = ToolPkgPreHookTimeout::runHook(
+                        budget.as_ref(),
+                        &manager,
+                        &container.packageName,
+                        &hook.function,
+                        TOOLPKG_EVENT_TOOL_PROMPT_COMPOSE,
+                        &current.stage,
+                        &hook.id,
+                        hook.functionSource.as_deref(),
+                        payload,
+                    )
+                    .await?;
+                    if let Some(mutation) = decode_tool_prompt_policy_result(raw)? {
+                        apply_prompt_mutation(&mut current, mutation.clone());
+                        merge_prompt_mutation(&mut combined, mutation);
+                        changed = true;
+                    }
+                }
+            }
+            Ok(if changed { Some(combined) } else { None })
+        })
+    }
+}
+
+/// Strictly decodes an invoked tool policy without converting malformed fields into absent mutations.
+pub(super) fn decode_tool_prompt_policy_result(raw: Option<String>) -> Result<Option<PromptHookMutation>, String> {
+    let Some(raw) = raw else { return Ok(None); };
+    // The JavaScript engine encodes a valid undefined/void hook result as an empty string.
+    if raw.is_empty() { return Ok(None); }
+    let value: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    match value {
+        Value::Null => Ok(None),
+        Value::String(prompt) => Ok(Some(PromptHookMutation {
+            tool_prompt: Some(prompt), ..PromptHookMutation::default()
+        })),
+        Value::Object(mut object) => {
+            let mut mutation = PromptHookMutation::default();
+            for (key, target) in [
+                ("rawInput", &mut mutation.raw_input),
+                ("processedInput", &mut mutation.processed_input),
+                ("systemPrompt", &mut mutation.system_prompt),
+                ("toolPrompt", &mut mutation.tool_prompt),
+            ] {
+                if let Some(value) = object.remove(key) {
+                    *target = Some(serde_json::from_value::<String>(value).map_err(|error| format!("Tool-prompt policy {key}: {error}"))?);
+                }
+            }
+            if let Some(value) = object.remove("availableTools") {
+                mutation.available_tools = Some(serde_json::from_value(value).map_err(|error| format!("Tool-prompt policy availableTools: {error}"))?);
+            }
+            if let Some(value) = object.remove("chatHistory") {
+                mutation.chat_history = Some(serde_json::from_value(value).map_err(|error| format!("Tool-prompt policy chatHistory: {error}"))?);
+            }
+            if let Some(value) = object.remove("preparedHistory") {
+                mutation.prepared_history = Some(serde_json::from_value(value).map_err(|error| format!("Tool-prompt policy preparedHistory: {error}"))?);
+            }
+            if let Some(value) = object.remove("metadata") {
+                mutation.metadata = serde_json::from_value(value).map_err(|error| format!("Tool-prompt policy metadata: {error}"))?;
+                if mutation.metadata.contains_key("executionContext") {
+                    return Err("Tool-prompt policy cannot replace its authenticated executionContext".to_string());
+                }
+            }
+            Ok(Some(mutation))
+        }
+        _ => Err("Tool-prompt policy result must be a string, object, explicit null or void".to_string()),
+    }
+}
 prompt_bridge!(
     PromptFinalizeBridge,
     PromptFinalizeHook,
@@ -249,12 +330,13 @@ prompt_bridge!(
     TOOLPKG_EVENT_PROMPT_ESTIMATE_FINALIZE
 );
 
-fn dispatch_prompt_hooks(
+/// Runs prompt handlers under their declared stage policy and propagates failures.
+async fn dispatch_prompt_hooks(
     runtime: &ToolPkgBridgeRuntime,
     hooks: &Mutex<Vec<ToolPkgPromptHookRegistration>>,
     event: &str,
     context: &PromptHookContext,
-) -> Option<PromptHookMutation> {
+) -> Result<Option<PromptHookMutation>, String> {
     let snapshot = hooks
         .lock()
         .expect("toolpkg prompt hook mutex poisoned")
@@ -263,22 +345,9 @@ fn dispatch_prompt_hooks(
     let mut mutation = PromptHookMutation::default();
     let mut changed = false;
     let package_manager = runtime.package_manager();
-    let budget = ToolPkgPreHookTimeout::fromPreferences();
+    let budget = ToolPkgPreHookTimeout::forStage(&context.stage)?;
     for hook in snapshot {
-        let Some(timeoutMillis) = budget.remainingTimeoutMillis() else {
-            report_prompt_hook_timeout(&current, &hook);
-            ChainLogger::error(
-                PLUGIN_CHAIN,
-                "plugin.toolpkg.prompt.timeout",
-                &[
-                    ("event", event.to_string()),
-                    ("stage", current.stage.clone()),
-                    ("phase", "before_hook".to_string()),
-                ],
-            );
-            break;
-        };
-        ChainLogger::info(
+        ChainLogger::verbose_with_level(
             PLUGIN_CHAIN,
             "plugin.toolpkg.prompt.run.start",
             &[
@@ -288,69 +357,26 @@ fn dispatch_prompt_hooks(
                 ("hookId", hook.hookId.clone()),
                 ("function", hook.functionName.clone()),
             ],
+            operit_util::AppLogger::VERBOSE_LEVEL_3,
         );
-        let raw = package_manager.runToolPkgMainHookWithTimeoutMillis(
+        let raw = ToolPkgPreHookTimeout::runHook(
+            budget.as_ref(),
+            &package_manager,
             &hook.containerPackageName,
             &hook.functionName,
             event,
-            Some(&current.stage),
-            Some(&hook.hookId),
+            &current.stage,
+            &hook.hookId,
             hook.functionSource.as_deref(),
             prompt_context_to_value(&current),
-            None,
-            None,
-            None,
-            timeoutMillis,
-        );
-        let hookTimedOut = raw
-            .as_ref()
-            .err()
-            .map(|error| ToolPkgPreHookTimeout::isTimeoutError(error))
-            .unwrap_or(false);
-        if hookTimedOut || budget.hasExpired() {
-            report_prompt_hook_timeout(&current, &hook);
-            ChainLogger::error(
-                PLUGIN_CHAIN,
-                "plugin.toolpkg.prompt.timeout",
-                &[
-                    ("event", event.to_string()),
-                    ("stage", current.stage.clone()),
-                    ("package", hook.containerPackageName.clone()),
-                    ("hookId", hook.hookId.clone()),
-                ],
-            );
-            break;
-        }
-        let result = match raw {
-            Ok(raw) => decodeToolPkgHookResult(raw),
-            Err(error) => {
-                ChainLogger::error(
-                    PLUGIN_CHAIN,
-                    "plugin.toolpkg.prompt.run.error",
-                    &[
-                        ("event", event.to_string()),
-                        ("stage", current.stage.clone()),
-                        ("package", hook.containerPackageName.clone()),
-                        ("hookId", hook.hookId.clone()),
-                        ("function", hook.functionName.clone()),
-                        ("error", error.clone()),
-                    ],
-                );
-                AppLogger::e(
-                    TAG,
-                    &format!(
-                        "ToolPkg prompt hook failed: {}:{} {}",
-                        hook.containerPackageName, hook.hookId, error
-                    ),
-                );
-                None
-            }
-        };
+        )
+        .await?;
+        let result = decodeToolPkgHookResult(raw);
         if let Some(next_mutation) = parse_prompt_hook_result(event, result.as_ref(), &current) {
             apply_prompt_mutation(&mut current, next_mutation.clone());
             merge_prompt_mutation(&mut mutation, next_mutation);
             changed = true;
-            ChainLogger::info(
+            ChainLogger::verbose_with_level(
                 PLUGIN_CHAIN,
                 "plugin.toolpkg.prompt.run.changed",
                 &[
@@ -359,9 +385,10 @@ fn dispatch_prompt_hooks(
                     ("package", hook.containerPackageName.clone()),
                     ("hookId", hook.hookId.clone()),
                 ],
+                operit_util::AppLogger::VERBOSE_LEVEL_3,
             );
         } else {
-            ChainLogger::info(
+            ChainLogger::verbose_with_level(
                 PLUGIN_CHAIN,
                 "plugin.toolpkg.prompt.run.done",
                 &[
@@ -371,14 +398,11 @@ fn dispatch_prompt_hooks(
                     ("hookId", hook.hookId.clone()),
                     ("changed", ChainLogger::boolField(false)),
                 ],
+                operit_util::AppLogger::VERBOSE_LEVEL_3,
             );
         }
     }
-    if changed {
-        Some(mutation)
-    } else {
-        None
-    }
+    Ok(if changed { Some(mutation) } else { None })
 }
 
 /// Serializes prompt histories and omits absent optional fields for the plugin SDK contract.
@@ -432,8 +456,27 @@ mod payload_tests {
         assert_eq!(payload["promptFunctionType"], "VOICE");
         assert_eq!(payload["useEnglish"], false);
     }
+
+    /// Lets plugins clear complete fields while retaining exact whitespace and omitted fields.
+    #[test]
+    fn explicit_empty_prompt_replacements_are_not_omissions() {
+        let empty = parse_prompt_object_result(&serde_json::json!({
+            "rawInput": "", "processedInput": "", "systemPrompt": "", "toolPrompt": " \n"
+        }).as_object().unwrap());
+        assert_eq!(empty.raw_input.as_deref(), Some(""));
+        assert_eq!(empty.processed_input.as_deref(), Some(""));
+        assert_eq!(empty.system_prompt.as_deref(), Some(""));
+        assert_eq!(empty.tool_prompt.as_deref(), Some(" \n"));
+        let omitted = parse_prompt_object_result(&serde_json::Map::new());
+        assert!(omitted.processed_input.is_none());
+        for event in [TOOLPKG_EVENT_PROMPT_INPUT, TOOLPKG_EVENT_PROMPT_FINALIZE,
+            TOOLPKG_EVENT_PROMPT_ESTIMATE_FINALIZE] {
+            assert_eq!(parse_prompt_string_result(event, "").unwrap().processed_input.as_deref(), Some(""));
+        }
+    }
 }
 
+/// Decodes a mutation while preserving explicit empty text replacements.
 fn parse_prompt_hook_result(
     event: &str,
     decoded: Option<&Value>,
@@ -447,10 +490,8 @@ fn parse_prompt_hook_result(
     }
 }
 
+/// Maps a string result to the text field owned by the current hook family.
 fn parse_prompt_string_result(event: &str, value: &str) -> Option<PromptHookMutation> {
-    if value.trim().is_empty() {
-        return None;
-    }
     let mut mutation = PromptHookMutation::default();
     match event {
         TOOLPKG_EVENT_PROMPT_INPUT
@@ -492,19 +533,18 @@ fn parse_prompt_array_result(
     Some(mutation)
 }
 
+/// Distinguishes omitted fields from explicitly cleared fields.
 fn parse_prompt_object_result(object: &serde_json::Map<String, Value>) -> PromptHookMutation {
     let mut mutation = PromptHookMutation::default();
     if let Some(value) = object
         .get("rawInput")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
     {
         mutation.raw_input = Some(value.to_string());
     }
     if let Some(value) = object
         .get("processedInput")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
     {
         mutation.processed_input = Some(value.to_string());
     }
@@ -517,14 +557,12 @@ fn parse_prompt_object_result(object: &serde_json::Map<String, Value>) -> Prompt
     if let Some(value) = object
         .get("systemPrompt")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
     {
         mutation.system_prompt = Some(value.to_string());
     }
     if let Some(value) = object
         .get("toolPrompt")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
     {
         mutation.tool_prompt = Some(value.to_string());
     }
@@ -646,5 +684,53 @@ fn apply_prompt_mutation(current: &mut PromptHookContext, mutation: PromptHookMu
     }
     if !mutation.metadata.is_empty() {
         current.metadata.extend(mutation.metadata);
+    }
+}
+
+#[cfg(test)]
+mod tool_policy_result_tests {
+    use super::decode_tool_prompt_policy_result;
+
+    /// Keeps shared owners ahead of local owners even when their names sort in the opposite order.
+    #[test]
+    fn prompt_registration_preserves_committed_owner_order() {
+        let owners = ["z.shared", "b.shared", "a.device"];
+        let target = std::sync::Mutex::new(Vec::new());
+        super::replace_hooks(&target, owners.iter().map(|owner| {
+            operit_plugin_sdk::toolpkg::ToolPkgHooks::ToolPkgPromptHookRegistration {
+                containerPackageName: (*owner).into(), hookId: "compose".into(),
+                functionName: "compose".into(), functionSource: None,
+            }
+        }).collect());
+        let hooks = target.lock().unwrap();
+        assert_eq!(hooks.iter().map(|hook| hook.containerPackageName.as_str()).collect::<Vec<_>>(), owners);
+    }
+
+    /// Rejects malformed invoked policies instead of treating invalid output as permission to continue.
+    #[test]
+    fn rejects_malformed_policy_results() {
+        for raw in [
+            " ", "not-json", "17", "true", "[]",
+            r#"{"toolPrompt":null}"#,
+            r#"{"availableTools":{}}"#,
+            r#"{"availableTools":[17]}"#,
+            r#"{"chatHistory":"invalid"}"#,
+            r#"{"preparedHistory":[{"kind":"invalid"}]}"#,
+            r#"{"metadata":null}"#,
+            r#"{"metadata":{"executionContext":null}}"#,
+        ] {
+            assert!(decode_tool_prompt_policy_result(Some(raw.to_string())).is_err(), "{raw}");
+        }
+    }
+
+    /// Distinguishes an explicit no-contribution result from valid exact JSON mutations.
+    #[test]
+    fn preserves_explicit_nonparticipation_and_exact_tool_mutations() {
+        assert!(decode_tool_prompt_policy_result(None).unwrap().is_none());
+        assert!(decode_tool_prompt_policy_result(Some(String::new())).unwrap().is_none());
+        assert!(decode_tool_prompt_policy_result(Some("null".to_string())).unwrap().is_none());
+        let mutation = decode_tool_prompt_policy_result(Some(r#"{"toolPrompt":" exact prompt ","availableTools":[]}"#.to_string())).unwrap().unwrap();
+        assert_eq!(mutation.tool_prompt.as_deref(), Some(" exact prompt "));
+        assert_eq!(mutation.available_tools, Some(Vec::new()));
     }
 }

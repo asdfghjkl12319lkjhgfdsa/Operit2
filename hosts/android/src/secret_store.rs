@@ -22,6 +22,19 @@ fn jniHostError(action: &str, error: impl std::fmt::Display) -> HostError {
     ))
 }
 
+/// Converts a Java callback failure and clears its pending exception before returning to Rust.
+fn jniSecretCallError(env: &mut jni::JNIEnv<'_>, action: &str, error: jni::errors::Error) -> HostError {
+    let exception = env.exception_occurred().ok();
+    let _ = env.exception_clear();
+    let detail = exception.filter(|exception| !exception.is_null()).and_then(|exception| {
+        let message = env.call_method(exception, "toString", "()Ljava/lang/String;", &[]).ok()?.l().ok()?;
+        let message = JString::from(message);
+        env.get_string(&message).ok().map(String::from)
+    });
+    let _ = env.exception_clear();
+    jniHostError(action, detail.unwrap_or_else(|| error.to_string()))
+}
+
 /// Registers the Java host used by Android host secret store calls.
 pub fn setAndroidHostSecretStoreBridge(vm: JavaVM, host: GlobalRef) -> HostResult<()> {
     let mut guard = androidHostSecretStoreBridgeSlot()
@@ -58,9 +71,7 @@ pub(crate) fn androidHostSystemLanguageCode() -> HostResult<String> {
 impl AndroidHostSecretStoreBridge {
     /// Reads the system language code from the Java Android runtime host.
     pub fn systemLanguageCode(&self) -> HostResult<String> {
-        let mut env = self
-            .vm
-            .attach_current_thread()
+        let mut env = crate::attachCurrentThread(&self.vm)
             .map_err(|error| jniHostError("attaching current thread", error))?;
         let value = env
             .call_method(
@@ -87,9 +98,7 @@ impl AndroidHostSecretStoreBridge {
 
     /// Reads secret bytes from the Java Android host.
     pub fn readSecret(&self, key: &str) -> HostResult<Option<Vec<u8>>> {
-        let mut env = self
-            .vm
-            .attach_current_thread()
+        let mut env = crate::attachCurrentThread(&self.vm)
             .map_err(|error| jniHostError("attaching current thread", error))?;
         let key = env
             .new_string(key)
@@ -102,7 +111,7 @@ impl AndroidHostSecretStoreBridge {
                 "(Ljava/lang/String;)[B",
                 &[JValue::Object(&keyObject)],
             )
-            .map_err(|error| jniHostError("reading secret", error))?;
+            .map_err(|error| jniSecretCallError(&mut env, "reading secret", error))?;
         let object = value
             .l()
             .map_err(|error| jniHostError("reading secret result", error))?;
@@ -117,9 +126,7 @@ impl AndroidHostSecretStoreBridge {
 
     /// Writes secret bytes through the Java Android host.
     pub fn writeSecret(&self, key: &str, content: &[u8]) -> HostResult<()> {
-        let mut env = self
-            .vm
-            .attach_current_thread()
+        let mut env = crate::attachCurrentThread(&self.vm)
             .map_err(|error| jniHostError("attaching current thread", error))?;
         let key = env
             .new_string(key)
@@ -135,15 +142,13 @@ impl AndroidHostSecretStoreBridge {
             "(Ljava/lang/String;[B)V",
             &[JValue::Object(&keyObject), JValue::Object(&contentObject)],
         )
-        .map_err(|error| jniHostError("writing secret", error))?;
+        .map_err(|error| jniSecretCallError(&mut env, "writing secret", error))?;
         Ok(())
     }
 
     /// Deletes secret bytes through the Java Android host.
     pub fn deleteSecret(&self, key: &str) -> HostResult<()> {
-        let mut env = self
-            .vm
-            .attach_current_thread()
+        let mut env = crate::attachCurrentThread(&self.vm)
             .map_err(|error| jniHostError("attaching current thread", error))?;
         let key = env
             .new_string(key)
@@ -155,7 +160,7 @@ impl AndroidHostSecretStoreBridge {
             "(Ljava/lang/String;)V",
             &[JValue::Object(&keyObject)],
         )
-        .map_err(|error| jniHostError("deleting secret", error))?;
+        .map_err(|error| jniSecretCallError(&mut env, "deleting secret", error))?;
         Ok(())
     }
 
@@ -164,9 +169,7 @@ impl AndroidHostSecretStoreBridge {
         &self,
         schedules: &[HostRuntimeEventSchedule],
     ) -> HostResult<()> {
-        let mut env = self
-            .vm
-            .attach_current_thread()
+        let mut env = crate::attachCurrentThread(&self.vm)
             .map_err(|error| jniHostError("attaching current thread", error))?;
         let schedulesJson = serde_json::to_string(schedules)
             .map_err(|error| jniHostError("encoding runtime event schedules", error))?;

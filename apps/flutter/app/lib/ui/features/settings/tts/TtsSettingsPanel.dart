@@ -12,6 +12,7 @@ import '../../../common/components/M3LoadingIndicator.dart';
 import '../../../theme/OperitFormStyles.dart';
 import '../../../theme/OperitGlassSurface.dart';
 import '../../chat/tts/TtsPlaybackController.dart';
+import '../components/ApiKeyTextField.dart';
 import '../components/SettingsControlStyles.dart';
 
 part 'TtsProviderWidgets.dart';
@@ -21,7 +22,6 @@ part 'SttProviderWidgets.dart';
 part 'SttProviderDialogs.dart';
 
 const String _ttsTestText = '你好，我是 Operit 的语音试听。';
-
 
 /// Section widget that manages TTS providers and voices.
 class TtsProviderSection extends StatefulWidget {
@@ -41,6 +41,7 @@ class TtsProviderSection extends StatefulWidget {
 
 class _TtsProviderSectionState extends State<TtsProviderSection> {
   Future<_TtsSectionData>? _future;
+  late String _currentTtsConfigId;
   String? _testingTtsConfigId;
   final Set<String> _expandedProviderKeys = <String>{};
   bool _providerExpansionInitialized = false;
@@ -57,6 +58,7 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
     });
   }
 
+  /// Loads provider data and initializes the independently updated selection.
   Future<_TtsSectionData> _loadData() async {
     final ttsManager = widget.clients.preferencesTtsConfigManager;
     final ttsConfigs = await ttsManager.getAllTtsConfigs();
@@ -66,28 +68,26 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
     if (ttsProviderCatalogEntries.isEmpty) {
       throw StateError('TTS provider catalog is empty');
     }
-    final characterCards = await widget.clients.preferencesCharacterCardManager
-        .getAllCharacterCards();
-    final characterBoundConfigIds = characterCards
-        .map((card) => card.ttsConfigId?.trim())
-        .whereType<String>()
-        .where((id) => id.isNotEmpty)
-        .toSet();
+    _currentTtsConfigId = currentTtsConfigId;
     return _TtsSectionData(
       configs: ttsConfigs,
-      currentConfigId: currentTtsConfigId,
       providerCatalogEntries: ttsProviderCatalogEntries,
-      characterBoundConfigIds: characterBoundConfigIds,
     );
-  }
-  Future<void> _setCurrentTtsConfigId(String id) async {
-    await widget.clients.preferencesTtsConfigManager.setCurrentTtsConfigId(
-      id: id,
-    );
-    _reload();
   }
 
-  Future<void> _testTtsConfig(core_proxy.TtsConfig config) async {
+  /// Updates the persisted selection without replacing the expanded provider tree.
+  Future<void> _setCurrentTtsConfigId(String id) async {
+    final currentConfigId = await widget.clients.preferencesTtsConfigManager
+        .setCurrentTtsConfigId(id: id);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _currentTtsConfigId = currentConfigId;
+    });
+  }
+
+  Future<void> _testTtsConfig(core_proxy.CoreOperitModelTtsConfigTtsConfig config) async {
     final configId = config.id.trim();
     if (configId.isEmpty) {
       ScaffoldMessenger.of(
@@ -128,7 +128,7 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
     }
   }
 
-  Future<void> _save(core_proxy.TtsConfig config) async {
+  Future<void> _save(core_proxy.CoreOperitModelTtsConfigTtsConfig config) async {
     final manager = widget.clients.preferencesTtsConfigManager;
     if (config.id.isEmpty) {
       await manager.createTtsConfig(config: config);
@@ -138,18 +138,13 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
     _reload();
   }
 
+  /// Deletes an independent voice configuration while protecting the current one.
   Future<void> _delete(
-    core_proxy.TtsConfig config,
+    core_proxy.CoreOperitModelTtsConfigTtsConfig config,
     String currentConfigId,
-    Set<String> characterBoundConfigIds,
   ) async {
     final l10n = AppLocalizations.of(context)!;
-    if (_ttsConfigDeleteBlockedReason(
-          config,
-          currentConfigId,
-          characterBoundConfigIds,
-          l10n,
-        )
+    if (_ttsConfigDeleteBlockedReason(config, currentConfigId, l10n)
         case final reason?) {
       if (!mounted) {
         return;
@@ -187,10 +182,10 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
     await _save(edited);
   }
 
+  /// Opens the independent voice editor with current-selection deletion protection.
   Future<void> _openVoiceEditor(
-    core_proxy.TtsConfig config,
+    core_proxy.CoreOperitModelTtsConfigTtsConfig config,
     String currentConfigId,
-    Set<String> characterBoundConfigIds,
   ) async {
     final l10n = AppLocalizations.of(context)!;
     final result = await _TtsVoiceConfigDialog.show(
@@ -199,7 +194,6 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
       deleteBlockedReason: _ttsConfigDeleteBlockedReason(
         config,
         currentConfigId,
-        characterBoundConfigIds,
         l10n,
       ),
       onTest: () => _testTtsConfig(config),
@@ -211,7 +205,7 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
       case _TtsVoiceEditSaved(:final config):
         await _save(config);
       case _TtsVoiceEditDeleted():
-        await _delete(config, currentConfigId, characterBoundConfigIds);
+        await _delete(config, currentConfigId);
     }
   }
 
@@ -266,7 +260,7 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
   }
 
   Future<void> _createCustomTtsVoice(
-    core_proxy.TtsConfig providerConfig,
+    core_proxy.CoreOperitModelTtsConfigTtsConfig providerConfig,
   ) async {
     final result = await _CustomTtsVoiceDialog.show(
       context: context,
@@ -292,7 +286,6 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
     _TtsProviderGroup group,
     List<core_proxy.TtsProviderCatalogEntry> providerCatalogEntries,
     String currentConfigId,
-    Set<String> characterBoundConfigIds,
   ) async {
     final l10n = AppLocalizations.of(context)!;
     final result = await _TtsProviderDialog.show(
@@ -302,7 +295,6 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
       deleteBlockedReason: _ttsProviderGroupDeleteBlockedReason(
         group,
         currentConfigId,
-        characterBoundConfigIds,
         l10n,
       ),
     );
@@ -315,7 +307,7 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
         final now = DateTime.now().millisecondsSinceEpoch;
         for (final config in group.configs) {
           await manager.updateTtsConfig(
-            config: core_proxy.TtsConfig(
+            config: core_proxy.CoreOperitModelTtsConfigTtsConfig(
               id: config.id,
               name: values.name,
               providerType: values.providerType,
@@ -339,11 +331,7 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
         _expandedProviderKeys.clear();
         _reload();
       case _TtsProviderEditDeleted():
-        await _confirmDeleteTtsProvider(
-          group,
-          currentConfigId,
-          characterBoundConfigIds,
-        );
+        await _confirmDeleteTtsProvider(group, currentConfigId);
     }
   }
 
@@ -351,7 +339,6 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
   Future<void> _confirmDeleteTtsProvider(
     _TtsProviderGroup group,
     String currentConfigId,
-    Set<String> characterBoundConfigIds,
   ) async {
     final l10n = AppLocalizations.of(context)!;
     final confirmed = await showDialog<bool>(
@@ -380,20 +367,18 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
     if (confirmed != true) {
       return;
     }
-    await _deleteTtsProvider(group, currentConfigId, characterBoundConfigIds);
+    await _deleteTtsProvider(group, currentConfigId);
   }
 
-  /// Deletes every voice configuration that belongs to one unreferenced provider.
+  /// Deletes one independent provider while protecting its current TTS configuration.
   Future<void> _deleteTtsProvider(
     _TtsProviderGroup group,
     String currentConfigId,
-    Set<String> characterBoundConfigIds,
   ) async {
     final l10n = AppLocalizations.of(context)!;
     final blockedReason = _ttsProviderGroupDeleteBlockedReason(
       group,
       currentConfigId,
-      characterBoundConfigIds,
       l10n,
     );
     if (blockedReason != null) {
@@ -450,6 +435,7 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
     });
   }
 
+  /// Builds the provider tree while keeping selection changes out of loading state.
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<_TtsSectionData>(
@@ -462,40 +448,36 @@ class _TtsProviderSectionState extends State<TtsProviderSection> {
           return Center(child: Text('语音配置加载失败：${snapshot.error}'));
         }
         final data = snapshot.data!;
+        final currentConfigId = _currentTtsConfigId;
         final groups = _ttsProviderGroups(data.configs);
-        _initializeProviderExpansion(groups, data.currentConfigId);
+        _initializeProviderExpansion(groups, currentConfigId);
         return _SectionCard(
           title: 'TTS 供应商',
           icon: Icons.record_voice_over_outlined,
           initiallyExpanded: widget.initiallyExpanded,
           action: SettingsSectionAddButton(
             tooltip: '添加 TTS 供应商',
-            onPressed: () =>
-                _createProviderConfig(data.providerCatalogEntries),
+            onPressed: () => _createProviderConfig(data.providerCatalogEntries),
           ),
-              children: <Widget>[
-                _TtsProviderManager(
-                  groups: groups,
-                  currentConfigId: data.currentConfigId,
-                  testingConfigId: _testingTtsConfigId,
-                  expandedProviderKeys: _expandedProviderKeys,
-                  onToggleProviderExpanded: _toggleProviderExpanded,
-                  onAddVoice: _addProviderVoice,
-                  onEditProvider: (group) => _editProvider(
-                    group,
-                    data.providerCatalogEntries,
-                    data.currentConfigId,
-                    data.characterBoundConfigIds,
-                  ),
-                  onEditConfig: (config) => _openVoiceEditor(
-                    config,
-                    data.currentConfigId,
-                    data.characterBoundConfigIds,
-                  ),
-                  onTestConfig: _testTtsConfig,
-                  onSetCurrent: _setCurrentTtsConfigId,
-                ),
-              ],
+          children: <Widget>[
+            _TtsProviderManager(
+              groups: groups,
+              currentConfigId: currentConfigId,
+              testingConfigId: _testingTtsConfigId,
+              expandedProviderKeys: _expandedProviderKeys,
+              onToggleProviderExpanded: _toggleProviderExpanded,
+              onAddVoice: _addProviderVoice,
+              onEditProvider: (group) => _editProvider(
+                group,
+                data.providerCatalogEntries,
+                currentConfigId,
+              ),
+              onEditConfig: (config) =>
+                  _openVoiceEditor(config, currentConfigId),
+              onTestConfig: _testTtsConfig,
+              onSetCurrent: _setCurrentTtsConfigId,
+            ),
+          ],
         );
       },
     );
@@ -548,6 +530,7 @@ class _SttProviderSectionState extends State<SttProviderSection> {
       sttProviderCatalogEntries: sttProviderCatalogEntries,
     );
   }
+
   /// Selects the global STT provider configuration.
   Future<void> _setCurrentSttConfigId(String id) async {
     await _runSttOperation(() async {
@@ -659,6 +642,7 @@ class _SttProviderSectionState extends State<SttProviderSection> {
       ).showSnackBar(SnackBar(content: Text('STT 操作失败：$error')));
     }
   }
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<_SttSectionData>(
@@ -680,19 +664,19 @@ class _SttProviderSectionState extends State<SttProviderSection> {
             onPressed: () =>
                 _createSttProviderConfig(data.sttProviderCatalogEntries),
           ),
-              children: <Widget>[
-                _SttProviderManager(
-                  configs: data.sttConfigs,
-                  currentConfigId: data.currentSttConfigId,
-                  onEdit: (config) => _editSttProviderConfig(
-                    config,
-                    data.sttProviderCatalogEntries,
-                  ),
-                  onDelete: (config) =>
-                      _deleteSttProviderConfig(config, data.currentSttConfigId),
-                  onSetCurrent: _setCurrentSttConfigId,
-                ),
-              ],
+          children: <Widget>[
+            _SttProviderManager(
+              configs: data.sttConfigs,
+              currentConfigId: data.currentSttConfigId,
+              onEdit: (config) => _editSttProviderConfig(
+                config,
+                data.sttProviderCatalogEntries,
+              ),
+              onDelete: (config) =>
+                  _deleteSttProviderConfig(config, data.currentSttConfigId),
+              onSetCurrent: _setCurrentSttConfigId,
+            ),
+          ],
         );
       },
     );

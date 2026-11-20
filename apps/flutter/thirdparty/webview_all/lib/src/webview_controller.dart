@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart'
@@ -17,7 +18,8 @@ import 'webview_widget.dart';
 /// Pass this to a [WebViewWidget] to display the WebView.
 ///
 /// A [WebViewController] can only be used by a single [WebViewWidget] at a
-/// time.
+/// time. The widget automatically releases its browser when unmounted.
+/// Controllers created for offscreen work must be explicitly disposed by their owner.
 ///
 /// ## Platform-Specific Features
 /// This class contains an underlying implementation provided by the current
@@ -125,9 +127,28 @@ class WebViewController {
   /// Implementation of [PlatformWebViewController] for the current platform.
   final PlatformWebViewController platform;
 
+  /// Releases the browser owned by this controller after its widget unmounts.
+  Future<void> dispose() => platform.dispose();
+
   /// Updates the browser color preference without navigating or reloading content.
   Future<void> setPreferredColorScheme(Brightness brightness) =>
       platform.setPreferredColorScheme(brightness);
+
+  /// Registers document-start JavaScript through the current WebView host.
+  Future<String> addDocumentStartJavaScript(String source) =>
+      platform.addUserScript(
+        WebViewUserScript(source: source, forMainFrameOnly: false),
+      );
+
+  /// Removes one document-start registration through the current WebView host.
+  Future<void> removeDocumentStartJavaScript(String identifier) =>
+      platform.removeUserScript(identifier);
+
+  /// Scheme for native, socket-free resources; null on unsupported platforms.
+  String? get localResourceScheme => platform.localResourceScheme;
+
+  Future<void> setLocalResourceHandler(WebViewLocalResourceHandler? handler) =>
+      platform.setLocalResourceHandler(handler);
 
   /// Loads the file located on the specified [absoluteFilePath].
   ///
@@ -250,12 +271,16 @@ class WebViewController {
   /// Runs the given JavaScript in the context of the current page, and returns
   /// the result.
   ///
-  /// The Future completes with an error if a JavaScript error occurred, or if
-  /// the type the given expression evaluates to is unsupported. Unsupported
-  /// values include certain non-primitive types on iOS, as well as `undefined`
-  /// or `null` on iOS 14+.
-  Future<Object> runJavaScriptReturningResult(String javaScript) {
-    return platform.runJavaScriptReturningResult(javaScript);
+  /// Returns JSON-compatible values on every platform. JavaScript `null` and
+  /// `undefined` both become Dart `null`. Strings are not decoded a second time.
+  /// The Future completes with an error if execution or serialization fails.
+  Future<Object?> runJavaScriptReturningResult(String javaScript) async {
+    final result = await platform.runJavaScriptReturningResult(javaScript);
+    try {
+      return jsonDecode(jsonEncode(result));
+    } catch (error) {
+      throw StateError('The JavaScript result is not JSON-compatible: $error');
+    }
   }
 
   /// Adds a new JavaScript channel to the set of enabled channels.

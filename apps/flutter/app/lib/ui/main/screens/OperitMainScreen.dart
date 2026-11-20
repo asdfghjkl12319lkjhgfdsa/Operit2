@@ -7,10 +7,17 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:desktop_widgets/desktop_widgets.dart';
 
+import '../../window/DesktopWindowChrome.dart';
+import '../design/SoftwareDesignCatalog.dart';
+
 import '../../../core/bridge/ProxyCoreRuntimeBridge.dart';
+import '../../common/contributions/ChatSidebarTabHost.dart'
+    show ChatSidebarPreparation, ChatSidebarPreparationScope;
 import '../../../core/notifications/NotificationActivationService.dart';
+import '../../../core/host/IncomingAttachmentService.dart';
 import '../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
+import '../../features/chat/components/NewChatIntro.dart';
 import '../../features/chat/viewmodel/ChatSelectionTransition.dart';
 import '../components/AppContent.dart';
 import '../components/DrawerConversationState.dart';
@@ -25,6 +32,24 @@ import '../navigation/AppRouteCatalog.dart';
 import '../navigation/ToolPkgCatalogChangeBus.dart';
 import 'OperitScreens.dart';
 import '../../features/packages/screens/ToolPkgUiLauncherScreen.dart';
+
+/// Decides whether startup already has a conversation to show.
+enum StartupConversationResolution { keep, create, openExisting }
+
+/// Keeps a real selection, creates one when the list is empty, or opens one.
+StartupConversationResolution resolveStartupConversation({
+  required Iterable<String> historyIds,
+  required String? currentChatId,
+}) {
+  final selected = currentChatId?.trim() ?? '';
+  if (selected.isNotEmpty && historyIds.contains(selected)) {
+    return StartupConversationResolution.keep;
+  }
+  if (historyIds.isEmpty) {
+    return StartupConversationResolution.create;
+  }
+  return StartupConversationResolution.openExisting;
+}
 
 class OperitMainScreen extends StatefulWidget {
   const OperitMainScreen({super.key});
@@ -41,9 +66,11 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
 
   late AppNavigationModel _navigationModel;
   late final AppRouterState _routerState;
+  late final SoftwareDesignCatalog _softwareDesignCatalog;
   late final TopBarController _topBarController;
   late final MainLayoutController _mainLayoutController;
   late final SidebarDockController _sidebarDockController;
+  late final ChatSidebarPreparation _sidebarPreparation;
   List<core_proxy.ToolPkgUiRoute> _toolPkgUiRoutes =
       const <core_proxy.ToolPkgUiRoute>[];
   List<core_proxy.ToolPkgNavigationEntry> _toolPkgNavigationEntries =
@@ -53,18 +80,12 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
   _drawerHistoriesSubscription;
   StreamSubscription<String?>? _drawerCurrentChatSubscription;
   StreamSubscription<List<String>>? _drawerActiveStreamingChatIdsSubscription;
-  StreamSubscription<List<core_proxy.CharacterGroupCard>>?
-  _drawerCharacterGroupsSubscription;
-  StreamSubscription<List<String>>? _drawerCharacterCardIdsSubscription;
-  final Map<String, StreamSubscription<core_proxy.CharacterCard>>
-  _drawerCharacterCardSubscriptions =
-      <String, StreamSubscription<core_proxy.CharacterCard>>{};
-  final Map<String, String> _drawerCharacterCardNamesById = <String, String>{};
   late final ValueNotifier<bool> _drawerOpenState;
-  bool _isTabletSidebarExpanded = false;
+  bool _isTabletSidebarExpanded = true;
   bool _isNavigatingBack = false;
   bool _requestedInitialToolPkgNavigationRefresh = false;
   StreamSubscription<void>? _toolPkgCatalogChangeSubscription;
+  StreamSubscription<int>? _coreCatalogRevisionSubscription;
   int _backPressedTime = 0;
 
   /// Initializes navigation services and drawer data subscriptions.
@@ -74,12 +95,19 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
     _topBarController = TopBarController();
     _mainLayoutController = MainLayoutController();
     _sidebarDockController = SidebarDockController();
+    _sidebarPreparation = ChatSidebarPreparation(clients: _clients);
     _routerState = AppRouterState(AppRouteCatalog.initialEntry());
     _drawerConversationState = ValueNotifier<DrawerConversationState>(
       const DrawerConversationState(),
     );
+    _drawerConversationState.addListener(_prepareSidebarData);
     _drawerOpenState = ValueNotifier<bool>(false);
     AppRouterGateway.install(handler: _navigateToRoute, reset: _resetToRoute);
+    _softwareDesignCatalog = SoftwareDesignCatalog(
+      router: _routerState,
+      routes: () => _navigationModel.routes,
+      navigate: _navigateToRoute,
+    );
     NotificationActivationService.instance.installChatHandler(
       _activateNotificationChat,
     );
@@ -88,10 +116,19 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
         unawaited(_refreshToolPkgNavigationModel());
       }
     });
+    _coreCatalogRevisionSubscription = _clients.application
+        .extensionCatalogRevisionFlow()
+        .distinct()
+        .listen((_) {
+          ToolPkgCatalogChangeBus.notifyCatalogChanged(reloadPluginCode: false);
+        });
     unawaited(_loadSidebarDockPreferences());
     unawaited(_initializeDrawerData());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
+        IncomingAttachmentService.instance.installNavigation(
+          _activateConversationRoute,
+        );
         unawaited(_initializeDesktopWidgets());
       }
     });
@@ -178,15 +215,76 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
     }
   }
 
-  /// Loads drawer data before subscribing to its live updates.
+  /// Prepares plugin-owned sidebar data even while the desktop drawer is closed.
+  void _prepareSidebarData() {
+    final state = _drawerConversationState.value;
+    if (!state.loading && state.errorMessage == null) {
+      unawaited(_sidebarPreparation.prepare(state.histories));
+    }
+  }
+
+  /// Loads drawer data, opens a usable conversation, then subscribes to updates.
   Future<void> _initializeDrawerData() async {
     await _loadDrawerConversations();
     if (!mounted) {
       return;
     }
+    await _ensureStartupConversation();
+    if (!mounted) {
+      return;
+    }
+    await _loadDrawerConversations();
+    if (!mounted) {
+      return;
+    }
     _watchDrawerConversations();
-    _watchDrawerCharacterGroups();
-    _watchDrawerCharacterCards();
+  }
+
+  /// Creates the default conversation when this identity has none.
+  ///
+  /// An empty selection leaves the composer in its initial loading state, so
+  /// a fresh identity always opens one new chat before the first frame settles.
+  Future<void> _ensureStartupConversation() async {
+    final state = _drawerConversationState.value;
+    if (state.errorMessage != null) {
+      return;
+    }
+    final resolution = resolveStartupConversation(
+      historyIds: state.histories.map((history) => history.id),
+      currentChatId: state.currentChatId,
+    );
+    switch (resolution) {
+      case StartupConversationResolution.keep:
+        return;
+      case StartupConversationResolution.create:
+        newChatIntroArmed.value = true;
+        try {
+          await _clients.chatRuntimeHolderMain.createNewChat(
+            setAsCurrentChat: true,
+            sourceChatId: null,
+            parentChatId: null,
+            workspaceId: null,
+            input: null,
+          );
+        } catch (error, stackTrace) {
+          newChatIntroArmed.value = false;
+          debugPrint(
+            'Failed to create the startup conversation: $error\n$stackTrace',
+          );
+        }
+        return;
+      case StartupConversationResolution.openExisting:
+        try {
+          await _clients.chatRuntimeHolderMain.switchChat(
+            chatId: state.histories.first.id,
+          );
+        } catch (error, stackTrace) {
+          debugPrint(
+            'Failed to open the startup conversation: $error\n$stackTrace',
+          );
+        }
+        return;
+    }
   }
 
   @override
@@ -198,6 +296,7 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
       toolPkgNavigationEntries: _toolPkgNavigationEntries,
     );
     AppRouteDiscoveryGateway.install(() => _navigationModel.routes);
+    _softwareDesignCatalog.install();
     _synchronizeSidebarDock();
     if (!_requestedInitialToolPkgNavigationRefresh) {
       _requestedInitialToolPkgNavigationRefresh = true;
@@ -207,20 +306,20 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
 
   @override
   void dispose() {
+    _coreCatalogRevisionSubscription?.cancel();
     unawaited(DesktopWidgets.setActionHandler(null));
     unawaited(DesktopWidgets.setSnapshotRenderer(null));
+    _softwareDesignCatalog.dispose();
     AppRouterGateway.clear();
     AppRouteDiscoveryGateway.clear();
     NotificationActivationService.instance.clearChatHandler();
+    IncomingAttachmentService.instance.clearNavigation();
     _toolPkgCatalogChangeSubscription?.cancel();
     _drawerHistoriesSubscription?.cancel();
     _drawerCurrentChatSubscription?.cancel();
     _drawerActiveStreamingChatIdsSubscription?.cancel();
-    _drawerCharacterGroupsSubscription?.cancel();
-    _drawerCharacterCardIdsSubscription?.cancel();
-    for (final subscription in _drawerCharacterCardSubscriptions.values) {
-      subscription.cancel();
-    }
+    _drawerConversationState.removeListener(_prepareSidebarData);
+    _sidebarPreparation.dispose();
     _drawerConversationState.dispose();
     _drawerOpenState.dispose();
     _routerState.dispose();
@@ -239,16 +338,19 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
     if (routeSpec == null) {
       throw StateError('Unknown routeId: $routeId');
     }
+    // Rejects arguments the route cannot show before the router moves.
+    AppRouteCatalog.resolveScreen(
+      _navigationModel,
+      RouteEntry(routeId: routeId, args: args, source: source),
+    );
     _isNavigatingBack = false;
-    if (!_shouldPreserveTopBarTitle(routeId, args, source)) {
-      _topBarController.clear();
-    }
-    _mainLayoutController.clear();
-    _routerState.navigate(
-      routeId: routeId,
-      args: args,
-      source: source,
-      routeSpec: routeSpec,
+    _moveRouter(
+      () => _routerState.navigate(
+        routeId: routeId,
+        args: args,
+        source: source,
+        routeSpec: routeSpec,
+      ),
     );
   }
 
@@ -260,30 +362,35 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
     if (!_navigationModel.routesById.containsKey(routeId)) {
       throw StateError('Unknown routeId: $routeId');
     }
+    final entry = RouteEntry(routeId: routeId, args: args, source: source);
+    // Rejects arguments the route cannot show before the router moves.
+    AppRouteCatalog.resolveScreen(_navigationModel, entry);
     _isNavigatingBack = false;
-    if (!_shouldPreserveTopBarTitle(routeId, args, source)) {
-      _topBarController.clear();
-    }
-    _mainLayoutController.clear();
-    _routerState.resetTo(
-      RouteEntry(routeId: routeId, args: args, source: source),
-    );
+    _moveRouter(() => _routerState.resetTo(entry));
   }
 
-  bool _shouldPreserveTopBarTitle(
-    String nextRouteId,
-    Map<String, Object?> nextArgs,
-    RouteEntrySource nextSource,
-  ) {
-    final currentScreen = AppRouteCatalog.resolveScreen(
+  /// Moves the router, then resets the chrome pages own (the top bar content
+  /// and the layout attachment) only if another page is now on screen.
+  ///
+  /// A navigation can land on the page already shown: one cached page serves
+  /// several routes and arguments, and the router reuses an identical current
+  /// entry. That page stays mounted and current, so it never claims its chrome
+  /// again; clearing it would leave the top bar empty.
+  void _moveRouter(VoidCallback move) {
+    final previousPage = _currentPageKey();
+    move();
+    if (_currentPageKey() != previousPage) {
+      _topBarController.clear();
+      _mainLayoutController.clear();
+    }
+  }
+
+  String _currentPageKey() {
+    final entry = _routerState.currentEntry;
+    return AppRouteCatalog.resolveScreen(
       _navigationModel,
-      _routerState.currentEntry,
-    );
-    final nextScreen = AppRouteCatalog.resolveScreen(
-      _navigationModel,
-      RouteEntry(routeId: nextRouteId, args: nextArgs, source: nextSource),
-    );
-    return currentScreen.preserveTopBarTitleWhenReplacingWith(nextScreen);
+      entry,
+    ).pageKey(entry);
   }
 
   Future<void> _refreshToolPkgNavigationModel() async {
@@ -341,50 +448,34 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
     }
   }
 
-  /// Loads drawer conversations and their character avatar metadata.
+  /// Loads only canonical conversations and generic runtime selection state.
   Future<void> _loadDrawerConversations() async {
     final currentState = _drawerConversationState.value;
     _drawerConversationState.value = DrawerConversationState(
       histories: currentState.histories,
       activeStreamingChatIds: currentState.activeStreamingChatIds,
-      characterGroupNamesById: currentState.characterGroupNamesById,
-      characterCardAvatarUrisByName: currentState.characterCardAvatarUrisByName,
       currentChatId: currentState.currentChatId,
       loading: true,
     );
     try {
-      final characterGroupCoreProxy =
-          _clients.preferencesCharacterGroupCardManager;
-      final characterCardCoreProxy = _clients.preferencesCharacterCardManager;
       final results = await Future.wait<Object?>(<Future<Object?>>[
         _clients.chatRuntimeHolderMain.chatHistoryListItemsFlow().first,
         _clients.chatRuntimeHolderMain.currentChatIdFlow().first,
-        characterGroupCoreProxy.allCharacterGroupCardsFlow().first,
-        characterCardCoreProxy.getAllCharacterCards(),
         _clients.chatRuntimeHolderMain.activeStreamingChatIds(),
       ]);
       final histories = results[0] as List<core_proxy.ChatHistoryListItem>;
       final currentChatId = results[1] as String?;
-      final characterGroups = results[2] as List<core_proxy.CharacterGroupCard>;
-      final characterCards = results[3] as List<core_proxy.CharacterCard>;
-      final activeStreamingChatIds = results[4] as List<String>;
+      final activeStreamingChatIds = results[2] as List<String>;
       if (!mounted) {
         return;
       }
-      _replaceDrawerCharacterCardAvatars(characterCards);
       _drawerConversationState.value = DrawerConversationState(
         histories: List<core_proxy.ChatHistoryListItem>.unmodifiable(histories),
         activeStreamingChatIds: Set<String>.unmodifiable(
           activeStreamingChatIds,
         ),
-        characterGroupNamesById: _characterGroupNameMap(characterGroups),
-        characterCardAvatarUrisByName:
-            _drawerConversationState.value.characterCardAvatarUrisByName,
         currentChatId: currentChatId,
         loading: false,
-      );
-      await _syncDrawerCharacterCardSubscriptions(
-        characterCards.map((card) => card.id).toList(growable: false),
       );
     } catch (error, stackTrace) {
       debugPrint('Failed to load drawer conversations: $error\n$stackTrace');
@@ -395,8 +486,6 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
       _drawerConversationState.value = DrawerConversationState(
         histories: state.histories,
         activeStreamingChatIds: state.activeStreamingChatIds,
-        characterGroupNamesById: state.characterGroupNamesById,
-        characterCardAvatarUrisByName: state.characterCardAvatarUrisByName,
         currentChatId: state.currentChatId,
         errorMessage: error.toString(),
         loading: false,
@@ -419,9 +508,6 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
                 histories,
               ),
               activeStreamingChatIds: state.activeStreamingChatIds,
-              characterGroupNamesById: state.characterGroupNamesById,
-              characterCardAvatarUrisByName:
-                  state.characterCardAvatarUrisByName,
               currentChatId: state.currentChatId,
               loading: false,
             );
@@ -437,9 +523,6 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
             _drawerConversationState.value = DrawerConversationState(
               histories: state.histories,
               activeStreamingChatIds: state.activeStreamingChatIds,
-              characterGroupNamesById: state.characterGroupNamesById,
-              characterCardAvatarUrisByName:
-                  state.characterCardAvatarUrisByName,
               currentChatId: state.currentChatId,
               errorMessage: error.toString(),
               loading: false,
@@ -459,9 +542,6 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
             _drawerConversationState.value = DrawerConversationState(
               histories: state.histories,
               activeStreamingChatIds: state.activeStreamingChatIds,
-              characterGroupNamesById: state.characterGroupNamesById,
-              characterCardAvatarUrisByName:
-                  state.characterCardAvatarUrisByName,
               currentChatId: chatId,
               errorMessage: state.errorMessage,
               loading: state.loading,
@@ -478,9 +558,6 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
             _drawerConversationState.value = DrawerConversationState(
               histories: state.histories,
               activeStreamingChatIds: state.activeStreamingChatIds,
-              characterGroupNamesById: state.characterGroupNamesById,
-              characterCardAvatarUrisByName:
-                  state.characterCardAvatarUrisByName,
               currentChatId: state.currentChatId,
               errorMessage: error.toString(),
               loading: state.loading,
@@ -500,9 +577,6 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
             _drawerConversationState.value = DrawerConversationState(
               histories: state.histories,
               activeStreamingChatIds: Set<String>.unmodifiable(activeChatIds),
-              characterGroupNamesById: state.characterGroupNamesById,
-              characterCardAvatarUrisByName:
-                  state.characterCardAvatarUrisByName,
               currentChatId: state.currentChatId,
               errorMessage: state.errorMessage,
               loading: state.loading,
@@ -519,9 +593,6 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
             _drawerConversationState.value = DrawerConversationState(
               histories: state.histories,
               activeStreamingChatIds: state.activeStreamingChatIds,
-              characterGroupNamesById: state.characterGroupNamesById,
-              characterCardAvatarUrisByName:
-                  state.characterCardAvatarUrisByName,
               currentChatId: state.currentChatId,
               errorMessage: error.toString(),
               loading: state.loading,
@@ -530,227 +601,7 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
         );
   }
 
-  void _watchDrawerCharacterGroups() {
-    _drawerCharacterGroupsSubscription?.cancel();
-    _drawerCharacterGroupsSubscription = _clients
-        .preferencesCharacterGroupCardManager
-        .allCharacterGroupCardsFlow()
-        .listen(
-          (groups) {
-            if (!mounted) {
-              return;
-            }
-            final state = _drawerConversationState.value;
-            _drawerConversationState.value = DrawerConversationState(
-              histories: state.histories,
-              activeStreamingChatIds: state.activeStreamingChatIds,
-              characterGroupNamesById: _characterGroupNameMap(groups),
-              characterCardAvatarUrisByName:
-                  state.characterCardAvatarUrisByName,
-              currentChatId: state.currentChatId,
-              errorMessage: state.errorMessage,
-              loading: state.loading,
-            );
-          },
-          onError: (Object error, StackTrace stackTrace) {
-            debugPrint(
-              'Failed to watch drawer character groups: $error\n$stackTrace',
-            );
-            if (!mounted) {
-              return;
-            }
-            final state = _drawerConversationState.value;
-            _drawerConversationState.value = DrawerConversationState(
-              histories: state.histories,
-              activeStreamingChatIds: state.activeStreamingChatIds,
-              characterGroupNamesById: state.characterGroupNamesById,
-              characterCardAvatarUrisByName:
-                  state.characterCardAvatarUrisByName,
-              currentChatId: state.currentChatId,
-              errorMessage: error.toString(),
-              loading: state.loading,
-            );
-          },
-        );
-  }
-
-  /// Watches the character-card collection used to supply drawer avatars.
-  void _watchDrawerCharacterCards() {
-    final characterCardCoreProxy = _clients.preferencesCharacterCardManager;
-    _drawerCharacterCardIdsSubscription?.cancel();
-    _drawerCharacterCardIdsSubscription = characterCardCoreProxy
-        .characterCardListFlow()
-        .listen(
-          (cardIds) {
-            unawaited(_syncDrawerCharacterCardSubscriptions(cardIds));
-          },
-          onError: (Object error, StackTrace stackTrace) {
-            _reportDrawerCharacterCardError(error, stackTrace);
-          },
-        );
-  }
-
-  /// Synchronizes per-card avatar subscriptions with the current card list.
-  Future<void> _syncDrawerCharacterCardSubscriptions(
-    List<String> cardIds,
-  ) async {
-    try {
-      final desiredCardIds = cardIds
-          .map((id) => id.trim())
-          .where((id) => id.isNotEmpty)
-          .toSet();
-      final removedCardIds = _drawerCharacterCardSubscriptions.keys
-          .where((id) => !desiredCardIds.contains(id))
-          .toList(growable: false);
-      for (final cardId in removedCardIds) {
-        await _drawerCharacterCardSubscriptions.remove(cardId)!.cancel();
-        final previousName = _drawerCharacterCardNamesById.remove(cardId);
-        if (previousName != null) {
-          _removeDrawerCharacterCardAvatar(previousName);
-        }
-      }
-
-      final characterCardCoreProxy = _clients.preferencesCharacterCardManager;
-      for (final cardId in desiredCardIds) {
-        if (_drawerCharacterCardSubscriptions.containsKey(cardId)) {
-          continue;
-        }
-        _drawerCharacterCardSubscriptions[cardId] = characterCardCoreProxy
-            .getCharacterCardFlow(id: cardId)
-            .listen(
-              _updateDrawerCharacterCardAvatar,
-              onError: (Object error, StackTrace stackTrace) {
-                _reportDrawerCharacterCardError(error, stackTrace);
-              },
-            );
-      }
-
-      final cards = await Future.wait<core_proxy.CharacterCard>(
-        desiredCardIds.map(
-          (id) => characterCardCoreProxy.getCharacterCardFlow(id: id).first,
-        ),
-      );
-      if (!mounted) {
-        return;
-      }
-      _replaceDrawerCharacterCardAvatars(cards);
-    } catch (error, stackTrace) {
-      _reportDrawerCharacterCardError(error, stackTrace);
-    }
-  }
-
-  /// Replaces all drawer avatar metadata with the supplied character cards.
-  void _replaceDrawerCharacterCardAvatars(
-    List<core_proxy.CharacterCard> cards,
-  ) {
-    final avatarUrisByName = <String, String>{};
-    _drawerCharacterCardNamesById.clear();
-    for (final card in cards) {
-      final id = card.id.trim();
-      final name = card.name.trim();
-      if (id.isEmpty || name.isEmpty) {
-        continue;
-      }
-      _drawerCharacterCardNamesById[id] = name;
-      final avatarUri = card.avatarUri?.trim();
-      if (avatarUri != null && avatarUri.isNotEmpty) {
-        avatarUrisByName[name] = avatarUri;
-      }
-    }
-    final state = _drawerConversationState.value;
-    _drawerConversationState.value = DrawerConversationState(
-      histories: state.histories,
-      activeStreamingChatIds: state.activeStreamingChatIds,
-      characterGroupNamesById: state.characterGroupNamesById,
-      characterCardAvatarUrisByName: avatarUrisByName,
-      currentChatId: state.currentChatId,
-      errorMessage: state.errorMessage,
-      loading: state.loading,
-    );
-  }
-
-  /// Applies a single character-card avatar update to drawer state.
-  void _updateDrawerCharacterCardAvatar(core_proxy.CharacterCard card) {
-    if (!mounted) {
-      return;
-    }
-    final cardId = card.id.trim();
-    final cardName = card.name.trim();
-    if (cardId.isEmpty || cardName.isEmpty) {
-      return;
-    }
-    final avatarUrisByName = Map<String, String>.of(
-      _drawerConversationState.value.characterCardAvatarUrisByName,
-    );
-    final previousName = _drawerCharacterCardNamesById[cardId];
-    if (previousName != null) {
-      avatarUrisByName.remove(previousName);
-    }
-    _drawerCharacterCardNamesById[cardId] = cardName;
-    final avatarUri = card.avatarUri?.trim();
-    if (avatarUri != null && avatarUri.isNotEmpty) {
-      avatarUrisByName[cardName] = avatarUri;
-    }
-    final state = _drawerConversationState.value;
-    _drawerConversationState.value = DrawerConversationState(
-      histories: state.histories,
-      activeStreamingChatIds: state.activeStreamingChatIds,
-      characterGroupNamesById: state.characterGroupNamesById,
-      characterCardAvatarUrisByName: avatarUrisByName,
-      currentChatId: state.currentChatId,
-      errorMessage: state.errorMessage,
-      loading: state.loading,
-    );
-  }
-
-  /// Removes a deleted character-card avatar from drawer state.
-  void _removeDrawerCharacterCardAvatar(String cardName) {
-    if (!mounted) {
-      return;
-    }
-    final avatarUrisByName = Map<String, String>.of(
-      _drawerConversationState.value.characterCardAvatarUrisByName,
-    )..remove(cardName);
-    final state = _drawerConversationState.value;
-    _drawerConversationState.value = DrawerConversationState(
-      histories: state.histories,
-      activeStreamingChatIds: state.activeStreamingChatIds,
-      characterGroupNamesById: state.characterGroupNamesById,
-      characterCardAvatarUrisByName: avatarUrisByName,
-      currentChatId: state.currentChatId,
-      errorMessage: state.errorMessage,
-      loading: state.loading,
-    );
-  }
-
-  /// Publishes a character avatar loading error to the drawer state.
-  void _reportDrawerCharacterCardError(Object error, StackTrace stackTrace) {
-    debugPrint('Failed to watch drawer character cards: $error\n$stackTrace');
-    if (!mounted) {
-      return;
-    }
-    final state = _drawerConversationState.value;
-    _drawerConversationState.value = DrawerConversationState(
-      histories: state.histories,
-      activeStreamingChatIds: state.activeStreamingChatIds,
-      characterGroupNamesById: state.characterGroupNamesById,
-      characterCardAvatarUrisByName: state.characterCardAvatarUrisByName,
-      currentChatId: state.currentChatId,
-      errorMessage: error.toString(),
-      loading: false,
-    );
-  }
-
-  Map<String, String> _characterGroupNameMap(
-    List<core_proxy.CharacterGroupCard> groups,
-  ) {
-    return <String, String>{
-      for (final group in groups)
-        if (group.id.trim().isNotEmpty && group.name.trim().isNotEmpty)
-          group.id.trim(): group.name.trim(),
-    };
-  }
-
+  /// Closes the drawer while retaining an already selected page and its session.
   void _navigateToNavigationEntry(NavigationEntrySpec entry) {
     final action = entry.action;
     if (action != null) {
@@ -767,12 +618,12 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
       );
       return;
     }
+    _drawerOpenState.value = false;
     final currentRouteEntry = _routerState.currentEntry;
     if (currentRouteEntry.routeId == entry.routeId &&
         mapEquals(currentRouteEntry.args, entry.routeArgs)) {
       return;
     }
-    _drawerOpenState.value = false;
     _isNavigatingBack = false;
     _resetToRoute(entry.routeId, entry.routeArgs, RouteEntrySource.drawer);
   }
@@ -825,7 +676,6 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
   Future<void> _activateNotificationChat(String chatId) async {
     ChatSelectionTransition.begin(chatId);
     _activateConversationRoute();
-    await WidgetsBinding.instance.endOfFrame;
     if (!mounted) {
       return;
     }
@@ -839,9 +689,7 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
 
   void _goBack() {
     _isNavigatingBack = true;
-    _topBarController.clear();
-    _mainLayoutController.clear();
-    _routerState.pop();
+    _moveRouter(_routerState.pop);
   }
 
   void _resetToConversationFromBack() {
@@ -850,15 +698,15 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
       throw StateError('Unknown navigation entry: main.ai_chat');
     }
     _isNavigatingBack = true;
-    _topBarController.clear();
-    _mainLayoutController.clear();
-    _routerState.resetTo(
-      RouteEntry(
-        routeId: entry.routeId,
-        args: <String, Object?>{
-          'conversationActivatedAt': DateTime.now().microsecondsSinceEpoch,
-        },
-        source: RouteEntrySource.defaultSource,
+    _moveRouter(
+      () => _routerState.resetTo(
+        RouteEntry(
+          routeId: entry.routeId,
+          args: <String, Object?>{
+            'conversationActivatedAt': DateTime.now().microsecondsSinceEpoch,
+          },
+          source: RouteEntrySource.defaultSource,
+        ),
       ),
     );
   }
@@ -884,9 +732,13 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
     }
   }
 
+  /// Dismisses visible shell surfaces before navigating or confirming exit.
   void _handleSystemBack(OperitScreen currentScreen) {
     if (_drawerOpenState.value) {
       _drawerOpenState.value = false;
+      return;
+    }
+    if (_mainLayoutController.handleBack()) {
       return;
     }
     if (_routerState.canPop) {
@@ -952,63 +804,85 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
           ],
         );
 
-        return SidebarDockScope(
-          controller: _sidebarDockController,
-          child: MainLayoutScope(
-            controller: _mainLayoutController,
-            child: TopBarScope(
-              controller: _topBarController,
-              child: ValueListenableBuilder<bool>(
-                valueListenable: _drawerOpenState,
-                child: Scaffold(
-                  body: useTabletLayout
-                      ? TabletLayout(
-                          content: content,
-                          navigationEntries: _navigationModel.navigationEntries,
-                          pluginSidebarEntries: pluginSidebarEntries,
-                          selectedRouteId: currentRouteEntry.routeId,
-                          drawerConversationState: _drawerConversationState,
-                          isTabletSidebarExpanded: _isTabletSidebarExpanded,
-                          tabletSidebarWidth: 280,
-                          collapsedTabletSidebarWidth: 56,
-                          onNavigationEntrySelected: _navigateToNavigationEntry,
-                          onConversationActivated: _activateConversationRoute,
-                        )
-                      : PhoneLayout(
-                          content: content,
-                          navigationEntries: _navigationModel.navigationEntries,
-                          pluginSidebarEntries: pluginSidebarEntries,
-                          selectedRouteId: currentRouteEntry.routeId,
-                          drawerConversationState: _drawerConversationState,
-                          drawerWidth: screenSize.width * 0.75,
-                          drawerOpenState: _drawerOpenState,
-                          enableNavigationAnimation: true,
-                          onOpenDrawer: () {
-                            _drawerOpenState.value = true;
-                          },
-                          onCloseDrawer: () {
-                            _drawerOpenState.value = false;
-                          },
-                          onNavigationEntrySelected: _navigateToNavigationEntry,
-                          onConversationActivated: _activateConversationRoute,
-                        ),
+        return ChatSidebarPreparationScope(
+          preparation: _sidebarPreparation,
+          child: SidebarDockScope(
+            controller: _sidebarDockController,
+            child: MainLayoutScope(
+              controller: _mainLayoutController,
+              child: TopBarScope(
+                controller: _topBarController,
+                child: ListenableBuilder(
+                  listenable: Listenable.merge(<Listenable>[
+                    _drawerOpenState,
+                    _mainLayoutController,
+                  ]),
+                  child: Scaffold(
+                    body: useTabletLayout
+                        ? TabletLayout(
+                            content: content,
+                            navigationEntries:
+                                _navigationModel.navigationEntries,
+                            pluginSidebarEntries: pluginSidebarEntries,
+                            selectedRouteId: currentRouteEntry.routeId,
+                            drawerConversationState: _drawerConversationState,
+                            isTabletSidebarExpanded: _isTabletSidebarExpanded,
+                            collapsedTabletSidebarWidth: 56,
+                            onNavigationEntrySelected:
+                                _navigateToNavigationEntry,
+                            onConversationActivated: _activateConversationRoute,
+                            onExpandSidebar: () {
+                              setState(() => _isTabletSidebarExpanded = true);
+                            },
+                            onCollapseSidebar: () {
+                              setState(() {
+                                _isTabletSidebarExpanded = false;
+                              });
+                            },
+                          )
+                        : DesktopContentPanel(
+                            child: PhoneLayout(
+                              content: content,
+                              navigationEntries:
+                                  _navigationModel.navigationEntries,
+                              pluginSidebarEntries: pluginSidebarEntries,
+                              selectedRouteId: currentRouteEntry.routeId,
+                              drawerConversationState: _drawerConversationState,
+                              drawerWidth: screenSize.width * 0.75,
+                              drawerOpenState: _drawerOpenState,
+                              enableNavigationAnimation: true,
+                              onOpenDrawer: () {
+                                _drawerOpenState.value = true;
+                              },
+                              onCloseDrawer: () {
+                                _drawerOpenState.value = false;
+                              },
+                              onNavigationEntrySelected:
+                                  _navigateToNavigationEntry,
+                              onConversationActivated:
+                                  _activateConversationRoute,
+                            ),
+                          ),
+                  ),
+                  builder: (context, child) {
+                    final phoneDrawerOpen =
+                        !useTabletLayout && _drawerOpenState.value;
+                    return PopScope(
+                      canPop:
+                          defaultTargetPlatform != TargetPlatform.android &&
+                          !phoneDrawerOpen &&
+                          !_mainLayoutController.hasBackAction &&
+                          !_routerState.canPop,
+                      onPopInvokedWithResult: (didPop, result) {
+                        if (didPop) {
+                          return;
+                        }
+                        _handleSystemBack(currentScreen);
+                      },
+                      child: child!,
+                    );
+                  },
                 ),
-                builder: (context, drawerOpen, child) {
-                  final phoneDrawerOpen = !useTabletLayout && drawerOpen;
-                  return PopScope(
-                    canPop:
-                        defaultTargetPlatform != TargetPlatform.android &&
-                        !phoneDrawerOpen &&
-                        !_routerState.canPop,
-                    onPopInvokedWithResult: (didPop, result) {
-                      if (didPop) {
-                        return;
-                      }
-                      _handleSystemBack(currentScreen);
-                    },
-                    child: child!,
-                  );
-                },
               ),
             ),
           ),

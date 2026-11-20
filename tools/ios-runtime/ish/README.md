@@ -1,18 +1,10 @@
-# iSH Runtime Tooling
+# Historical iSH caches
 
-This directory owns the iOS iSH runtime inputs and build steps.
+The iSH x86 backend has been removed from the iOS app, terminal routing and CI.
+Its source preparation, build scripts and custom patches are no longer build
+inputs. This directory may still contain ignored download/build caches from an
+earlier checkout; existing user roots and ignored archives are preserved.
 
-- `fetch_sources.py` downloads verified ZIP archives for iSH and its required
-  upstream dependencies into `downloads/`, then extracts them into `sources/`.
-- `build_alpine_rootfs_linux.sh` produces the x86 Alpine rootfs on Linux with
-  `bash`, `python3`, `py3-pip`, `nodejs`, `npm`, and `ca-certificates`.
-- `build_ish_ios.sh` builds the iSH static targets used by the Flutter iOS
-  Runner. It requires the rootfs staged by the Linux rootfs build.
-
-`downloads/`, `sources/`, and `build/` are build-owned directories and are
-ignored by Git. The Runner exposes one terminal type: `shell`, backed by the
-iSH Alpine Linux environment with Python and Node.js installed.
-
-iSH is GPLv3 with its `LICENSE.IOS` App Store exception. Distributing an iOS
-build that includes this runtime requires providing the corresponding iSH
-source and license text to users.
+Use [`../arm64/`](../arm64/README.md) to build the independent ARM64 runtime and
+Alpine AArch64 development environment. Do not reuse an x86 root as an ARM64
+root: executables, libraries and the package database must match the architecture.

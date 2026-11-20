@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::engine::general_purpose::STANDARD;
@@ -14,8 +15,8 @@ use operit_store::{
 use serde::{Deserialize, Serialize};
 
 use operit_host_api::HostManager::HostManager;
-use operit_tools::files::PathMapper::PathMapper;
-use operit_tools::files::VisualFileSystem::VisualFileSystem;
+use operit_vfs::VfsPath;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 use operit_util::stream::HotStream::MutableSharedStreamImpl;
 use operit_util::stream::Stream::{CollectFuture, Stream};
 
@@ -193,58 +194,60 @@ fn start_terminal_pty_output_reader(
 ) {
     let scheduledTaskScheduler = taskScheduler.clone();
     taskScheduler
-        .scheduleHostRuntimeTask(
+        .scheduleHostRuntimeAsyncTask(
             "operit-terminal-pty-output",
-            Box::new(move || {
-                poll_terminal_pty_output(terminalHost, scheduledTaskScheduler, sessionId, stream);
-            }),
+            Box::new(move || Box::pin(async move {
+                // Keep one request thread and yield to the shared timer instead
+                // of creating a new OS thread for every 40 ms polling turn.
+                while poll_terminal_pty_output(terminalHost.as_ref(), &sessionId, &stream) {
+                    if scheduledTaskScheduler.waitForHostRuntimeDelay(40).await.is_err() {
+                        close_terminal_pty_output_stream(&sessionId);
+                        break;
+                    }
+                }
+            })),
         )
         .expect("terminal PTY output task must be scheduled");
 }
 
-/// Reads one PTY output batch and schedules the next host-owned polling turn.
+/// Reads one batch; false terminates the session's single asynchronous reader.
 fn poll_terminal_pty_output(
-    terminalHost: Arc<dyn TerminalHost>,
-    taskScheduler: Arc<dyn HostRuntimeTaskSchedulerHost>,
-    sessionId: String,
-    stream: MutableSharedStreamImpl<String>,
-) {
-    match terminalHost.readPtySession(&sessionId) {
+    terminalHost: &dyn TerminalHost,
+    sessionId: &str,
+    stream: &MutableSharedStreamImpl<String>,
+) -> bool {
+    if !terminal_pty_output_streams()
+        .lock()
+        .expect("terminal pty output streams mutex poisoned")
+        .contains_key(sessionId)
+    {
+        return false;
+    }
+    match terminalHost.readPtySession(sessionId) {
         Ok(data) if !data.is_empty() => stream.emit(STANDARD.encode(data)),
         Ok(_) => {}
         Err(_) => {
-            close_terminal_pty_output_stream(&sessionId);
-            return;
+            close_terminal_pty_output_stream(sessionId);
+            return false;
         }
     }
 
-    match terminalHost.pollPtyExitCode(&sessionId) {
+    match terminalHost.pollPtyExitCode(sessionId) {
         Ok(Some(_)) => {
-            publish_terminal_sessions(terminalHost.as_ref())
+            // Drain bytes arriving between the read and the exit observation.
+            if let Ok(data) = terminalHost.readPtySession(sessionId) {
+                if !data.is_empty() { stream.emit(STANDARD.encode(data)); }
+            }
+            publish_terminal_sessions(terminalHost)
                 .expect("TerminalHost.listSessions must succeed after PTY exit");
-            close_terminal_pty_output_stream(&sessionId);
+            close_terminal_pty_output_stream(sessionId);
+            false
         }
-        Ok(None) => {
-            let nextTerminalHost = terminalHost.clone();
-            let nextTaskScheduler = taskScheduler.clone();
-            let nextSessionId = sessionId.clone();
-            let nextStream = stream.clone();
-            taskScheduler
-                .scheduleDelayedHostRuntimeTask(
-                    "operit-terminal-pty-output",
-                    40,
-                    Box::new(move || {
-                        poll_terminal_pty_output(
-                            nextTerminalHost,
-                            nextTaskScheduler,
-                            nextSessionId,
-                            nextStream,
-                        );
-                    }),
-                )
-                .expect("terminal PTY output delay must be scheduled");
+        Ok(None) => true,
+        Err(_) => {
+            close_terminal_pty_output_stream(sessionId);
+            false
         }
-        Err(_) => close_terminal_pty_output_stream(&sessionId),
     }
 }
 
@@ -295,7 +298,7 @@ impl RuntimeTerminalService {
     }
 
     #[allow(non_snake_case)]
-    /// Starts a PTY terminal session and attaches its output stream.
+    /// Starts a PTY on the host's blocking pool without holding the Core proxy lock.
     pub fn startTerminalPty(
         &self,
         sessionName: String,
@@ -304,8 +307,49 @@ impl RuntimeTerminalService {
         workingDir: String,
         rows: i32,
         cols: i32,
+    ) -> impl Future<Output = Result<String, String>> + 'static {
+        let service = Self {
+            terminalHost: self.terminalHost.clone(),
+            context: self.context.clone(),
+        };
+        async move {
+            let scheduler = service.context.hostRuntimeTaskSchedulerHost.clone()
+                .ok_or_else(|| "Starting a terminal requires a runtime task scheduler".to_string())?;
+            let (send, receive) = tokio::sync::oneshot::channel();
+            scheduler.scheduleHostRuntimeTask("start-terminal-pty", Box::new(move || {
+                let result = service.start_terminal_pty(sessionName, terminal, terminalType, workingDir, rows, cols);
+                if let Err(Ok(session_id)) = send.send(result) {
+                    let _ = service.closeTerminalPty(session_id);
+                }
+            })).map_err(|error| error.message)?;
+            receive.await.map_err(|_| "Terminal startup worker stopped".to_string())?
+        }
+    }
+
+    #[allow(non_snake_case)]
+    /// Resolves the working directory, starts the host PTY, and publishes it.
+    fn start_terminal_pty(
+        &self,
+        sessionName: String,
+        terminal: String,
+        terminalType: String,
+        workingDir: String,
+        rows: i32,
+        cols: i32,
     ) -> Result<String, String> {
-        let resolvedWorkingDir = resolve_terminal_working_dir(&self.context, &workingDir)?;
+        let resolvedWorkingDir = self
+            .terminalHost
+            .resolveWorkingDirectory(
+                &terminal,
+                &terminalType,
+                &workingDir,
+                &|path| resolve_terminal_working_dir(&self.context, self.terminalHost.as_ref(), path)
+                    .map_err(operit_host_api::HostError::new),
+            )
+            .map_err(|error| format!(
+                "Cannot resolve terminal working directory for {terminal}/{terminalType} at {workingDir}: {}",
+                error.message,
+            ))?;
         let sessionId = self
             .terminalHost
             .startPtySession(
@@ -317,6 +361,12 @@ impl RuntimeTerminalService {
                 cols as u16,
             )
             .map_err(|error| error.message)?;
+        if let Err(error) = operit_host_api::TerminalWorkingDirectory::enterTerminalDirectory(
+            self.terminalHost.as_ref(), &sessionId, &terminalType, &resolvedWorkingDir,
+        ) {
+            let _ = self.terminalHost.closePtySession(&sessionId);
+            return Err(error.message);
+        }
         self.ensureTerminalPtyOutputStream(sessionId.clone());
         publish_terminal_sessions(self.terminalHost.as_ref())?;
         Ok(sessionId)
@@ -427,34 +477,109 @@ impl RuntimeTerminalService {
     }
 }
 
-fn resolve_terminal_working_dir(context: &HostManager, workingDir: &str) -> Result<String, String> {
-    let trimmed = workingDir.trim();
-    if trimmed == "/app" || trimmed.starts_with("/app/")
-        || trimmed == "/mnt" || trimmed.starts_with("/mnt/")
-    {
-        return terminal_vfs(context)?
-            .resolvePath(trimmed)
-            .map(|path| path.physicalPath);
-    }
-    Ok(trimmed.to_string())
+/// Resolves host-owned directories after the selected terminal has dispatched its namespace.
+fn resolve_terminal_working_dir(
+    context: &HostManager,
+    terminalHost: &dyn TerminalHost,
+    workingDir: &str,
+) -> Result<String, String> {
+    let filesystem = terminal_vfs(context)?;
+    let path = filesystem.resolveResourcePath(None, workingDir.trim())?;
+    filesystem.terminalDirectory(terminalHost, &path)
 }
 
+/// Builds the host VFS used only for directories owned by the current runtime.
 fn terminal_vfs(context: &HostManager) -> Result<VisualFileSystem, String> {
-    let runtimeStorageHost = context.runtimeStorageHost.as_ref().ok_or_else(|| {
-        "RuntimeStorageHost is not configured for terminal working directory".to_string()
-    })?;
-    let runtimeStoreRoot = runtimeStorageHost.runtimeRootDir().ok_or_else(|| {
-        "RuntimeStorageHost runtime root is not configured for terminal working directory"
-            .to_string()
-    })?;
-    let workspaceCollectionRoot = runtimeStorageHost.workspaceRootDir().ok_or_else(|| {
-        "RuntimeStorageHost workspace root is not configured for terminal working directory"
-            .to_string()
-    })?;
-    Ok(VisualFileSystem::new(
-        context.fileSystemHost.clone().ok_or_else(|| {
-            "FileSystemHost is not registered for terminal working directory".to_string()
-        })?,
-        PathMapper::new(runtimeStoreRoot, workspaceCollectionRoot),
-    ))
+    context.vfs()
+}
+
+#[cfg(test)]
+mod idle_poll_tests {
+    use super::*;
+    use operit_host_api::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestTerminal { reads: AtomicUsize, exited: bool }
+    #[allow(unused_variables)]
+    impl TerminalHost for TestTerminal {
+        /// Resolves host directories without changing this stream-test host's capabilities.
+        fn resolveWorkingDirectory(
+            &self,
+            _: &str,
+            _: &str,
+            workingDir: &str,
+            resolveHostDirectory: &dyn Fn(&str) -> HostResult<String>,
+        ) -> HostResult<String> {
+            resolveHostDirectory(workingDir)
+        }
+        fn terminalInfo(&self) -> HostResult<TerminalInfo> { unimplemented!() }
+        fn startPtySession(
+        &self,
+        sessionName: &str,
+        terminal: &str,
+        terminalType: &str,
+        workingDir: &str,
+        rows: u16,
+        cols: u16,
+    ) -> HostResult<String> { unimplemented!() }
+        fn readPtySession(&self, sessionId: &str) -> HostResult<Vec<u8>> { let read = self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(if self.exited { if read == 0 { b"before".to_vec() } else { b"tail".to_vec() } } else { Vec::new() }) }
+        fn writePtySession(&self, sessionId: &str, data: &[u8]) -> HostResult<usize> { unimplemented!() }
+        fn resizePtySession(&self, sessionId: &str, rows: u16, cols: u16) -> HostResult<()> { unimplemented!() }
+        fn pollPtyExitCode(&self, sessionId: &str) -> HostResult<Option<i32>> { Ok(if self.exited { Some(0) } else { None }) }
+        fn closePtySession(&self, sessionId: &str) -> HostResult<()> { unimplemented!() }
+        fn listSessions(&self) -> HostResult<Vec<TerminalSessionListEntry>> { Ok(Vec::new()) }
+        fn createOrGetSession(&self, sessionName: &str) -> HostResult<TerminalSessionInfo> { unimplemented!() }
+        /// Rejects typed session creation in this output-stream-only test host.
+        fn createOrGetTypedSession(&self, _: &str, _: &str) -> HostResult<TerminalSessionInfo> { unimplemented!() }
+        fn executeInSession(
+        &self,
+        sessionId: &str,
+        command: &str,
+        timeoutMs: u64,
+    ) -> HostResult<TerminalCommandOutput> { unimplemented!() }
+        fn executeHiddenCommand(
+        &self,
+        command: &str,
+        executorKey: &str,
+        timeoutMs: u64,
+    ) -> HostResult<HiddenTerminalCommandOutput> { unimplemented!() }
+        fn inputInSession(
+        &self,
+        sessionId: &str,
+        input: Option<&str>,
+        control: Option<&str>,
+    ) -> HostResult<TerminalInputOutput> { unimplemented!() }
+        fn closeSession(&self, sessionId: &str) -> HostResult<TerminalCloseOutput> { unimplemented!() }
+        fn getSessionScreen(&self, sessionId: &str) -> HostResult<TerminalScreenOutput> { unimplemented!() }
+    }
+
+    fn register(id: &str) -> MutableSharedStreamImpl<String> {
+        let stream = MutableSharedStreamImpl::new(8);
+        terminal_pty_output_streams().lock().unwrap().insert(
+            id.to_owned(), TerminalPtyOutputEntry { stream: stream.clone() });
+        stream
+    }
+
+    #[test]
+    fn closed_reader_stops_without_touching_host() {
+        let id = "idle-poll-test-close";
+        let stream = register(id);
+        let host = TestTerminal { reads: AtomicUsize::new(0), exited: false };
+        assert!(poll_terminal_pty_output(&host, id, &stream));
+        close_terminal_pty_output_stream(id);
+        assert!(!poll_terminal_pty_output(&host, id, &stream));
+        assert_eq!(host.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn exit_drains_final_bytes_before_closing() {
+        let id = "idle-poll-test-exit";
+        let stream = register(id);
+        let host = TestTerminal { reads: AtomicUsize::new(0), exited: true };
+        assert!(!poll_terminal_pty_output(&host, id, &stream));
+        assert_eq!(stream.replay_cache(), vec![STANDARD.encode(b"before"), STANDARD.encode(b"tail")]);
+        assert!(!poll_terminal_pty_output(&host, id, &stream));
+        assert_eq!(host.reads.load(Ordering::SeqCst), 2);
+    }
 }

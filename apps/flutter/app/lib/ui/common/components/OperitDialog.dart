@@ -3,6 +3,7 @@
 import 'package:flutter/material.dart';
 
 class OperitDialogScaffold extends StatelessWidget {
+  /// Creates the shared dialog shell with bounded or expanding content.
   const OperitDialogScaffold({
     super.key,
     required this.title,
@@ -11,6 +12,7 @@ class OperitDialogScaffold extends StatelessWidget {
     this.icon,
     this.maxWidth = 560,
     this.maxHeight,
+    this.expandContent = true,
     this.contentPadding = const EdgeInsets.fromLTRB(24, 16, 24, 20),
     this.actionsPadding = const EdgeInsets.fromLTRB(24, 0, 24, 20),
     this.titleActions = const <Widget>[],
@@ -25,6 +27,9 @@ class OperitDialogScaffold extends StatelessWidget {
   final Widget? icon;
   final double maxWidth;
   final double? maxHeight;
+
+  /// Whether bounded content fills the available height instead of wrapping.
+  final bool expandContent;
   final EdgeInsetsGeometry contentPadding;
   final EdgeInsetsGeometry actionsPadding;
   final List<Widget> titleActions;
@@ -32,6 +37,7 @@ class OperitDialogScaffold extends StatelessWidget {
   final bool closeButtonEnabled;
   final VoidCallback? onClose;
 
+  /// Builds the common dialog header, flexible content, and action bar.
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -39,8 +45,9 @@ class OperitDialogScaffold extends StatelessWidget {
     final dialogTheme = DialogTheme.of(context);
     final shape =
         dialogTheme.shape ??
-        RoundedRectangleBorder(borderRadius: BorderRadius.circular(28));
+        RoundedRectangleBorder(borderRadius: BorderRadius.circular(20));
     return Dialog(
+      constraints: BoxConstraints(maxWidth: maxWidth),
       child: ConstrainedBox(
         constraints: BoxConstraints(
           maxWidth: maxWidth,
@@ -51,7 +58,7 @@ class OperitDialogScaffold extends StatelessWidget {
           shape: shape,
           clipBehavior: Clip.antiAlias,
           child: Column(
-            mainAxisSize: maxHeight == null
+            mainAxisSize: maxHeight == null || !expandContent
                 ? MainAxisSize.min
                 : MainAxisSize.max,
             children: <Widget>[
@@ -73,8 +80,8 @@ class OperitDialogScaffold extends StatelessWidget {
                         overflow: TextOverflow.ellipsis,
                         style:
                             dialogTheme.titleTextStyle ??
-                            theme.textTheme.headlineSmall?.copyWith(
-                              fontWeight: FontWeight.w700,
+                            theme.textTheme.titleLarge?.copyWith(
+                              fontWeight: FontWeight.w600,
                             ),
                       ),
                     ),
@@ -92,12 +99,20 @@ class OperitDialogScaffold extends StatelessWidget {
                   ],
                 ),
               ),
-              if (maxHeight == null)
-                Padding(padding: contentPadding, child: child)
-              else
-                Expanded(
-                  child: Padding(padding: contentPadding, child: child),
-                ),
+              Flexible(
+                fit: maxHeight != null && expandContent
+                    ? FlexFit.tight
+                    : FlexFit.loose,
+                // Wrap-content dialogs still need a bounded, scrollable body
+                // when the window shrinks or the keyboard is visible.
+                child: maxHeight == null
+                    ? SingleChildScrollView(
+                        primary: false,
+                        padding: contentPadding,
+                        child: child,
+                      )
+                    : Padding(padding: contentPadding, child: child),
+              ),
               if (actions.isNotEmpty) ...<Widget>[
                 OperitDialogActionBar(
                   padding: actionsPadding,

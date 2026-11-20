@@ -1,23 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use flate2::read::GzDecoder;
 use operit_link::CoreLinkError;
-use operit_model::ActivePrompt::ActivePrompt;
 use operit_model::ApiKeyInfo::ApiKeyInfo;
 use operit_model::AttachmentInfo::AttachmentInfo;
-use operit_model::CharacterCard::{
-    CharacterCard, CharacterCardChatModelBindingMode, CharacterCardToolAccessConfig,
-};
-use operit_model::CharacterGroupCard::{CharacterGroupCard, GroupMemberConfig};
 use operit_model::ChatMessage::ChatMessage;
 use operit_model::ChatTurnOptions::ChatTurnOptions;
 use operit_model::FunctionType::FunctionType;
@@ -25,19 +18,14 @@ use operit_model::InputProcessingState::InputProcessingState;
 use operit_model::ModelConfigData::ApiProviderType;
 use operit_model::ModelParameter::ModelParameter;
 use operit_model::PromptFunctionType::PromptFunctionType;
-use operit_model::PromptTag::TagType;
 use operit_model::TtsConfig::{TtsConfig, TtsProviderType};
 use operit_providers::chat::enhance::ConversationService::ConversationService;
 use operit_providers::chat::EnhancedAIService::EnhancedAIService;
 use operit_providers::market::MarketStatsApiService::{MarketEntrySummary, MarketListPage};
 use operit_runtime::core::chat::ChatRuntimeSlot::ChatRuntimeSlot;
-use operit_runtime::data::preferences::ActivePromptManager::ActivePromptManager;
 use operit_runtime::data::preferences::ApiPreferences::ApiPreferences;
-use operit_runtime::data::preferences::CharacterCardManager::CharacterCardManager;
-use operit_runtime::data::preferences::CharacterGroupCardManager::CharacterGroupCardManager;
 use operit_runtime::data::preferences::FunctionalConfigManager::FunctionalConfigManager;
 use operit_runtime::data::preferences::ModelConfigManager::ModelConfigManager;
-use operit_runtime::data::preferences::PromptTagManager::PromptTagManager;
 use operit_runtime::data::preferences::TtsConfigManager::TtsConfigManager;
 use operit_runtime::services::core::MessageCoordinationDelegate::MessageCoordinationDelegate;
 use operit_runtime::services::GitHubOAuthBrokerService::GitHubOAuthBrokerLoginCompletion;
@@ -45,22 +33,20 @@ use operit_runtime::services::TtsSynthesisService::TtsSynthesisService;
 use operit_store::repository::ChatHistoryManager::ChatHistoryManager;
 use operit_tools::tools::ToolPermissionSystem::{AiPermissionMode, PermissionRequestResult};
 use operit_tools::ToolExecutionManager::{AITool, ToolParameter};
+use operit_tools::tools::packTool::RuntimePackageManager::ToolPkgCoreCommandInfo;
 use operit_util::stream::Stream::Stream;
 use operit_util::GithubReleaseUtil::{
     FullUpdateProgressEvent, FullUpdateStatus, FullUpdateTarget, GithubReleaseUtil,
 };
-use sha2::{Digest, Sha256};
-use tar::Archive;
-use zip::ZipArchive;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-mod host_ops;
+pub(crate) mod host_ops;
 pub(crate) mod link;
 pub(crate) mod network_control_ui;
 mod transfer;
-mod web_access;
+mod web;
 
 use crate::bootstrap::{
     cli_identities, create_cli_identity, persist_cli_storage_config,
@@ -69,13 +55,17 @@ use crate::bootstrap::{
 };
 use crate::browser_callback::CliOAuthCallback;
 use crate::chat_runtime::{
-    run_chat_send_command_with_core, run_chat_shell_command_with_core, run_shell_command,
+    run_chat_shell_command_with_core, run_shell_command,
 };
 use crate::core_proxy::local_cli_core;
+pub(crate) use host_ops::install_downloaded_cli_update;
 use host_ops::{schedule_cli_uninstall, schedule_cli_update};
+#[cfg(test)]
+use host_ops::extract_cli_binary_from_zip;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 use link::run_link_command;
 use transfer::{run_backup_command, run_export_command, run_import_command};
-use web_access::run_web_access_command;
+use web::run_web_command;
 
 const CLI_DEFAULT_TTS_PROVIDER_TYPE: &str = "OPENAI_COMPATIBLE";
 
@@ -109,6 +99,7 @@ pub(crate) fn emit_cli_json(value: serde_json::Value) {
     );
 }
 
+/// Sets output mode and owns the selected command dispatcher on the heap.
 pub(crate) async fn run_cli_root(args: &[String]) -> Result<(), String> {
     let json = args.iter().any(|arg| arg == "--json");
     let commandArgs = args
@@ -117,7 +108,8 @@ pub(crate) async fn run_cli_root(args: &[String]) -> Result<(), String> {
         .cloned()
         .collect::<Vec<_>>();
     begin_cli_output(json);
-    let result = run_cli_root_inner(&commandArgs).await;
+    // Keep command dispatch off the caller's stack while it starts the Core tree.
+    let result = Box::pin(run_cli_root_inner(&commandArgs)).await;
     finish_cli_output();
     result
 }
@@ -125,20 +117,37 @@ pub(crate) async fn run_cli_root(args: &[String]) -> Result<(), String> {
 /// Dispatches one CLI invocation after global options are removed.
 async fn run_cli_root_inner(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
-        print_cli_usage();
+        return print_cli_usage().await;
+    }
+
+    // Local help routes remain explicit; plugin help uses the ready Core command catalog.
+    if matches!(args[0].as_str(), "help" | "-h" | "--help") {
+        return print_cli_help(args.get(1).map(String::as_str)).await;
+    }
+    if args.len() >= 2 && matches!(args[1].as_str(), "help" | "-h" | "--help") {
+        return print_cli_help(Some(&args[0])).await;
+    }
+    // Version reporting is local metadata; do not claim a Core owner for it.
+    if args.len() == 1 && args[0].as_str() == "version" {
+        print_local_version();
         return Ok(());
     }
 
     if args[0].as_str() == "link" {
-        return run_link_command(&args[1..]).await;
+        return Box::pin(run_link_command(&args[1..])).await;
     }
 
+    Box::pin(run_cli_local_command(args)).await
+}
+
+/// Keeps unrelated local command state out of the persistent Link dispatch stack.
+async fn run_cli_local_command(args: &[String]) -> Result<(), String> {
     if args[0].as_str() == "identity" {
         return run_identity_command(&args[1..]);
     }
 
     if args[0].as_str() == "web" {
-        return run_web_access_command(&args[1..]).await;
+        return run_web_command(&args[1..]);
     }
 
     if args[0].as_str() == "install" {
@@ -150,51 +159,48 @@ async fn run_cli_root_inner(args: &[String]) -> Result<(), String> {
     }
 
     let localArgs = scope_cli_storage_command_args(args)?;
+    if let Some(result) = crate::daemon::try_run_cli_command(&cli_core_command_args(&localArgs)?, cli_json_mode()).await {
+        return result;
+    }
     let mut core = local_cli_core().await?;
+    let pluginCommands = read_cli_plugin_commands(&mut core).await?;
 
     let result = match localArgs[0].as_str() {
         "model" if localArgs.get(1).map(String::as_str) == Some("codex-login") => {
             run_codex_login_command(&mut core, &localArgs[2..]).await
         }
         "model" => run_core_command_and_print(&mut core, &localArgs).await,
-        "version" => run_version_core_command(&mut core).await,
         "prefs" => run_core_command_and_print(&mut core, &args).await,
         "host" => run_core_command_and_print(&mut core, &args).await,
         "log" => run_core_command_and_print(&mut core, &args).await,
         "local-models" => run_core_command_and_print(&mut core, &args).await,
         "stt" => run_core_command_and_print(&mut core, &args).await,
-        "memory" => run_core_command_and_print(&mut core, &args).await,
         "tts" => run_tts_cli_command(&core, &args[1..]).await,
         "export" => run_export_command(&mut core, &args[1..]).await,
         "import" => run_import_command(&mut core, &args[1..]).await,
         "backup" => run_backup_command(&mut core, &args[1..]).await,
-        "chat" if args.get(1).map(String::as_str) == Some("send") => {
-            run_chat_send_command_with_core(&mut core, &args[2..]).await
-        }
         "chat" if args.get(1).map(String::as_str) == Some("shell") => {
             run_chat_shell_command_with_core(&mut core, &args[2..]).await
         }
         "chat" => run_core_command_and_print(&mut core, &args).await,
         "workspace" => run_core_command_and_print(&mut core, &args).await,
         "storage" => run_local_core_command_and_print(&mut core, &localArgs).await,
+        "sync" => run_core_command_and_print(&mut core, &args).await,
         "shell" => run_shell_command(&mut core, &args[1..]).await,
-        "tag" => run_core_command_and_print(&mut core, &args).await,
-        "character" => run_core_command_and_print(&mut core, &args).await,
-        "group" => run_core_command_and_print(&mut core, &args).await,
-        "active-prompt" => run_core_command_and_print(&mut core, &args).await,
         "approval" => run_core_command_and_print(&mut core, &args).await,
         "tool" => run_core_command_and_print(&mut core, &args).await,
         "market" => run_market_cli_command(&mut core, &args).await,
         "update" => run_update_cli_command(&mut core, &args[1..]).await,
+        "extension" => run_core_command_and_print(&mut core, &args).await,
         "skill" => run_core_command_and_print(&mut core, &args).await,
         "package" => run_core_command_and_print(&mut core, &args).await,
         "plugin" => run_core_command_and_print(&mut core, &args).await,
         "mcp" => run_core_command_and_print(&mut core, &args).await,
         "usage" => run_core_command_and_print(&mut core, &args).await,
-        _ => {
-            print_cli_usage();
-            Ok(())
+        command if pluginCommands.iter().any(|entry| entry.name == command) => {
+            run_core_command_and_print(&mut core, &localArgs).await
         }
+        command => Err(format!("Unknown command: {command}; run 'operit2 cli help' to list commands.")),
     };
     result.map_err(rewrite_cli_usage_message)
 }
@@ -447,25 +453,16 @@ fn run_tts_config_cli_command(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Synthesizes speech through a character or exact TTS configuration.
-/// Synthesizes speech through the selected character or TTS configuration.
+/// Synthesizes speech through an explicit TTS configuration.
 fn run_tts_synthesize_cli_command(
     core: &crate::core_proxy::CliCore,
     args: &[String],
 ) -> Result<(), String> {
-    let mut characterId: Option<String> = None;
     let mut configId: Option<String> = None;
     let mut text: Option<String> = None;
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
-            "--character" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "--character requires a value".to_string())?;
-                characterId = Some(value.clone());
-            }
             "--text" => {
                 index += 1;
                 let value = args
@@ -486,15 +483,8 @@ fn run_tts_synthesize_cli_command(
     }
     let text = text.ok_or_else(|| "--text is required".to_string())?;
     let service = TtsSynthesisService::getInstance(core.localHostManager()?);
-    let result = match (characterId, configId) {
-        (Some(characterId), None) => service.synthesizeForCharacter(&characterId, &text)?,
-        (None, Some(configId)) => service.synthesizeWithConfig(&configId, &text)?,
-        _ => {
-            return Err(
-                "tts synthesize requires exactly one of --character or --config".to_string(),
-            )
-        }
-    };
+    let configId = configId.ok_or_else(|| "tts synthesize requires --config <id>".to_string())?;
+    let result = service.synthesizeWithConfig(&configId, &text)?;
     if cli_json_mode() {
         emit_cli_json(serde_json::json!({ "audioPaths": result.audioPaths }));
     } else {
@@ -520,7 +510,6 @@ fn print_tts_usage() {
     println!("operit2 cli tts config create-local <name> <model-id> <version> <voice> <speed>");
     println!("operit2 cli tts config update <id> <name|endpoint|api-key|model|voice|response-format|speed|http-method|request-body|content-type> <value>");
     println!("operit2 cli tts config delete <id>");
-    println!("operit2 cli tts synthesize --character <id> --text <text>");
     println!("operit2 cli tts synthesize --config <id> --text <text>");
 }
 
@@ -530,8 +519,9 @@ async fn run_update_cli_command(
     args: &[String],
 ) -> Result<(), String> {
     if args.is_empty() {
-        let target = FullUpdateTarget::cliForCurrentHost()?;
+        let target = crate::cli::host_ops::cli_update_target()?;
         return run_update_with_progress(
+            core.localHostManager()?,
             env!("CARGO_PKG_VERSION"),
             target,
             UpdateApplyMode::InstallCurrentTarget,
@@ -541,7 +531,7 @@ async fn run_update_cli_command(
 
     match args[0].as_str() {
         "check" if args.len() == 1 => {
-            let target = FullUpdateTarget::cliForCurrentHost()?;
+            let target = crate::cli::host_ops::cli_update_target()?;
             let command = vec![
                 "update".to_string(),
                 "check".to_string(),
@@ -553,13 +543,14 @@ async fn run_update_cli_command(
             run_core_command_and_print(core, &command).await
         }
         "target" if args.len() == 1 => {
-            let target = FullUpdateTarget::cliForCurrentHost()?;
+            let target = crate::cli::host_ops::cli_update_target()?;
             print_update_target(target)
         }
         "run" if args.len() == 2 => {
             let current_version = args.get(1).ok_or_else(|| cli_update_usage("run"))?;
-            let target = FullUpdateTarget::cliForCurrentHost()?;
+            let target = crate::cli::host_ops::cli_update_target()?;
             run_update_with_progress(
+                core.localHostManager()?,
                 current_version,
                 target,
                 UpdateApplyMode::InstallCurrentTarget,
@@ -568,12 +559,12 @@ async fn run_update_cli_command(
         }
         "download" if args.len() == 2 => {
             let current_version = args.get(1).ok_or_else(|| cli_update_usage("download"))?;
-            let target = FullUpdateTarget::cliForCurrentHost()?;
-            run_update_with_progress(current_version, target, UpdateApplyMode::DownloadOnly).await
+            let target = crate::cli::host_ops::cli_update_target()?;
+            run_update_with_progress(core.localHostManager()?, current_version, target, UpdateApplyMode::DownloadOnly).await
         }
         "check" if args.len() == 2 => {
             let current_version = args.get(1).ok_or_else(|| cli_update_usage("check"))?;
-            let target = FullUpdateTarget::cliForCurrentHost()?;
+            let target = crate::cli::host_ops::cli_update_target()?;
             let command = vec![
                 "update".to_string(),
                 "check".to_string(),
@@ -635,23 +626,25 @@ enum UpdateApplyMode {
 
 /// Checks, downloads, and optionally installs a full CLI update.
 async fn run_update_with_progress(
+    context: &operit_host_api::HostManager::HostManager,
     current_version: &str,
     target: FullUpdateTarget,
     apply_mode: UpdateApplyMode,
 ) -> Result<(), String> {
     let package_name = target.assetName()?;
     let target_for_install = target.clone();
+    let current_asset = target.assetNameForVersion(current_version)?;
     let channel = GithubReleaseUtil::fullUpdateChannelForVersion(current_version)?;
-    let status = GithubReleaseUtil::checkForFullUpdateBlocking(current_version, target)?;
+    let status = GithubReleaseUtil::checkForFullUpdate(current_version, target).await?;
     match status {
         FullUpdateStatus::Available(info) => {
-            let work_dir = std::env::temp_dir().join("operit2").join("full_update");
             let last_line_len = Arc::new(Mutex::new(0usize));
             let progress_line_len = Arc::clone(&last_line_len);
-            let package_path = GithubReleaseUtil::downloadAndPrepareFullUpdateBlocking(
-                &info.downloadUrl,
-                &info.assetName,
-                &work_dir,
+            let package_path = operit_util::IncrementalUpdate::prepareUpdate(
+                info.clone(),
+                current_asset,
+                context,
+                operit_host_api::HttpDownloadControl::new(),
                 move |event| match event {
                     FullUpdateProgressEvent::StageChanged { stage: _, message } => {
                         let mut last_line_len = progress_line_len
@@ -689,15 +682,23 @@ async fn run_update_with_progress(
                         *last_line_len = line.len();
                     }
                 },
-            )?;
+            )
+            .await?;
+            let package_path =
+                operit_vfs::VisualFileSystem::VisualFileSystem::runtimePath(
+                    &package_path,
+                )?;
             let mut last_line_len = last_line_len
                 .lock()
                 .expect("progress line length mutex poisoned");
             clear_progress_line(&mut *last_line_len);
             let mut install_status = None;
             if apply_mode == UpdateApplyMode::InstallCurrentTarget {
+                let vfs =
+                    (context).vfs()?;
                 install_status = Some(handle_downloaded_update_package(
                     &target_for_install,
+                    &vfs,
                     &package_path,
                 )?);
             }
@@ -718,7 +719,7 @@ async fn run_update_with_progress(
                 println!("Current version: {current_version}");
                 println!("Channel: {channel}");
                 println!("Package: {}", info.assetName);
-                println!("Downloaded to: {}", package_path.display());
+                println!("Downloaded to: {package_path}");
                 println!("Release page: {}", info.releasePageUrl);
                 if apply_mode == UpdateApplyMode::DownloadOnly {
                     println!("Install status: download-only");
@@ -798,37 +799,16 @@ pub(crate) enum DownloadedUpdateInstallStatus {
     TargetMismatch,
 }
 
-pub(crate) fn install_downloaded_cli_update(
-    target: &FullUpdateTarget,
-    package_path: &Path,
-    output: InstallOutput,
-) -> Result<DownloadedUpdateInstallStatus, String> {
-    if target.product != "cli" {
-        return Ok(DownloadedUpdateInstallStatus::TargetMismatch);
-    }
-    let current_target = FullUpdateTarget::cliForCurrentHost()?;
-    if target != &current_target {
-        return Ok(DownloadedUpdateInstallStatus::TargetMismatch);
-    }
-    let source = extract_cli_binary_from_package(target, package_path)?;
-    let install_state = current_cli_install_state()?;
-    match install_state {
-        CliInstallState::Installed => {
-            install_cli_from_source(&source, InstallMode::Update, output, |_| {})?;
-            Ok(DownloadedUpdateInstallStatus::Scheduled)
-        }
-        CliInstallState::NotInstalled => Ok(DownloadedUpdateInstallStatus::NotInstalled),
-    }
-}
-
 /// Installs a downloaded package and returns the exact installation outcome.
 fn handle_downloaded_update_package(
     target: &FullUpdateTarget,
-    package_path: &Path,
+    vfs: &VisualFileSystem,
+    package_path: &str,
 ) -> Result<DownloadedUpdateInstallStatus, String> {
+    let source = vfs.file(package_path)?;
     let status = install_downloaded_cli_update(
         target,
-        package_path,
+        &source,
         if cli_json_mode() {
             InstallOutput::Silent
         } else {
@@ -895,6 +875,7 @@ pub(crate) enum CliInstallProgress {
     Complete,
 }
 
+/// Installs the executable and the runtime assets declared by the host.
 fn install_cli_from_source(
     source: &Path,
     mode: InstallMode,
@@ -919,6 +900,12 @@ fn install_cli_from_source(
         return Ok(());
     }
 
+    for library in host_ops::cli_runtime_libraries() {
+        copy_cli_binary(&source.with_file_name(library), &install_dir.join(library))?;
+    }
+    for directory in host_ops::cli_runtime_directories() {
+        copy_cli_runtime_directory(&source.with_file_name(directory), &install_dir.join(directory))?;
+    }
     on_progress(CliInstallProgress::CopyOperit);
     copy_cli_binary(source, &operit)?;
     on_progress(CliInstallProgress::CopyOperit2);
@@ -998,6 +985,22 @@ fn uninstall_cli() -> Result<(), String> {
 
     remove_file_if_exists(&operit)?;
     remove_file_if_exists(&operit2)?;
+    for library in host_ops::cli_runtime_libraries() {
+        remove_file_if_exists(&install_dir.join(library))?;
+    }
+    for directory in host_ops::cli_runtime_directories() {
+        let target = install_dir.join(directory);
+        if !target.is_absolute() || target.parent() != Some(install_dir.as_path()) {
+            return Err(format!("Runtime directory escapes CLI installation: {}", target.display()));
+        }
+        if target.exists() {
+            let metadata = fs::symlink_metadata(&target).map_err(|error| error.to_string())?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!("Runtime directory is a link: {}", target.display()));
+            }
+            fs::remove_dir_all(&target).map_err(|error| error.to_string())?;
+        }
+    }
     remove_cli_install_dir_from_path(&install_dir)?;
 
     if cli_json_mode() {
@@ -1106,6 +1109,46 @@ fn cli_install_dir() -> Result<PathBuf, String> {
 fn cli_profile_file() -> Result<PathBuf, String> {
     let home = env::var_os("HOME").ok_or_else(|| "HOME is required".to_string())?;
     Ok(PathBuf::from(home).join(".profile"))
+}
+
+/// Copies a complete runtime tree without following links and preserves an identical source.
+fn copy_cli_runtime_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|error| format!("{}: {error}", source.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "Runtime source is not a regular directory: {}",
+            source.display()
+        ));
+    }
+    if destination.exists() {
+        let metadata = fs::symlink_metadata(destination).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "Runtime destination is not a regular directory: {}",
+                destination.display()
+            ));
+        }
+        if existing_paths_equal(source, destination)? {
+            return Ok(());
+        }
+    }
+    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let kind = entry.file_type().map_err(|error| error.to_string())?;
+        if kind.is_dir() {
+            copy_cli_runtime_directory(&entry.path(), &destination.join(entry.file_name()))?;
+        } else if kind.is_file() {
+            copy_cli_binary(&entry.path(), &destination.join(entry.file_name()))?;
+        } else {
+            return Err(format!(
+                "Runtime entry is not a regular file: {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn copy_cli_binary(source: &Path, destination: &Path) -> Result<(), String> {
@@ -1366,78 +1409,6 @@ fn windows_path_part_matches(part: &str, target: &Path) -> bool {
     part.eq_ignore_ascii_case(target)
 }
 
-fn extract_cli_binary_from_package(
-    target: &FullUpdateTarget,
-    package_path: &Path,
-) -> Result<PathBuf, String> {
-    let extract_dir = std::env::temp_dir()
-        .join("operit2")
-        .join("cli_update_extract")
-        .join(unique_suffix());
-    fs::create_dir_all(&extract_dir).map_err(|error| error.to_string())?;
-    match target.platform.as_str() {
-        "windows" => extract_cli_binary_from_zip(package_path, &extract_dir),
-        "linux" | "macos" => extract_cli_binary_from_tar_gz(package_path, &extract_dir),
-        other => Err(format!("Unsupported CLI update package platform: {other}")),
-    }
-}
-
-fn extract_cli_binary_from_zip(package_path: &Path, extract_dir: &Path) -> Result<PathBuf, String> {
-    let file = fs::File::open(package_path).map_err(|error| error.to_string())?;
-    let mut archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
-    let mut entry = archive.by_name("operit2.exe").map_err(|error| {
-        format!(
-            "operit2.exe not found in {}: {error}",
-            package_path.display()
-        )
-    })?;
-    let destination = extract_dir.join("operit2.exe");
-    let mut output = fs::File::create(&destination).map_err(|error| error.to_string())?;
-    io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
-    Ok(destination)
-}
-
-fn extract_cli_binary_from_tar_gz(
-    package_path: &Path,
-    extract_dir: &Path,
-) -> Result<PathBuf, String> {
-    let file = fs::File::open(package_path).map_err(|error| error.to_string())?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
-    for entry in archive.entries().map_err(|error| error.to_string())? {
-        let mut entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path().map_err(|error| error.to_string())?;
-        if archive_path_is_exact_file(&path, "operit2") {
-            let destination = extract_dir.join("operit2");
-            entry
-                .unpack(&destination)
-                .map_err(|error| error.to_string())?;
-            #[cfg(unix)]
-            {
-                let mut permissions = fs::metadata(&destination)
-                    .map_err(|error| error.to_string())?
-                    .permissions();
-                permissions.set_mode(0o755);
-                fs::set_permissions(&destination, permissions)
-                    .map_err(|error| error.to_string())?;
-            }
-            return Ok(destination);
-        }
-    }
-    Err(format!("operit2 not found in {}", package_path.display()))
-}
-
-fn archive_path_is_exact_file(path: &Path, file_name: &str) -> bool {
-    let mut components = path.components().filter_map(|component| match component {
-        Component::CurDir => None,
-        Component::Normal(value) => Some(value),
-        _ => Some(OsStr::new("")),
-    });
-    let first = components.next();
-    let second = components.next();
-    first == Some(OsStr::new(file_name)) && second.is_none()
-}
-
 fn unique_suffix() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1477,11 +1448,19 @@ fn rewrite_cli_usage_message(message: String) -> String {
     }
 }
 
+/// Carries the caller's current directory across local and daemon command dispatch.
+fn cli_core_command_args(args: &[String]) -> Result<Vec<String>, String> {
+    let directory = std::env::current_dir().map_err(|error| error.to_string())?;
+    let directory = operit_vfs::VfsPath::normalizeWorkspaceBindingPath(&directory.to_string_lossy())?;
+    let mut command = vec!["--cwd".into(), directory];
+    command.extend_from_slice(args);
+    Ok(command)
+}
 async fn run_core_command_and_print(
     core: &mut crate::core_proxy::CliCore,
     args: &[String],
 ) -> Result<(), String> {
-    let mut commandArgs = args.to_vec();
+    let mut commandArgs = cli_core_command_args(args)?;
     if cli_json_mode() {
         commandArgs.push("--json".to_string());
     }
@@ -1725,7 +1704,7 @@ async fn run_local_core_command_and_print(
     core: &mut crate::core_proxy::CliCore,
     args: &[String],
 ) -> Result<(), String> {
-    let mut commandArgs = args.to_vec();
+    let mut commandArgs = cli_core_command_args(args)?;
     if cli_json_mode() {
         commandArgs.push("--json".to_string());
     }
@@ -1755,7 +1734,7 @@ async fn run_local_core_command_and_print(
     Ok(())
 }
 
-fn rewrite_core_command_usage_message(message: String) -> String {
+pub(crate) fn rewrite_core_command_usage_message(message: String) -> String {
     let ends_with_newline = message.ends_with('\n');
     let lines = message
         .lines()
@@ -1788,23 +1767,18 @@ fn core_command_error_message(error: CoreLinkError) -> String {
     }
 }
 
-async fn run_version_core_command(core: &mut crate::core_proxy::CliCore) -> Result<(), String> {
-    let core_version = core
-        .application()
-        .coreVersion()
-        .await
-        .map_err(|error| error.to_string())?;
+fn print_local_version() {
     if cli_json_mode() {
         emit_cli_json(serde_json::json!({
             "cliVersion": env!("CARGO_PKG_VERSION"),
-            "coreVersion": core_version,
+            "coreVersion": operit_runtime::CORE_VERSION,
             "linkVersion": operit_link::LINK_VERSION,
             "targetOs": std::env::consts::OS,
             "targetArch": std::env::consts::ARCH,
         }));
     } else {
         println!("CLI version: {}", env!("CARGO_PKG_VERSION"));
-        println!("Core version: {core_version}");
+        println!("Core version: {}", operit_runtime::CORE_VERSION);
         println!("Link version: {}", operit_link::LINK_VERSION);
         println!(
             "Target: {} {}",
@@ -1812,105 +1786,170 @@ async fn run_version_core_command(core: &mut crate::core_proxy::CliCore) -> Resu
             std::env::consts::ARCH
         );
     }
-    Ok(())
 }
 
 pub(crate) fn print_root_usage() {
     if cli_json_mode() {
-        emit_cli_json(serde_json::json!({ "usage": "operit2 [tui|cli|install|uninstall]" }));
+        emit_cli_json(
+            serde_json::json!({ "usage": "operit2 [tui|cli|daemon|install|uninstall]" }),
+        );
         return;
     }
-    println!("operit2");
+    println!("operit2                       Start the interactive TUI");
+    println!("operit2 tui [options]         Start the TUI ('operit2 tui --help' for options)");
+    println!("operit2 cli <command> [args]  Run a CLI command");
+    println!("operit2 daemon <command>      Run or control the headless Core daemon");
+    println!("operit2 rescue <command>      Export, inspect, import, or resume data rescue");
     println!("operit2 install [--source <path>]");
     println!("operit2 uninstall");
-    println!("operit2 [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>] [--update-current-version <version>]");
-    println!("operit2 tui [--link-server --link-bind <addr:port> --link-token <token>] [--link-join <session>] [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>] [--update-current-version <version>]");
-    println!("operit2 cli <version|identity|prefs|host|log|local-models|stt|memory|tts|export|import|backup|model|chat|workspace|storage|tag|character|group|active-prompt|approval|tool|market|update|install|uninstall|skill|package|plugin|mcp|link|web|shell>");
-    println!("operit2 cli --link <session> <version|prefs|host|log|local-models|stt|memory|export|import|backup|model|chat|workspace|storage|tag|character|group|active-prompt|approval|tool|market|update|skill|package|plugin|mcp|shell>");
     println!();
-    print_cli_usage();
+    println!("Run 'operit2 cli help' to list CLI commands.");
 }
 
-/// Prints the complete CLI usage entry point.
-fn print_cli_usage() {
+/// One CLI command family with the short description shown by `operit2 cli help`.
+/// Inherent CLI families live here; plugin families come from the enabled Core catalog.
+const CLI_COMMANDS: &[(&str, &str)] = &[
+    ("version", "Show CLI, core, and link versions"),
+    ("identity", "Manage local node identities"),
+    ("chat", "Manage chat sessions and messages"),
+    ("shell", "Interactive chat shell"),
+    ("tts", "Configure text-to-speech and synthesize"),
+    ("stt", "Configure speech-to-text and transcribe"),
+    ("model", "Manage providers, models, and parameters"),
+    ("local-models", "Manage local model files"),
+    ("workspace", "Bind workspaces to chats and run commands"),
+    ("tool", "List, show, or execute tools"),
+    ("approval", "Manage AI permission mode and tool approval"),
+    ("skill", "Manage skills"),
+    ("package", "Manage ToolPkg packages"),
+    ("plugin", "Manage plugins"),
+    ("mcp", "Manage MCP servers"),
+    ("extension", "Move extensions between device and space"),
+    ("market", "Browse, publish, and install from the market"),
+    ("prefs", "Show or change preferences"),
+    ("host", "Show host information"),
+    ("storage", "Show storage paths or migrate storage"),
+    ("sync", "Reset local synchronization transaction history (recovery)"),
+    ("log", "Show, package, or clear logs"),
+    ("backup", "Create, restore, or inspect backups"),
+    ("export", "Export memory, chat, or a snapshot"),
+    ("import", "Import memory, chat, snapshot, or operit1 config"),
+    ("usage", "Show token usage summary and records"),
+    ("update", "Check or run self-update"),
+    ("link", "Pair peers and manage link sessions and spaces"),
+    ("web", "Open the Web Access UI"),
+    ("install", "Install CLI integration"),
+    ("uninstall", "Uninstall CLI integration"),
+];
+
+/// Prints the compact level-1 command list shown by `operit2 cli [help]`.
+async fn print_cli_usage() -> Result<(), String> {
+    let mut core = local_cli_core().await?;
+    let pluginCommands = read_cli_plugin_commands(&mut core).await?;
+    let lines = cli_usage_lines(&pluginCommands);
     if cli_json_mode() {
-        emit_cli_json(serde_json::json!({ "usage": "operit2 cli <command> [arguments]" }));
-        return;
+        emit_cli_json(serde_json::json!({ "usage": lines }));
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
     }
-    println!("operit2 cli --link <session> <version|chat|workspace|local-models|stt>");
-    println!("operit2 cli version");
-    print_identity_usage();
-    println!("operit2 cli prefs <show|thinking|thinking-quality|stream|media-history|mcp-timeout>");
-    println!("operit2 cli host <show|capabilities|paths>");
-    println!("operit2 cli storage <paths|migrate>");
-    println!("operit2 cli log <show|package|path|clear>");
-    println!("operit2 cli local-models <paths|catalog|show|installed|installed-show|install|install-statuses|install-status|install-cancel|verify|delete|engine-delete>");
-    println!(
-        "operit2 cli stt <provider-list|provider-model-list|config|transcribe|transcribe-config>"
-    );
-    println!("operit2 cli memory <character|shared|mount|unmount>");
-    println!("operit2 cli tts config <list|show|current|use|create|update|delete>");
-    println!("operit2 cli tts synthesize --character <id> --text <text>");
-    println!("operit2 cli export <memory|chat|snapshot>");
-    println!("operit2 cli import <memory|chat|snapshot|operit1-model-config>");
-    println!("operit2 cli backup <create|restore|inspect|inspect-operit1-model-config>");
-    println!("operit2 cli model <init|list|show|set|set-key|api-settings-full|custom-headers|request-queue|api-key-pool|custom-parameters|parameters|builtin-tools|tool-call|direct-image|direct-audio|direct-video|google-search|params|context-show|context-set|summary-show|summary-set|function-list|function-show|function-set|function-reset>");
-    println!("operit2 cli tag <list|show|create|update|delete>");
-    println!("operit2 cli character <init|list|show|create|update|delete|set-active|combine|reset-default>");
-    println!("operit2 cli group <init|list|show|create|update|delete|set-active|duplicate>");
-    println!("operit2 cli active-prompt <show|set-card|set-group|activate-for-chat|resolved-card>");
-    println!("operit2 cli approval <status|list|allow|ask|forbid|tool>");
-    println!("operit2 cli tool <list|show|exec>");
-    println!(
-        "operit2 cli market <auth|rank|list|search|show|comments|comment|like|notifications|my|publish|install|download>"
-    );
-    println!("operit2 cli update [check|target]");
-    println!("operit2 cli usage <summary|records|models|clear>");
-    println!("operit2 cli install [--source <path>]");
-    println!("operit2 cli uninstall");
-    println!("operit2 cli skill <dir|list|more|load|show|create|import-zip|delete|visible|errors>");
-    println!("operit2 cli package <help|dir|list|more|load|show|import|enable|disable|use|exec>");
-    println!("operit2 cli plugin <help|list|more|load|show|import|enable|disable>");
-    println!("operit2 cli mcp <dir|list|show|import|export|remove|enable|disable|start|kill|tools|config|config-set|local-set|meta|meta-set|describe>");
-    println!(
-        "operit2 cli link <serve|discover|hello|pair-start|pair-finish|connect|space|sessions|session-delete|accepted-sessions|accepted-session-delete|ping|refresh|stream-probe>"
-    );
-    println!("operit2 cli web <open|close|status|token>");
-    println!("operit2 cli shell [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
-    println!("operit2 cli chat <new|list|show|current|switch|delete|delete-message|clear|rollback|branch|branches|lock|pin|stats|bind-character|bind-group|set-group|shell|send>");
-    println!("operit2 cli chat new [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
-    println!("operit2 cli chat list");
-    println!("operit2 cli chat show <chat-id> [--runtime]");
-    println!("operit2 cli chat current");
-    println!("operit2 cli chat switch <chat-id>");
-    println!("operit2 cli chat delete <chat-id>");
-    println!("operit2 cli chat delete-message <message-timestamp>");
-    println!("operit2 cli chat clear");
-    println!("operit2 cli chat rollback <message-timestamp>");
-    println!("operit2 cli chat branch [--up-to <message-timestamp>]");
-    println!("operit2 cli chat branches [parent-chat-id]");
-    println!("operit2 cli chat lock <chat-id> <true|false>");
-    println!("operit2 cli chat pin <chat-id> <true|false>");
-    println!("operit2 cli chat stats");
-    println!("operit2 cli chat bind-character <chat-id> <character-card-name>");
-    println!("operit2 cli chat bind-group <chat-id> <character-group-id>");
-    println!("operit2 cli chat set-group <chat-id> <group-name>");
-    println!("operit2 cli chat shell [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
-    println!("operit2 cli chat send [--chat <chat-id>] <message>");
-    println!(
-        "operit2 cli workspace <default-path|create-default|bind-default|bind|unbind|list|chats|commands|commands-path|run|run-path>"
-    );
-    println!("operit2 cli workspace default-path <chat-id>");
-    println!("operit2 cli workspace create-default <chat-id> [project-type]");
-    println!("operit2 cli workspace bind-default <chat-id> [project-type]");
-    println!("operit2 cli workspace bind <chat-id> <workspace>");
-    println!("operit2 cli workspace unbind <chat-id>");
-    println!("operit2 cli workspace list");
-    println!("operit2 cli workspace chats <workspace>");
-    println!("operit2 cli workspace commands <chat-id>");
-    println!("operit2 cli workspace commands-path <workspace>");
-    println!("operit2 cli workspace run <chat-id> <command-id>");
-    println!("operit2 cli workspace run-path <workspace> <command-id>");
+    Ok(())
+}
+
+/// Reads enabled plugin commands through the existing authenticated Core registry.
+async fn read_cli_plugin_commands(
+    core: &mut crate::core_proxy::CliCore,
+) -> Result<Vec<ToolPkgCoreCommandInfo>, String> {
+    let output = core
+        .runCoreCommand(&["plugin".to_string(), "commands".to_string(), "--json".to_string()])
+        .await
+        .map_err(core_command_error_message)?;
+    let commands: Vec<ToolPkgCoreCommandInfo> = serde_json::from_str(&output.stdout)
+        .map_err(|error| format!("Invalid plugin command catalog: {error}"))?;
+    for command in &commands {
+        if CLI_COMMANDS.iter().any(|(name, _)| *name == command.name) {
+            return Err(format!("Plugin command conflicts with CLI command: {}", command.name));
+        }
+    }
+    Ok(commands)
+}
+
+/// Formats inherent CLI commands together with the actual enabled plugin descriptions.
+fn cli_usage_lines(pluginCommands: &[ToolPkgCoreCommandInfo]) -> Vec<String> {
+    let mut lines = vec![
+        "operit2 cli <command> [arguments...]".to_string(),
+        String::new(),
+        "Global options:".to_string(),
+        "  --json              Emit machine-readable JSON output".to_string(),
+        "  --link <session>    Run a command through link session <session>".to_string(),
+        String::new(),
+        "Commands:".to_string(),
+    ];
+    for (name, description) in CLI_COMMANDS {
+        lines.push(format!("  {name:<15}  {description}"));
+    }
+    for command in pluginCommands {
+        lines.push(format!("  {:<15}  {}", command.name, command.description));
+    }
+    lines.push(String::new());
+    lines.push("Run 'operit2 cli help <command>' for details on one command.".to_string());
+    lines
+}
+
+/// Prints help for one level: no command lists all families, a command name
+/// prints that family's usage only. Families with usage owned by the CLI print
+/// locally; the rest forward to the core, which prints its own usage.
+async fn print_cli_help(command: Option<&str>) -> Result<(), String> {
+    let Some(command) = command else {
+        return print_cli_usage().await;
+    };
+    match command {
+        "identity" => {
+            print_identity_usage();
+            Ok(())
+        }
+        "tts" => {
+            print_tts_usage();
+            Ok(())
+        }
+        "update" => {
+            print_update_usage();
+            Ok(())
+        }
+        "install" => {
+            print_install_usage();
+            Ok(())
+        }
+        "uninstall" => {
+            print_uninstall_usage();
+            Ok(())
+        }
+        "link" => {
+            link::print_link_usage();
+            Ok(())
+        }
+        "web" => {
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!({ "usage": "operit2 cli web open" }));
+            } else {
+                println!("operit2 cli web open");
+            }
+            Ok(())
+        }
+        family if CLI_COMMANDS.iter().any(|(name, _)| *name == family) => {
+            let mut core = local_cli_core().await?;
+            run_core_command_and_print(&mut core, &[family.to_string()]).await
+        }
+        command => {
+            let mut core = local_cli_core().await?;
+            let pluginCommands = read_cli_plugin_commands(&mut core).await?;
+            if !pluginCommands.iter().any(|entry| entry.name == command) {
+                return Err(format!("Unknown command: {command}; run 'operit2 cli help' to list commands."));
+            }
+            run_core_command_and_print(&mut core, &[command.to_string()]).await
+        }
+    }
 }
 
 /// Prints local identity commands that run before Core startup.
@@ -1926,168 +1965,6 @@ fn print_identity_usage() {
     println!("operit2 cli identity create <name>");
     println!("operit2 cli identity use <id>");
     println!("operit2 cli identity rename <id> <name>");
-}
-
-fn print_cli_link_usage() {
-    println!("operit2 cli --link <session> <version|prefs|host|log|local-models|stt|memory|export|import|backup|model|chat|workspace|tag|character|group|active-prompt|approval|tool|market|update|skill|package|plugin|mcp|shell>");
-    println!("operit2 cli link run <session> <version|chat|local-models|stt>");
-}
-
-fn print_model_usage() {
-    println!("operit2 cli model init");
-    println!("operit2 cli model provider-type-list");
-    println!("operit2 cli model provider-list");
-    println!("operit2 cli model provider-show <provider-id>");
-    println!("operit2 cli model codex-login <browser|device>");
-    println!("operit2 cli model provider-create <name> <provider-type-id> <endpoint>");
-    println!("operit2 cli model provider-set-key <provider-id> <api-key>");
-    println!("operit2 cli model provider-set-endpoint <provider-id> <endpoint>");
-    println!("operit2 cli model provider-model-available-list <provider-id> [fetched|all]");
-    println!("operit2 cli model provider-model-add <provider-id> <provider-model-id>");
-    println!("operit2 cli model provider-model-create <provider-id> <provider-model-id>");
-    println!("operit2 cli model list");
-    println!("operit2 cli model show [model-id]");
-    println!("operit2 cli model use <provider-id> <model-id>");
-    println!("operit2 cli model params [model-id]");
-    println!("operit2 cli model parameters <provider-id> <model-id> <parameters-json>");
-    println!("operit2 cli model builtin-tools <provider-id> <model-id> <builtin-tools-json>");
-    println!("operit2 cli model context-show [model-id]");
-    println!("operit2 cli model context-set <provider-id> <model-id> <max-context-length>");
-    println!("operit2 cli model summary-show [model-id]");
-    println!("operit2 cli model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold> <enable-summary-by-message-count> <summary-message-count-threshold>");
-    println!("operit2 cli model function-list");
-    println!("operit2 cli model function-show <function-type>");
-    println!("operit2 cli model function-set <function-type> <provider-id> <model-id>");
-    println!("operit2 cli model function-reset [function-type]");
-}
-
-fn print_prefs_usage() {
-    println!("operit2 cli prefs show");
-    println!("operit2 cli prefs thinking <on|off>");
-    println!("operit2 cli prefs thinking-quality <1-4>");
-    println!("operit2 cli prefs stream <on|off>");
-    println!("operit2 cli prefs media-history <image-user-turns> <media-user-turns>");
-    println!("operit2 cli prefs mcp-timeout <seconds>");
-}
-
-fn print_host_usage() {
-    println!("operit2 cli host show");
-    println!("operit2 cli host capabilities");
-    println!("operit2 cli host paths");
-}
-
-fn print_memory_usage() {
-    println!("operit2 cli memory character <character-id> user <show|write|path>");
-    println!(
-        "operit2 cli memory character <character-id> item <list|search|show|create|delete|move>"
-    );
-    println!("operit2 cli memory character <character-id> graph");
-    println!("operit2 cli memory shared <list|create|rename|delete>");
-    println!("operit2 cli memory shared <shared-id> user <show|write|path>");
-    println!("operit2 cli memory shared <shared-id> item <list|search|show|create|delete|move>");
-    println!("operit2 cli memory shared <shared-id> graph");
-    println!("operit2 cli memory mount <character-id> <shared-id> --read <true|false> --write <true|false>");
-    println!("operit2 cli memory unmount <character-id> <shared-id>");
-}
-
-fn print_chat_usage() {
-    println!("operit2 cli chat new [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
-    println!("operit2 cli chat list");
-    println!("operit2 cli chat show <chat-id> [--runtime]");
-    println!("operit2 cli chat current");
-    println!("operit2 cli chat switch <chat-id>");
-    println!("operit2 cli chat delete <chat-id>");
-    println!("operit2 cli chat delete-message <message-timestamp>");
-    println!("operit2 cli chat clear");
-    println!("operit2 cli chat rollback <message-timestamp>");
-    println!("operit2 cli chat branch [--up-to <message-timestamp>]");
-    println!("operit2 cli chat branches [parent-chat-id]");
-    println!("operit2 cli chat lock <chat-id> <true|false>");
-    println!("operit2 cli chat pin <chat-id> <true|false>");
-    println!("operit2 cli chat stats");
-    println!("operit2 cli chat bind-character <chat-id> <character-card-name>");
-    println!("operit2 cli chat bind-group <chat-id> <character-group-id>");
-    println!("operit2 cli chat set-group <chat-id> <group-name>");
-    println!("operit2 cli chat shell [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
-    println!("operit2 cli chat send [--chat <chat-id>] <message>");
-}
-
-fn print_tag_usage() {
-    println!("operit2 cli tag list");
-    println!("operit2 cli tag show <id>");
-    println!("operit2 cli tag create <name> [prompt-content] [description] [tag-type]");
-    println!("operit2 cli tag update <id> <field> <value>");
-    println!("operit2 cli tag delete <id>");
-}
-
-fn print_character_usage() {
-    println!("operit2 cli character init");
-    println!("operit2 cli character list");
-    println!("operit2 cli character show <id>");
-    println!("operit2 cli character create <name> [character-setting]");
-    println!("operit2 cli character update <id> <field> <value>");
-    println!("operit2 cli character delete <id>");
-    println!("operit2 cli character set-active <id>");
-    println!("operit2 cli character combine <id> [CHAT|VOICE] [tag-id-csv]");
-    println!("operit2 cli character reset-default");
-}
-
-fn print_group_usage() {
-    println!("operit2 cli group init");
-    println!("operit2 cli group list");
-    println!("operit2 cli group show <id>");
-    println!("operit2 cli group create <name> [description]");
-    println!("operit2 cli group update <id> <field> <value>");
-    println!("operit2 cli group delete <id>");
-    println!("operit2 cli group set-active <id>");
-    println!("operit2 cli group duplicate <source-id> [new-name]");
-}
-
-fn print_active_prompt_usage() {
-    println!("operit2 cli active-prompt show");
-    println!("operit2 cli active-prompt set-card <id>");
-    println!("operit2 cli active-prompt set-group <id>");
-    println!(
-        "operit2 cli active-prompt activate-for-chat [character-card-name] [character-group-id]"
-    );
-    println!("operit2 cli active-prompt resolved-card");
-}
-
-fn print_approval_usage() {
-    println!("operit2 cli approval status");
-    println!("operit2 cli approval list");
-    println!("operit2 cli approval allow");
-    println!("operit2 cli approval ask");
-    println!("operit2 cli approval forbid");
-    println!("operit2 cli approval tool <tool-name> <allow|ask|forbid|clear>");
-}
-
-fn print_tool_usage() {
-    println!("operit2 cli tool list <public|internal|all>");
-    println!("operit2 cli tool show <tool-name>");
-    println!("operit2 cli tool exec <tool-name> <params-json>");
-}
-
-fn print_market_usage() {
-    println!("operit2 cli market auth login");
-    println!("operit2 cli market rank [updated|likes|downloads] [page]");
-    println!("operit2 cli market list [updated|likes|downloads] [type|-] [category|-] [page]");
-    println!("operit2 cli market search <query> [updated|likes|downloads] [type|-] [category|-]");
-    println!("operit2 cli market show <entryId>");
-    println!("operit2 cli market install <entryId> [versionId]");
-    println!("operit2 cli market comments <entryId> [page]");
-    println!("operit2 cli market comment <entryId> <body-or-@file>");
-    println!("operit2 cli market comment edit <commentId> <body-or-@file>");
-    println!("operit2 cli market comment delete <commentId>");
-    println!("operit2 cli market like <entryId>");
-    println!("operit2 cli market notifications [limit] [offset]");
-    println!("operit2 cli market my");
-    println!("operit2 cli market publish artifact <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256>");
-    println!("operit2 cli market publish repo <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <sourceUrl> <refType> <refName> <installConfig-or-@file> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or->");
-    println!("operit2 cli market publish version artifact <entryId> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-]");
-    println!("operit2 cli market publish version repo <entryId> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or-> <refType> <refName> <installConfig-or-@file> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-]");
-    println!("operit2 cli market publish update-entry <entryId> <title-or-> <description-or-@file-or-> <detail-or-@file-or-> <categoryId-or-> <allowPublicUpdates-or->");
-    println!("operit2 cli market download <assetId>");
 }
 
 /// Prints update command usage in the selected output format.
@@ -2129,66 +2006,6 @@ fn print_uninstall_usage() {
     println!("operit2 cli uninstall");
 }
 
-fn print_skill_usage() {
-    println!("operit2 cli skill dir");
-    println!("operit2 cli skill list");
-    println!("operit2 cli skill more");
-    println!("operit2 cli skill load <name>");
-    println!("operit2 cli skill show <name>");
-    println!(
-        "operit2 cli skill create <skill-id> <description> <content-or-@file> [attachment-path...]"
-    );
-    println!("operit2 cli skill import-zip <zip-path> [sub-dir-in-zip]");
-    println!("operit2 cli skill delete <name>");
-    println!("operit2 cli skill visible <name> [true|false]");
-    println!("operit2 cli skill errors");
-}
-
-fn print_package_usage() {
-    println!("operit2 cli package help");
-    println!("operit2 cli package dir");
-    println!("operit2 cli package list");
-    println!("operit2 cli package more");
-    println!("operit2 cli package load <name>");
-    println!("operit2 cli package show <name>");
-    println!("operit2 cli package import <js-ts-hjson-toolpkg-path>");
-    println!("operit2 cli package enable <name>");
-    println!("operit2 cli package disable <name>");
-    println!("operit2 cli package use <name>");
-    println!("operit2 cli package exec <package:tool> <params-json>");
-}
-
-fn print_plugin_usage() {
-    println!("operit2 cli plugin help");
-    println!("operit2 cli plugin list");
-    println!("operit2 cli plugin more");
-    println!("operit2 cli plugin load <name>");
-    println!("operit2 cli plugin show <name>");
-    println!("operit2 cli plugin import <toolpkg-path>");
-    println!("operit2 cli plugin enable <name>");
-    println!("operit2 cli plugin disable <name>");
-}
-
-fn print_mcp_usage() {
-    println!("operit2 cli mcp dir");
-    println!("operit2 cli mcp list");
-    println!("operit2 cli mcp show <id>");
-    println!("operit2 cli mcp import <json-or-@file>");
-    println!("operit2 cli mcp export");
-    println!("operit2 cli mcp remove <id>");
-    println!("operit2 cli mcp enable <id>");
-    println!("operit2 cli mcp disable <id>");
-    println!("operit2 cli mcp start <id>");
-    println!("operit2 cli mcp kill <id>");
-    println!("operit2 cli mcp tools <id>");
-    println!("operit2 cli mcp config <id>");
-    println!("operit2 cli mcp config-set <id> <json-or-@file>");
-    println!("operit2 cli mcp local-set <id> [--disabled true|false] [--env KEY=VALUE] [--approve TOOL] -- <command> [args...]");
-    println!("operit2 cli mcp meta <id>");
-    println!("operit2 cli mcp meta-set <id> <name> <description-or-@file> <author> <version>");
-    println!("operit2 cli mcp describe <id>");
-}
-
 /// Prints one chat history header for a human reader.
 fn print_chat_history_header(chat: &operit_model::ChatHistory::ChatHistory) {
     println!("Chat {}", chat.id);
@@ -2198,7 +2015,6 @@ fn print_chat_history_header(chat: &operit_model::ChatHistory::ChatHistory) {
     println!("Input tokens: {}", chat.inputTokens);
     println!("Output tokens: {}", chat.outputTokens);
     println!("Context window: {}", chat.currentWindowSize);
-    println!("Group: {}", chat.group.clone().unwrap_or_default());
     println!("Display order: {}", chat.displayOrder);
     println!(
         "Workspace: {}",
@@ -2207,14 +2023,6 @@ fn print_chat_history_header(chat: &operit_model::ChatHistory::ChatHistory) {
     println!(
         "Parent chat: {}",
         chat.parentChatId.clone().unwrap_or_default()
-    );
-    println!(
-        "Character: {}",
-        chat.characterCardName.clone().unwrap_or_default()
-    );
-    println!(
-        "Character group: {}",
-        chat.characterGroupId.clone().unwrap_or_default()
     );
     println!("Locked: {}", chat.locked);
     println!("Pinned: {}", chat.pinned);
@@ -2225,7 +2033,8 @@ fn print_chat_message(message: &operit_model::ChatMessage::ChatMessage) {
     println!("--- message ---");
     println!("Sender: {}", message.sender);
     println!("Timestamp: {}", message.timestamp);
-    println!("Role: {}", message.roleName);
+    let responder = if message.roleName.is_empty() { &message.modelName } else { &message.roleName };
+    println!("Responder: {}", responder);
     println!("Selected variant: {}", message.selectedVariantIndex);
     println!("Variants: {}", message.variantCount);
     println!("Provider: {}", message.provider);
@@ -2242,111 +2051,12 @@ fn print_chat_message(message: &operit_model::ChatMessage::ChatMessage) {
     println!("Content: {}", message.displayText());
 }
 
-/// Prints one prompt tag for a human reader.
-fn print_tag(tag: &operit_model::PromptTag::PromptTag) {
-    println!("Tag {}", tag.id);
-    println!("Name: {}", tag.name);
-    println!("Description: {}", tag.description);
-    println!("Prompt: {}", tag.promptContent);
-    println!("Type: {}", tagTypeName(&tag.tagType));
-    println!("Created: {}", tag.createdAt);
-    println!("Updated: {}", tag.updatedAt);
-}
-
-/// Prints one character card for a human reader.
-fn print_character_card(card: &CharacterCard) {
-    println!("Character {}", card.id);
-    println!("Name: {}", card.name);
-    println!("Description: {}", card.description);
-    println!("Character setting: {}", card.characterSetting);
-    println!("Opening statement: {}", card.openingStatement);
-    println!("Chat content: {}", card.otherContentChat);
-    println!("Voice content: {}", card.otherContentVoice);
-    println!("Tags: {}", card.attachedTagIds.join(","));
-    println!("Advanced prompt: {}", card.advancedCustomPrompt);
-    println!("Marks: {}", card.marks);
-    println!("Chat model binding: {}", card.chatModelBindingMode);
-    println!(
-        "Chat model: {}",
-        card.chatModelId.clone().unwrap_or_default()
-    );
-    println!(
-        "TTS config: {}",
-        card.ttsConfigId.clone().unwrap_or_default()
-    );
-    println!(
-        "Shared memory mounts: {}",
-        serde_json::to_string(&card.sharedMemoryMounts).expect("sharedMemoryMounts must serialize")
-    );
-    println!(
-        "Tool access: {}",
-        serde_json::to_string(&card.toolAccessConfig).expect("toolAccessConfig must serialize")
-    );
-    println!("Default: {}", card.isDefault);
-    println!("Created: {}", card.createdAt);
-    println!("Updated: {}", card.updatedAt);
-}
-
-/// Prints one character group card for a human reader.
-fn print_character_group_card(group: &CharacterGroupCard) {
-    println!("Character group {}", group.id);
-    println!("Name: {}", group.name);
-    println!("Description: {}", group.description);
-    println!(
-        "Members: {}",
-        group
-            .members
-            .iter()
-            .map(|member| format!("{}:{}", member.characterCardId, member.orderIndex))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    println!("Created: {}", group.createdAt);
-    println!("Updated: {}", group.updatedAt);
-}
-
-fn parse_group_members(value: &str) -> Vec<GroupMemberConfig> {
-    let mut result = Vec::new();
-    for (index, item) in value.split(',').enumerate() {
-        let trimmed = item.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        result.push(GroupMemberConfig {
-            characterCardId: trimmed.to_string(),
-            orderIndex: index as i32,
-        });
-    }
-    result
-}
-
-fn parseTagType(value: Option<&str>) -> Result<TagType, String> {
-    match value.unwrap_or("CUSTOM") {
-        "TONE" => Ok(TagType::TONE),
-        "CHARACTER" => Ok(TagType::CHARACTER),
-        "FUNCTION" => Ok(TagType::FUNCTION),
-        "CUSTOM" => Ok(TagType::CUSTOM),
-        other => Err(format!(
-            "invalid tagType: {other}; expected TONE | CHARACTER | FUNCTION | CUSTOM"
-        )),
-    }
-}
-
 fn parse_permission_level_arg(value: Option<&str>) -> Result<AiPermissionMode, String> {
     match value {
         Some("allow") | Some("ALLOW") => Ok(AiPermissionMode::Full),
         Some("ask") | Some("ASK") => Ok(AiPermissionMode::WorkspaceWrite),
         Some("forbid") | Some("FORBID") => Ok(AiPermissionMode::ReadOnly),
         _ => Err("expected allow, ask, or forbid".to_string()),
-    }
-}
-
-fn tagTypeName(tagType: &TagType) -> &'static str {
-    match tagType {
-        TagType::TONE => "TONE",
-        TagType::CHARACTER => "CHARACTER",
-        TagType::FUNCTION => "FUNCTION",
-        TagType::CUSTOM => "CUSTOM",
     }
 }
 
@@ -2452,50 +2162,6 @@ fn parseCsvList(value: &str) -> Vec<String> {
     result
 }
 
-/// Prints one memory in compact human-readable list form.
-fn print_memory_item_line(memory: &operit_model::Memory::Memory) {
-    println!(
-        "{}\t{}\t{}\t{}",
-        memory.id,
-        memory.title,
-        memory.folderPath.clone().unwrap_or_else(String::new),
-        memory
-            .tags
-            .iter()
-            .map(|tag| tag.name.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-}
-
-/// Prints one memory with labeled fields for a human reader.
-fn print_memory_item(memory: &operit_model::Memory::Memory) {
-    println!("Memory {}", memory.id);
-    println!("UUID: {}", memory.uuid);
-    println!("Title: {}", memory.title);
-    println!("Content: {}", memory.content);
-    println!("Content type: {}", memory.contentType);
-    println!("Source: {}", memory.source);
-    println!("Credibility: {}", memory.credibility);
-    println!("Importance: {}", memory.importance);
-    println!(
-        "Folder: {}",
-        memory.folderPath.clone().unwrap_or_else(String::new)
-    );
-    println!("Created: {}", memory.createdAt);
-    println!("Updated: {}", memory.updatedAt);
-    println!("Last accessed: {}", memory.lastAccessedAt);
-    println!(
-        "Tags: {}",
-        memory
-            .tags
-            .iter()
-            .map(|tag| tag.name.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-}
-
 /// Returns a trimmed string only when the value is non-empty.
 fn nonBlankString(value: String) -> Option<String> {
     let trimmed = value.trim();
@@ -2519,12 +2185,163 @@ fn currentTimeMillis() -> i64 {
 mod tests {
     use super::*;
 
+    /// Creates an isolated Windows package with an optional inference runtime.
+    fn windows_cli_package_fixture(include_runtime: bool) -> (PathBuf, PathBuf) {
+        use std::io::Write;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "operit-cli-package-{}-{unique}",
+            std::process::id()
+        ));
+        let extract_dir = root.join("extracted");
+        fs::create_dir_all(&extract_dir).unwrap();
+        let package = root.join("cli.zip");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&package).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("operit2.exe", options).unwrap();
+        archive.write_all(b"cli executable").unwrap();
+        if include_runtime {
+            for name in host_ops::WINDOWS_CLI_RUNTIME_LIBRARIES {
+                archive.start_file(*name, options).unwrap();
+                archive.write_all(b"native inference runtime").unwrap();
+            }
+            for name in [
+                "bash/bin/bash.exe",
+                "bash/usr/bin/msys-2.0.dll",
+                "bash/LICENSE.txt",
+            ] {
+                archive.start_file(name, options).unwrap();
+                archive.write_all(b"bundled Bash runtime").unwrap();
+            }
+        }
+        archive.finish().unwrap();
+        (package, extract_dir)
+    }
+
+    /// Keeps Windows runtime files beside the extracted executable for installation.
+    #[test]
+    fn windows_cli_package_extracts_its_native_runtime() {
+        let (package, extract_dir) = windows_cli_package_fixture(true);
+        let binary = extract_cli_binary_from_zip(&package, &extract_dir).unwrap();
+        assert_eq!(binary, extract_dir.join("operit2.exe"));
+        assert_eq!(fs::read(binary).unwrap(), b"cli executable");
+        for name in host_ops::WINDOWS_CLI_RUNTIME_LIBRARIES {
+            assert_eq!(
+                fs::read(extract_dir.join(name)).unwrap(),
+                b"native inference runtime"
+            );
+        }
+        assert_eq!(
+            fs::read(extract_dir.join("bash/bin/bash.exe")).unwrap(),
+            b"bundled Bash runtime"
+        );
+        fs::remove_dir_all(package.parent().unwrap()).unwrap();
+    }
+
+    /// Rejects Windows packages that cannot load the required native runtime.
+    #[test]
+    fn windows_cli_package_requires_its_native_runtime() {
+        let (package, extract_dir) = windows_cli_package_fixture(false);
+        let error = extract_cli_binary_from_zip(&package, &extract_dir).unwrap_err();
+        assert!(error.starts_with("operit_local_llm.dll not found in "));
+        fs::remove_dir_all(package.parent().unwrap()).unwrap();
+    }
+
+    /// Rejects updates that would install the executable without its Bash runtime.
+    #[test]
+    fn windows_cli_package_requires_bundled_bash() {
+        use std::io::Write;
+        let (package, extract_dir) = windows_cli_package_fixture(false);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&package)
+            .unwrap();
+        let mut archive = zip::ZipWriter::new_append(file).unwrap();
+        for name in host_ops::WINDOWS_CLI_RUNTIME_LIBRARIES {
+            archive
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(b"native runtime").unwrap();
+        }
+        archive.finish().unwrap();
+        assert!(extract_cli_binary_from_zip(&package, &extract_dir)
+            .unwrap_err()
+            .starts_with("bash/bin/bash.exe not found"));
+        fs::remove_dir_all(package.parent().unwrap()).unwrap();
+    }
+
+    /// Prevents a runtime ZIP entry from overwriting a file outside its declared tree.
+    #[test]
+    fn windows_cli_package_rejects_runtime_parent_components() {
+        use std::io::Write;
+        let (package, extract_dir) = windows_cli_package_fixture(true);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&package)
+            .unwrap();
+        let mut archive = zip::ZipWriter::new_append(file).unwrap();
+        archive
+            .start_file(
+                "bash/../outside.txt",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"must not escape runtime").unwrap();
+        archive.finish().unwrap();
+        assert!(extract_cli_binary_from_zip(&package, &extract_dir)
+            .unwrap_err()
+            .starts_with("Invalid CLI package path"));
+        assert!(!extract_dir.join("outside.txt").exists());
+        fs::remove_dir_all(package.parent().unwrap()).unwrap();
+    }
+
+    /// Copies every bundled runtime file and supports installing from the installed directory.
+    #[test]
+    fn cli_runtime_directory_copy_preserves_nested_files() {
+        let (package, extract_dir) = windows_cli_package_fixture(true);
+        extract_cli_binary_from_zip(&package, &extract_dir).unwrap();
+        let source = extract_dir.join("bash");
+        let destination = package.parent().unwrap().join("installed/bash");
+        copy_cli_runtime_directory(&source, &destination).unwrap();
+        copy_cli_runtime_directory(&destination, &destination).unwrap();
+        for name in ["bin/bash.exe", "usr/bin/msys-2.0.dll", "LICENSE.txt"] {
+            assert_eq!(
+                fs::read(source.join(name)).unwrap(),
+                fs::read(destination.join(name)).unwrap()
+            );
+        }
+        fs::remove_dir_all(package.parent().unwrap()).unwrap();
+    }
+
+    /// Verifies the level-1 help table has unique, described command names.
+    #[test]
+    fn cli_help_commands_are_unique_and_described() {
+        let mut names = CLI_COMMANDS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        let uniqueCount = names.len();
+        names.dedup();
+        assert_eq!(names.len(), uniqueCount, "CLI_COMMANDS names must be unique");
+        assert_eq!(uniqueCount, 31, "CLI_COMMANDS must cover inherent CLI families");
+        assert!(CLI_COMMANDS
+            .iter()
+            .all(|(_, description)| !description.is_empty()));
+    }
+
     /// Verifies CLI errors expose the denied route subject and capability.
     #[test]
     fn cli_route_permission_error_keeps_structured_diagnostics() {
         let error = CoreLinkError::withDetails(
             "ROUTE_PERMISSION_DENIED",
-            "Space route chatMessagesFlow requires capability chat.read on caller cli-client",
+            "Space route switch_core target cli-client lacks runtime.execute",
             operit_link::CoreValue::Map(BTreeMap::from([
                 (
                     "subject".to_string(),
@@ -2532,7 +2349,7 @@ mod tests {
                 ),
                 (
                     "requiredCapability".to_string(),
-                    operit_link::CoreValue::String("chat.read".to_string()),
+                    operit_link::CoreValue::String("runtime.execute".to_string()),
                 ),
                 (
                     "callerNodeId".to_string(),
@@ -2547,7 +2364,7 @@ mod tests {
         let message = core_command_error_message(error);
         assert!(message.contains("ROUTE_PERMISSION_DENIED"));
         assert!(message.contains("caller"));
-        assert!(message.contains("chat.read"));
+        assert!(message.contains("runtime.execute"));
         assert!(message.contains("cli-client"));
         assert!(message.contains("windows-owner"));
     }

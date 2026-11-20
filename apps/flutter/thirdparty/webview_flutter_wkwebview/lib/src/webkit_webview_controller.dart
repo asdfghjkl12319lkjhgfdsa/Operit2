@@ -355,7 +355,14 @@ class WebKitWebViewController extends PlatformWebViewController {
   final Map<String, WebKitJavaScriptChannelParams> _javaScriptChannelParams =
       <String, WebKitJavaScriptChannelParams>{};
 
+  final Map<String, WKUserScript> _applicationUserScripts =
+      <String, WKUserScript>{};
+  int _nextUserScriptIdentifier = 0;
+
   bool _zoomEnabled = true;
+  late final NativeWebViewZoom _nativeZoom = NativeWebViewZoom(
+    applyZoom: _setNativePageZoom,
+  );
   bool _verticalScrollBarEnabled = true;
   bool _horizontalScrollBarEnabled = true;
   Future<void> _macOSScrollBarStyleUpdate = Future<void>.value();
@@ -423,6 +430,16 @@ class WebKitWebViewController extends PlatformWebViewController {
   }
 
   @override
+  String get localResourceScheme => 'operit-vfs';
+
+  @override
+  Future<void> setLocalResourceHandler(
+    WebViewLocalResourceHandler? handler,
+  ) async {
+    await WebViewLocalResourceBridge.setHandler(webViewIdentifier, handler);
+  }
+
+  @override
   Future<void> loadFile(String absoluteFilePath) {
     return loadFileWithParams(
       WebKitLoadFileParams(absoluteFilePath: absoluteFilePath),
@@ -470,6 +487,40 @@ class WebKitWebViewController extends PlatformWebViewController {
         ..setHttpMethod(params.method.name)
         ..setHttpBody(params.body),
     );
+  }
+
+  /// Registers document-start JavaScript with the native WKUserContentController.
+  @override
+  Future<String> addUserScript(WebViewUserScript userScript) async {
+    final identifier = 'operit-user-script-${++_nextUserScriptIdentifier}';
+    final script = WKUserScript(
+      source: buildUserScriptSource(
+        userScript,
+        platformHandlesMainFrameOnly: true,
+      ),
+      injectionTime: UserScriptInjectionTime.atDocumentStart,
+      isForMainFrameOnly: userScript.forMainFrameOnly,
+    );
+    final controller = await _webView.configuration.getUserContentController();
+    await controller.addUserScript(script);
+    _applicationUserScripts[identifier] = script;
+    return identifier;
+  }
+
+  /// Removes an application script while preserving built-in WebKit scripts.
+  @override
+  Future<void> removeUserScript(String identifier) async {
+    if (_applicationUserScripts.remove(identifier) == null) {
+      throw ArgumentError.value(identifier, 'identifier');
+    }
+    await _resetUserScripts();
+  }
+
+  /// Removes application scripts while rebuilding channel and host scripts.
+  @override
+  Future<void> removeAllUserScripts() async {
+    _applicationUserScripts.clear();
+    await _resetUserScripts();
   }
 
   @override
@@ -578,15 +629,8 @@ class WebKitWebViewController extends PlatformWebViewController {
   }
 
   @override
-  Future<Object> runJavaScriptReturningResult(String javaScript) async {
-    final Object? result = await _webView.evaluateJavaScript(javaScript);
-    if (result == null) {
-      throw ArgumentError(
-        'Result of JavaScript execution returned a `null` value. '
-        'Use `runJavascript` when expecting a null return value.',
-      );
-    }
-    return result;
+  Future<Object?> runJavaScriptReturningResult(String javaScript) {
+    return _webView.evaluateJavaScript(javaScript);
   }
 
   @override
@@ -611,7 +655,7 @@ class WebKitWebViewController extends PlatformWebViewController {
   @override
   Future<Offset> getScrollPosition() async {
     if (defaultTargetPlatform == TargetPlatform.macOS) {
-      final Object result = await runJavaScriptReturningResult(
+      final Object? result = await runJavaScriptReturningResult(
         'JSON.stringify([window.scrollX || window.pageXOffset || 0, '
         'window.scrollY || window.pageYOffset || 0]);',
       );
@@ -664,6 +708,15 @@ class WebKitWebViewController extends PlatformWebViewController {
 
   @override
   Future<void> setBackgroundColor(Color color) {
+    if (defaultTargetPlatform == TargetPlatform.macOS) {
+      return _webView.setMacOSBackgroundColor(
+        red: color.r,
+        green: color.g,
+        blue: color.b,
+        alpha: color.a,
+      );
+    }
+
     const Color transparent = Colors.transparent;
     return Future.wait(<Future<void>>[
       _webView.setOpaque(false),
@@ -743,13 +796,24 @@ class WebKitWebViewController extends PlatformWebViewController {
     }
   }
 
-  /// Sets the page viewport zoom factor.
   @override
-  Future<void> setZoomFactor(double zoomFactor) {
-    if (!zoomFactor.isFinite || zoomFactor <= 0) {
-      throw ArgumentError.value(zoomFactor, 'zoomFactor');
-    }
+  bool get requiresNativeApplicationZoom =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.macOS;
 
+  /// Sets page zoom without replacing the application's independently set zoom.
+  @override
+  Future<void> setZoomFactor(double zoomFactor) =>
+      _nativeZoom.setPageZoomFactor(zoomFactor);
+
+  @override
+  Future<void> setApplicationZoomFactor(double zoomFactor) {
+    if (!requiresNativeApplicationZoom) {
+      return Future<void>.value();
+    }
+    return _nativeZoom.setApplicationZoomFactor(zoomFactor);
+  }
+
+  Future<void> _setNativePageZoom(double zoomFactor) {
     final int? identifier = PigeonInstanceManager.instance.getIdentifier(
       _webView.nativeWebView,
     );
@@ -874,7 +938,7 @@ class WebKitWebViewController extends PlatformWebViewController {
         return _webView.scrollView.setDelegate(null);
       }
     } else {
-      // TODO(stuartmorgan): Investigate doing this via JS instead.
+      // macOS does not expose UIScrollView's scroll callback delegate.
       throw UnimplementedError(
         'setOnScrollPositionChange is not implemented on macOS',
       );
@@ -928,9 +992,8 @@ class WebKitWebViewController extends PlatformWebViewController {
     final WKUserContentController controller = await _webView.configuration
         .getUserContentController();
     await controller.removeAllUserScripts();
-    // TODO(bparrishMines): This can be replaced with
-    // `removeAllScriptMessageHandlers` once Dart supports runtime version
-    // checking. (e.g. The equivalent to @availability in Objective-C.)
+    // Keep the per-channel removal for compatibility with older WebKit
+    // versions where the bulk API is unavailable.
     _javaScriptChannelParams.keys.forEach(
       controller.removeScriptMessageHandler,
     );
@@ -954,6 +1017,9 @@ class WebKitWebViewController extends PlatformWebViewController {
       if (defaultTargetPlatform == TargetPlatform.macOS)
         _applyMacOSScrollBarStyle(),
     ]);
+    for (final script in _applicationUserScripts.values) {
+      await controller.addUserScript(script);
+    }
   }
 
   /// Applies scrollbar visibility to macOS documents, where WKWebView does

@@ -1,5 +1,18 @@
 pub const TTS_CATALOG_VOICE_ROWS: &str = r#"
 SYSTEM_TTS|||系统默认音色|使用系统默认语言与默认声音
+DEEPSEEK_TTS||stella|Stella|DeepSeek 女声，自动识别语言
+DEEPSEEK_TTS||tide|Tide|DeepSeek 男声，自动识别语言
+ZHIPU_TTS||tongtong|彤彤|GLM-TTS 默认音色
+ZHIPU_TTS||chuichui|锤锤|GLM-TTS 系统音色
+ZHIPU_TTS||xiaochen|小陈|GLM-TTS 系统音色
+ZHIPU_TTS||jam|Jam|GLM-TTS 动动动物圈音色
+ZHIPU_TTS||kazi|Kazi|GLM-TTS 动动动物圈音色
+ZHIPU_TTS||douji|Douji|GLM-TTS 动动动物圈音色
+ZHIPU_TTS||luodo|Luodo|GLM-TTS 动动动物圈音色
+STEPFUN_TTS||cixingnansheng|磁性男声|阶跃星辰中文男声
+STEPFUN_TTS||linjiameimei|邻家妹妹|阶跃星辰中文女声
+STEPFUN_TTS||wenrounvsheng|温柔女声|阶跃星辰中文女声
+STEPFUN_TTS||yuanqishaonv|元气少女|阶跃星辰中文女声
 OPENAI_COMPATIBLE||alloy|Alloy|中性均衡音色
 OPENAI_COMPATIBLE||ash|Ash|低沉自然音色
 OPENAI_COMPATIBLE||ballad|Ballad|叙事感音色
@@ -115,6 +128,16 @@ GEMINI_TTS||Vindemiatrix|Vindemiatrix|Gemini 温和音色
 GEMINI_TTS||Sadachbia|Sadachbia|Gemini 活泼轻快音色
 GEMINI_TTS||Sadaltager|Sadaltager|Gemini 专业音色
 GEMINI_TTS||Sulafat|Sulafat|Gemini 温暖音色
+QWEN_TTS|qwen3-tts-flash|Cherry|芊悦 Cherry|通义千问普通话女声
+QWEN_TTS|qwen3-tts-flash|Serena|苏瑶 Serena|通义千问温柔女声
+QWEN_TTS|qwen3-tts-flash|Ethan|晨煦 Ethan|通义千问普通话男声
+QWEN_TTS|qwen3-tts-flash|Chelsie|千雪 Chelsie|通义千问中文女声
+CARTESIA_TTS|sonic-3.6|db6b0ed5-d5d3-463d-ae85-518a07d3c2b4|Skylar|Cartesia 美式英语女声
+INWORLD_TTS|inworld-tts-2|Ashley|Ashley|Inworld 英文音色
+INWORLD_TTS|inworld-tts-2|Dennis|Dennis|Inworld 英文音色
+INWORLD_TTS|inworld-tts-2|Alex|Alex|Inworld 英文男声
+RIME_TTS|coda|astra|Astra|Rime Coda 英文女声
+RIME_TTS|mistv3|cove|Cove|Rime Mist v3 英文女声
 KOKORO_TTS||af_heart|AF Heart|Kokoro 美式英语女声
 KOKORO_TTS||af_alloy|AF Alloy|Kokoro 美式英语女声
 KOKORO_TTS||af_aoede|AF Aoede|Kokoro 美式英语女声

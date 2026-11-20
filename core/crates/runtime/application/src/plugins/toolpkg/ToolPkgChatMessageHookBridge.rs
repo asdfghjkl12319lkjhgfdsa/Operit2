@@ -21,16 +21,12 @@ impl ToolPkgChatMessageHookBridge {
     /// Registers chat message persistence hooks for one application runtime.
     pub fn register(runtime: ToolPkgBridgeRuntime) {
         CHAT_MESSAGE_RUNTIME.get_or_init(|| runtime.clone());
-        let manager = runtime.package_manager();
-        manager.addToolPkgRuntimeChangeListener(std::sync::Arc::new(|activeContainers| {
-            ToolPkgChatMessageHookBridge::syncToolPkgRegistrations(activeContainers);
-        }));
     }
 
     /// Synchronizes active chat message hook registrations from enabled ToolPkg containers.
     #[allow(non_snake_case)]
-    pub fn syncToolPkgRegistrations(activeContainers: Vec<ToolPkgContainerRuntime>) {
-        let mut hooks = activeContainers
+    pub fn syncToolPkgRegistrations(activeContainers: &[ToolPkgContainerRuntime]) {
+        let hooks = activeContainers
             .iter()
             .flat_map(|runtime| {
                 runtime
@@ -44,11 +40,6 @@ impl ToolPkgChatMessageHookBridge {
                     })
             })
             .collect::<Vec<_>>();
-        hooks.sort_by(|left, right| {
-            left.containerPackageName
-                .cmp(&right.containerPackageName)
-                .then(left.hookId.cmp(&right.hookId))
-        });
         *CHAT_MESSAGE_HOOKS
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
@@ -58,65 +49,86 @@ impl ToolPkgChatMessageHookBridge {
     /// Dispatches a notification after a chat message has been persisted.
     #[allow(non_snake_case)]
     pub fn dispatchMessagePersisted(chatId: &str, message: &ChatMessage) {
-        let Some(runtime) = CHAT_MESSAGE_RUNTIME.get() else {
-            return;
-        };
-        let activeHooks = CHAT_MESSAGE_HOOKS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .expect("toolpkg chat message hook mutex poisoned")
-            .clone();
-        if activeHooks.is_empty() {
+        // Checkpoints save an unfinished response for recovery. Filter them before
+        // queueing plugin work; the terminal commit dispatches the completed message.
+        if message.sender == "ai" && message.completedAt <= 0 {
             return;
         }
+        let chatId = chatId.to_owned();
+        let message = message.to_owned();
+        super::ToolPkgHookBridgeSupport::scheduleToolPkgNotification(
+            "operit-toolpkg-notification",
+            move || {
+                Box::pin(async move {
+                    let chatId = &chatId;
+                    let message = &message;
+                    let Some(runtime) = CHAT_MESSAGE_RUNTIME.get() else {
+                        return;
+                    };
+                    let activeHooks = CHAT_MESSAGE_HOOKS
+                        .get_or_init(|| Mutex::new(Vec::new()))
+                        .lock()
+                        .expect("toolpkg chat message hook mutex poisoned")
+                        .clone();
+                    if activeHooks.is_empty() {
+                        return;
+                    }
 
-        let eventPayload = buildChatMessagePayload(chatId, message);
-        let manager = runtime.package_manager();
-        for hook in activeHooks {
-            ChainLogger::info(
-                PLUGIN_CHAIN,
-                "plugin.toolpkg.chat_message.run.start",
-                &[
-                    ("event", CHAT_MESSAGE_EVENT_PERSISTED.to_string()),
-                    ("package", hook.containerPackageName.clone()),
-                    ("hookId", hook.hookId.clone()),
-                    ("function", hook.functionName.clone()),
-                ],
-            );
-            match manager.runToolPkgMainHook(
-                &hook.containerPackageName,
-                &hook.functionName,
-                TOOLPKG_EVENT_CHAT_MESSAGE,
-                Some(CHAT_MESSAGE_EVENT_PERSISTED),
-                Some(&hook.hookId),
-                hook.functionSource.as_deref(),
-                eventPayload.clone(),
-                None,
-                None,
-                None,
-            ) {
-                Ok(_) => ChainLogger::info(
-                    PLUGIN_CHAIN,
-                    "plugin.toolpkg.chat_message.run.done",
-                    &[
-                        ("event", CHAT_MESSAGE_EVENT_PERSISTED.to_string()),
-                        ("package", hook.containerPackageName.clone()),
-                        ("hookId", hook.hookId.clone()),
-                    ],
-                ),
-                Err(error) => ChainLogger::error(
-                    PLUGIN_CHAIN,
-                    "plugin.toolpkg.chat_message.run.error",
-                    &[
-                        ("event", CHAT_MESSAGE_EVENT_PERSISTED.to_string()),
-                        ("package", hook.containerPackageName.clone()),
-                        ("hookId", hook.hookId.clone()),
-                        ("function", hook.functionName.clone()),
-                        ("error", error),
-                    ],
-                ),
-            }
-        }
+                    let eventPayload = buildChatMessagePayload(chatId, message);
+                    let manager = runtime.package_manager();
+                    for hook in activeHooks {
+                        ChainLogger::verbose_with_level(
+                            PLUGIN_CHAIN,
+                            "plugin.toolpkg.chat_message.run.start",
+                            &[
+                                ("event", CHAT_MESSAGE_EVENT_PERSISTED.to_string()),
+                                ("package", hook.containerPackageName.clone()),
+                                ("hookId", hook.hookId.clone()),
+                                ("function", hook.functionName.clone()),
+                            ],
+                            operit_util::AppLogger::VERBOSE_LEVEL_3,
+                        );
+                        match manager
+                            .runToolPkgMainHook(
+                                &hook.containerPackageName,
+                                &hook.functionName,
+                                TOOLPKG_EVENT_CHAT_MESSAGE,
+                                Some(CHAT_MESSAGE_EVENT_PERSISTED),
+                                Some(&hook.hookId),
+                                hook.functionSource.as_deref(),
+                                eventPayload.clone(),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(_) => ChainLogger::verbose_with_level(
+                                PLUGIN_CHAIN,
+                                "plugin.toolpkg.chat_message.run.done",
+                                &[
+                                    ("event", CHAT_MESSAGE_EVENT_PERSISTED.to_string()),
+                                    ("package", hook.containerPackageName.clone()),
+                                    ("hookId", hook.hookId.clone()),
+                                ],
+                                operit_util::AppLogger::VERBOSE_LEVEL_3,
+                            ),
+                            Err(error) => ChainLogger::error(
+                                PLUGIN_CHAIN,
+                                "plugin.toolpkg.chat_message.run.error",
+                                &[
+                                    ("event", CHAT_MESSAGE_EVENT_PERSISTED.to_string()),
+                                    ("package", hook.containerPackageName.clone()),
+                                    ("hookId", hook.hookId.clone()),
+                                    ("function", hook.functionName.clone()),
+                                    ("error", error),
+                                ],
+                            ),
+                        }
+                    }
+                })
+            },
+        );
     }
 }
 

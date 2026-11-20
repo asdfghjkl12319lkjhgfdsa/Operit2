@@ -1,68 +1,49 @@
-use crate::RuntimeRemoteLinkDiscovery::{
-    discoverEdgeDevices, discoverRemoteDevices, RuntimeEdgeDiscoveryEndpoint,
-    RuntimeRemoteDiscoveryEndpoint,
-};
-#[cfg(not(target_arch = "wasm32"))]
-use base64::engine::general_purpose::STANDARD as BASE64;
-#[cfg(not(target_arch = "wasm32"))]
-use base64::Engine;
-#[cfg(not(target_arch = "wasm32"))]
-use async_trait::async_trait;
-use operit_access_runtime::{
-    coreNodeTransportClient, remoteSessionAuthReason, AcceptedRemoteSessionRecord,
-        CoreNodePeerLink::{
-        activePeerNodeIds, attachPeerLinkCarrier, disconnectPeerLink,
-        isPeerLinkActive, kickPeerLink, subscribePeerLinkChanges, AttachedPeerLink,
-        PeerFrame, PeerLinkCarrier,
-    },
-    LinkAccessStore, LinkTransportPreference, PairedEdgeSessionRecord, PairedRemoteSession,
-    PairedRemoteSessionRecord, PendingOutboundEdgePairingRecord,
-    PendingOutboundPairingRecord, RemoteDeviceInfo, RemoteLinkClient,
-};
-#[cfg(not(target_arch = "wasm32"))]
-use operit_edge_transport::{
-    finishPairAsClient, linkTokenHash, startPairAsClient, AuthenticatedLinkChannel,
-    EdgePairStartState, EdgeSession, LinkChannel,
-};
 use operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost;
 use operit_host_api::TimeUtils::currentTimeMillis;
-use operit_link::{
-    fromCoreValue, toCoreValue, CoreCallRequest, CoreCallResponse, CoreValue, LinkDeviceInfo,
-    LinkFrame, LinkFramePayload, CORE_INTERNAL_TARGET,
-};
+use operit_link::protocol::LinkDeviceInfo;
+use operit_link::{fromCoreValue, toCoreValue, CoreCallRequest, CoreValue, CORE_INTERNAL_TARGET};
 use operit_store::CoreNodeBindingStore::CoreNodeBindingStore;
-use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceDeviceProfile, CoreSpaceStore};
+use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceDeviceProfile, CoreSpaceRoutePlan, CoreSpaceStore};
 use operit_store::NetworkControlStore::{
     NetworkControlAuditRecord, NetworkControlIdentityAssignment, NetworkControlRole,
     NetworkControlState, NetworkControlStore,
 };
-use operit_store::PreferencesDataStore::{
-    combine2, mutableStateFlow, CoroutineScope, SharingStarted, StateFlow,
-};
+use operit_store::PreferencesDataStore::StateFlow;
 use operit_store::SyncOperationStore::subscribeSyncMutations;
 use operit_tools::runtime_support::CoreRouteResumeContext;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::sync::Arc;
 use tokio::sync::oneshot;
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
-    CoreNodeRouter::{CoreNodeLocalRuntime, CoreNodeRouter},
+    CoreNodeRouter::{BindingRouteStatus, CoreNodeLocalRuntime, CoreNodeRouter},
     GeneratedRouteLifecycle,
+    NodeServices::NodeServices,
+    PeerSync::PeerSyncMethod,
     SpacePersistenceSyncService::SpacePersistenceSyncService,
 };
 
-/// Describes one paired device after merging inbound and outbound session records.
+// The same admission state machine is used by full Core and lightweight Edge.
+pub use crate::NodeSpaceService::{SpaceJoinRequest, SpaceJoinStatus};
+pub(crate) use crate::NodeSpaceService::PeerSpaceSnapshot;
+pub(crate) use crate::NodeSpaceService::{
+    NODE_SPACE_TARGET, NODE_SPACE_APPROVAL_TARGET, NODE_SPACE_CONTROL_TARGET,
+};
+use crate::NodeSpaceService::space_join;
+
+/// One delivery attempt per removal notice; the removal never blocks on it.
+const REMOVAL_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Total budget for the whole notice phase; partial delivery stays best-effort.
+const REMOVAL_NOTICES_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// 已配对设备的展示投影；不暴露底层会话、端点或传输选择。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePairedDevice {
     pub deviceId: String,
-    pub deviceInfo: RemoteDeviceInfo,
-    pub outboundSessionName: Option<String>,
-    pub outboundBaseUrl: Option<String>,
-    pub outboundTransport: Option<LinkTransportPreference>,
-    pub inboundSessionIds: Vec<String>,
+    pub deviceInfo: LinkDeviceInfo,
+    pub inbound: bool,
+    pub outbound: bool,
 }
 
 /// Reports whether one persisted pairing is usable by the current Space.
@@ -74,123 +55,6 @@ pub enum RuntimePairedDeviceStatus {
     RemovedFromSpace,
 }
 
-/// Reports the remote identity returned after beginning an outbound pairing transaction.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RuntimeRemotePairStartResult {
-    pub pairingId: String,
-    pub pairingServiceVersion: i32,
-    pub coreDeviceId: String,
-    pub coreDeviceInfo: RemoteDeviceInfo,
-    pub coreUserName: String,
-}
-
-/// Reports the Edge identity returned by an outbound lightweight pairing.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RuntimeEdgePairStartResult {
-    pub pairingId: String,
-    pub pairingServiceVersion: u16,
-    pub edgeDeviceId: String,
-    pub edgeDeviceInfo: RemoteDeviceInfo,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-struct RuntimeEdgePeerCarrier {
-    channel: Arc<dyn LinkChannel>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
-impl PeerLinkCarrier for RuntimeEdgePeerCarrier {
-    async fn sendPeerFrame(&self, frame: PeerFrame) -> Result<(), String> {
-        self.channel
-            .send(LinkFrame {
-                messageId: frame.messageId.clone(),
-                payload: LinkFramePayload::PeerFrame(frame),
-            })
-            .await
-    }
-
-    fn closePeerLinkCarrier(&self) {
-        let channel = self.channel.clone();
-        tokio::spawn(async move { channel.close().await });
-    }
-}
-
-/// Opens one Edge carrier from the user-facing endpoint string.
-///
-/// TCP remains the default (`192.168.1.20:8765`). USB/UART endpoints use
-/// `serial://COM27` or `serial://COM27?baud=115200` and share the exact same
-/// Link pairing and authenticated frame layer.
-#[cfg(not(target_arch = "wasm32"))]
-async fn connectEdgeChannel(endpoint: &str) -> Result<Arc<dyn LinkChannel>, String> {
-    if let Some(serialEndpoint) = endpoint.strip_prefix("serial://") {
-        let (port, query) = serialEndpoint
-            .split_once('?')
-            .unwrap_or((serialEndpoint, ""));
-        if port.trim().is_empty() {
-            return Err("Edge serial endpoint must contain a port name".to_string());
-        }
-        let baudRate = query
-            .split('&')
-            .find_map(|part| part.strip_prefix("baud="))
-            .map(|value| {
-                value
-                    .parse::<u32>()
-                    .map_err(|error| format!("invalid Edge serial baud rate: {error}"))
-            })
-            .transpose()?
-            .unwrap_or(115_200);
-        let host = operit_host_api::HostManager::defaultSerialPortHost()
-            .map_err(|error| error.to_string())?;
-        let channel =
-            operit_edge_transport::serial::SerialLinkChannel::open(host.as_ref(), port, baudRate)
-                .await?;
-        return Ok(channel);
-    }
-    let channel = operit_edge_transport::tcp::TcpLinkChannel::connect(endpoint).await?;
-    Ok(channel)
-}
-
-/// Describes one lightweight Edge discovered through local mDNS.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RuntimeEdgeDiscoveredDevice {
-    pub deviceId: String,
-    pub displayName: String,
-    pub platform: String,
-    pub model: String,
-    pub endpoint: String,
-    pub hostname: String,
-    pub port: u16,
-    pub tokenHash: String,
-    pub version: String,
-}
-
-/// Describes a Link-enabled runtime discovered by the local runtime.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RuntimeRemoteDiscoveredDevice {
-    pub deviceId: String,
-    pub displayName: String,
-    pub userName: String,
-    pub platform: String,
-    pub model: String,
-    pub baseUrl: String,
-    pub hostname: String,
-    pub port: u16,
-    pub tokenHash: String,
-    pub version: String,
-}
-
-/// Groups every discovered CoreNode that currently advertises the same Space identity.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RuntimeRemoteDiscoveredSpace {
-    pub spaceId: String,
-    pub spaceName: String,
-    pub spaceRevision: i64,
-    pub memberCount: usize,
-    pub devices: Vec<RuntimeRemoteDiscoveredDevice>,
-}
-
 /// Describes one device in the UI-facing device-space topology projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeDeviceSpaceDevice {
@@ -200,7 +64,15 @@ pub struct RuntimeDeviceSpaceDevice {
     pub platform: String,
     pub model: String,
     pub coreVersion: Option<String>,
+    #[serde(default)]
+    pub protocolVersion: Option<u32>,
     pub online: bool,
+    /// Peer Links one routed request traverses; reported only for multi-hop members.
+    #[serde(default)]
+    pub relayHops: Option<u32>,
+    /// Hop node ids from the first hop through the member; reported only for multi-hop members.
+    #[serde(default)]
+    pub relayPath: Option<Vec<String>>,
     pub currentIdentity: Option<RuntimeDeviceSpaceIdentity>,
 }
 
@@ -217,10 +89,13 @@ pub enum RuntimeDeviceSpaceConnectionStatus {
     Online,
     Offline,
     VersionMismatch,
+    /// Announced by its owning device; the local device cannot observe the link directly.
+    Announced,
     Unknown,
 }
 
-/// Describes one direct connection in the UI-facing device-space topology projection.
+/// Describes one undirected connection in the UI-facing device-space topology projection.
+/// Endpoints are ordered by device ID so both owners' announcements form one connection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeDeviceSpaceConnection {
     pub firstDeviceId: String,
@@ -234,7 +109,6 @@ pub struct RuntimeDeviceSpaceConnection {
 pub struct RuntimeDeviceSpaceTopology {
     pub currentDeviceId: String,
     pub devices: Vec<RuntimeDeviceSpaceDevice>,
-    pub removedDevices: Vec<RuntimeDeviceSpaceDevice>,
     pub connections: Vec<RuntimeDeviceSpaceConnection>,
 }
 
@@ -245,65 +119,182 @@ pub struct RuntimeDeviceSpaceSnapshot {
     pub topology: RuntimeDeviceSpaceTopology,
 }
 
-/// Provides runtime-owned remote session operations to generated local Core clients.
+/// 类型化 Proxy 的本机管理适配入口，以及 Space/network-control 业务服务。
+/// 配对、发现和监听只委托同一个 RuntimePeerService；不在这里实现第二套流程。
+/// It does not own sockets, pairing sessions, discovery clients, or transport managers.
 #[derive(Clone)]
 pub struct RuntimeRemoteLinkService {
     localRuntime: Arc<CoreNodeLocalRuntime>,
     nodeRouter: CoreNodeRouter,
-    linkAccessStore: LinkAccessStore,
     spaceStore: CoreSpaceStore,
     networkControlStore: NetworkControlStore,
-    #[cfg(not(target_arch = "wasm32"))]
-    edgePeerLinks: Arc<AsyncMutex<BTreeMap<String, AttachedPeerLink>>>,
-    edgeReconnectRunning: Arc<AtomicBool>,
+    persistenceSync: SpacePersistenceSyncService,
 }
 
 impl RuntimeRemoteLinkService {
-    /// Creates the service over the active local Core and its runtime-owned Link records.
-    pub fn new(localRuntime: CoreNodeLocalRuntime) -> Self {
-        let nodeRouter = CoreNodeRouter::new(localRuntime.clone());
-        Self::newWithRouter(localRuntime, nodeRouter)
+    /// Creates the Space business facade. Connectivity is injected separately.
+    pub fn new(localRuntime: CoreNodeLocalRuntime) -> Result<Self, String> {
+        let nodeRouter = CoreNodeRouter::new(localRuntime.clone())?;
+        Ok(Self::newWithRouter(localRuntime, nodeRouter))
     }
 
-    /// Creates the service using the router created by the owning application tree.
+    /// Creates the facade using the router owned by the application tree.
     #[allow(non_snake_case)]
     pub fn newWithRouter(localRuntime: CoreNodeLocalRuntime, nodeRouter: CoreNodeRouter) -> Self {
-        let linkAccessStore = LinkAccessStore::new(localRuntime.runtimeStorageHost());
-        Self::newWithAccessStore(localRuntime, nodeRouter, linkAccessStore)
-    }
-
-    /// Creates the service using application-owned Node and Access handles.
-    #[allow(non_snake_case)]
-    pub fn newWithAccessStore(
-        localRuntime: CoreNodeLocalRuntime,
-        nodeRouter: CoreNodeRouter,
-        linkAccessStore: LinkAccessStore,
-    ) -> Self {
         let localRuntime = Arc::new(localRuntime);
         let spaceStore = CoreSpaceStore::new(localRuntime.runtimeStorageHost());
-        let networkControlStore = NetworkControlStore::new(localRuntime.runtimeStorageHost())
-            .expect("RuntimeRemoteLinkService requires network control storage");
+        let networkControlStore = NetworkControlStore::withLocalNodeId(localRuntime.runtimeStorageHost(), nodeRouter.localNodeId());
+        let persistenceSync = SpacePersistenceSyncService::new(
+            localRuntime.clone(),
+            nodeRouter.clone(),
+            spaceStore.clone(),
+        );
         Self {
             localRuntime,
             nodeRouter,
-            linkAccessStore,
             spaceStore,
             networkControlStore,
-            #[cfg(not(target_arch = "wasm32"))]
-            edgePeerLinks: Arc::new(AsyncMutex::new(BTreeMap::new())),
-            edgeReconnectRunning: Arc::new(AtomicBool::new(false)),
+            persistenceSync,
         }
+    }
+
+    fn nodeServices(&self) -> Result<&NodeServices, String> {
+        self.nodeRouter.nodeServices()
+    }
+
+    /// Exposes the Core's unpaired discovery candidates uniformly through generated application proxies.
+    pub async fn discoverPeers(&self, timeoutMs: u64) -> Result<Vec<crate::NodeServices::DiscoveredPeer>, String> {
+        self.nodeServices()?.peers().discoverPeers(timeoutMs).await.map_err(|error| error.to_string())
+    }
+    /// Exports a short-lived pairing invitation for the current Space and live listeners.
+    pub async fn peerConnectionCode(&self) -> Result<String, String> {
+        let addresses = self.nodeServices()?.peers().pairingAddresses().await
+            .map_err(|error| error.to_string())?;
+        let info = crate::NodeServices::PeerConnectionInfo {
+            version: crate::PeerConnectionCode::VERSION,
+            nodeId: self.nodeRouter.localNodeId(),
+            displayName: self.spaceStore.deviceProfiles().ok()
+                .and_then(|profiles| profiles.get(&self.nodeRouter.localNodeId()).cloned())
+                .map(|profile| profile.displayName).unwrap_or_default(),
+            addresses,
+        };
+        let (invitationId, secret) = self.nodeServices()?.peers().pairingInvitation(&self.spaceStore.initialize()?.spaceId)
+            .map_err(|error| error.to_string())?;
+        crate::PeerConnectionCode::encode(&crate::PeerConnectionCode::ConnectionInvitation { info, invitationId, secret })
+            .map_err(|error| error.to_string())
+    }
+
+    /// Parses untrusted input without opening a connection or changing local state.
+    pub fn inspectPeerConnectionCode(&self, code: String) -> Result<crate::NodeServices::PeerConnectionInfo, String> {
+        crate::PeerConnectionCode::decode(&code, &self.nodeRouter.localNodeId()).map(|invitation| invitation.info)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Completes identity-bound QR pairing using the invitation secret without manual code entry.
+    pub async fn startPairingFromCode(&self, code: String) -> Result<crate::NodeServices::PairedPeer, String> {
+        let invitation = crate::PeerConnectionCode::decode(&code, &self.nodeRouter.localNodeId()).map_err(|error| error.to_string())?;
+        let info = &invitation.info;
+        let peers = self.nodeServices()?.peers();
+        let mut errors = Vec::new();
+        for address in &info.addresses {
+            let transport = crate::PeerConnectionCode::endpointTransport(address).map_err(|error| error.to_string())?;
+            let attempt = peers.startQrPairing(crate::NodeServices::PeerEndpoint {
+                nodeId: info.nodeId.clone(), address: address.clone(),
+            }, transport, &invitation.invitationId);
+            let result = crate::fault_isolation::link("QR pairing address", async {
+                crate::host_time::timeout(std::time::Duration::from_secs(4), attempt).await
+                    .map_err(|_| operit_link::CoreLinkError::new("PAIRING_TIMEOUT", "Connection timed out"))?
+            }).await;
+            match result {
+                Ok(pairing) => {
+                    let result = peers.finishPairing(&pairing.pairingId, &invitation.secret).await;
+                    if result.is_err() { peers.cancelPairing(&pairing.pairingId).await.map_err(|error| error.to_string())?; }
+                    return result.map_err(|error| error.to_string());
+                },
+                Err(error) => errors.push(format!("{address}: {error}")),
+            }
+        }
+        Err(format!("No address in the connection code could be paired:\n{}", errors.join("\n")))
+    }
+
+    /// Updates the local outbound pairing endpoint and probes the device through its sole channel.
+    #[allow(non_snake_case)]
+    pub async fn updatePairedDeviceEndpoint(
+        &self,
+        deviceId: String,
+        endpoint: String,
+        transport: Option<operit_peer_link::PeerTransport>,
+    ) -> Result<(), String> {
+        self.nodeServices()?.peers().updatePeerEndpoint(&deviceId, &endpoint, transport)
+            .await.map_err(|error| error.to_string())
+    }
+    /// Creates pending pairing for subsequent code confirmation.
+    pub async fn startPairing(&self, nodeId: String, address: String,
+        transport: Option<operit_peer_link::PeerTransport>,
+    ) -> Result<crate::NodeServices::PendingPairing, String> {
+        self.nodeServices()?.peers().startPairing(crate::NodeServices::PeerEndpoint { nodeId, address },
+            transport).await.map_err(|error| error.to_string())
+    }
+    pub async fn finishPairing(&self, pairingId: String, confirmationCode: String)
+        -> Result<crate::NodeServices::PairedPeer, String> {
+        self.nodeServices()?.peers().finishPairing(&pairingId, &confirmationCode).await.map_err(|error| error.to_string())
+    }
+    pub async fn cancelPairing(&self, pairingId: String) -> Result<(), String> {
+        self.nodeServices()?.peers().cancelPairing(&pairingId).await.map_err(|error| error.to_string())
+    }
+    pub fn pairingPrompts(&self) -> Result<Vec<crate::NodeServices::PairingPrompt>, String> {
+        self.nodeServices()?.peers().pairingPrompts().map_err(|error| error.to_string())
+    }
+    /// 仅本机 UI 观察待确认配对；使用共享节点状态通知，不建立第二套事件通道。
+    pub fn pairingPromptsFlow(&self) -> Result<StateFlow<Vec<crate::NodeServices::PairingPrompt>>, String> {
+        self.observePeerState(Self::pairingPrompts)
+    }
+    /// Exposes independent listener capabilities from the injected node peer service.
+    pub fn listenerCapabilities(&self) -> Result<operit_peer_link::PeerListenerCapabilities, String> {
+        Ok(self.nodeServices()?.peers().listenerCapabilities())
+    }
+
+    /// Opens only explicitly requested transports after runtime capability validation.
+    pub async fn startListening(&self, transports: Vec<operit_peer_link::PeerTransport>) -> Result<(), String> {
+        self.nodeServices()?.peers().startListening(&transports).await.map_err(|error| error.to_string())
+    }
+    pub async fn stopListening(&self) -> Result<(), String> {
+        self.nodeServices()?.peers().stop().await.map_err(|error| error.to_string())
+    }
+    /// Reads node-local listener preferences from their existing storage path.
+    pub fn localHostConfig(&self) -> Result<Option<crate::PeerStateStore::PeerHostConfig>, String> {
+        crate::PeerStateStore::PeerStateStore::new(self.localRuntime.runtimeStorageHost()).hostConfig()
+    }
+    pub fn saveLocalHostConfig(&self, config: crate::PeerStateStore::PeerHostConfig) -> Result<(), String> {
+        crate::PeerStateStore::PeerStateStore::new(self.localRuntime.runtimeStorageHost()).saveHostConfig(&config)
+    }
+    /// 复用原身份文件并刷新 Space 资料；通信会话不参与设备资料初始化。
+    pub fn initializeDeviceInfo(&self, supplied: LinkDeviceInfo) -> Result<LinkDeviceInfo, String> {
+        let info = crate::PeerStateStore::PeerStateStore::new(self.localRuntime.runtimeStorageHost())
+            .deviceInfo(supplied, false)?;
+        self.writeDeviceProfile(&info)?;
+        self.networkControlStore.initializeCurrentSpace()?;
+        Ok(info)
+    }
+
+    pub fn updateDeviceInfo(&self, supplied: LinkDeviceInfo) -> Result<LinkDeviceInfo, String> {
+        let info = crate::PeerStateStore::PeerStateStore::new(self.localRuntime.runtimeStorageHost())
+            .deviceInfo(supplied, true)?;
+        self.writeDeviceProfile(&info)?;
+        Ok(info)
+    }
+
+    fn writeDeviceProfile(&self, info: &LinkDeviceInfo) -> Result<(), String> {
+        self.spaceStore.writeLocalDeviceProfile(info.displayName(), info.platform.clone(),
+            info.model.clone(), operit_runtime::CORE_VERSION.to_string(),
+            info.pairingIncarnation.clone())?;
+        self.spaceStore.writeLocalProtocol(crate::PeerProtocol::VERSION)
     }
 
     /// Returns the converged Space membership owned by this CoreNode.
     #[allow(non_snake_case)]
     pub fn deviceSpace(&self) -> Result<CoreSpace, String> {
-        let mut space = self.spaceStore.initialize()?;
-        let removedNodeIds = self.networkControlStore.currentState()?.removedNodeIds;
-        space
-            .members
-            .retain(|nodeId| !removedNodeIds.contains(nodeId));
-        Ok(space)
+        self.spaceStore.initialize()
     }
 
     /// Reads a complete overview, retrying if membership changes during the read.
@@ -325,14 +316,18 @@ impl RuntimeRemoteLinkService {
         Err("Device space changed while reading its overview".to_string())
     }
 
-    /// Observes persistent Space changes and live Peer Links without UI polling.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Observes local synchronization execution separately from topology changes.
+    pub fn spaceSyncProgressFlow(&self) -> StateFlow<Vec<crate::SpaceSyncProgress::SpaceSyncProgress>> {
+        self.persistenceSyncService().progressFlow()
+    }
+
+    /// Observes persistent Space changes and live Peer Links through the shared Host scheduler.
     pub fn deviceSpaceSnapshotFlow(&self) -> Result<StateFlow<RuntimeDeviceSpaceSnapshot>, String> {
         let (changes, mut changed) = tokio::sync::mpsc::channel(1);
         let mutationSubscription = subscribeSyncMutations(move || {
             let _ = changes.try_send(());
         });
-        let mut peers = subscribePeerLinkChanges();
+        let mut peers = self.nodeServices()?.peers().subscribePeerChanges();
         let state = StateFlow::new(self.deviceSpaceSnapshot()?);
         let service = self.clone();
         let (stop, mut stopped) = oneshot::channel::<()>();
@@ -353,9 +348,15 @@ impl RuntimeRemoteLinkService {
                     // release their datastore locks before reading the projection.
                     tokio::select! {
                         _ = &mut stopped => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {},
+                        result = defaultHostRuntimeTaskSchedulerHost().waitForHostRuntimeDelay(25) => {
+                            if let Err(error) = result {
+                                operit_util::AppLogger::AppLogger::w(
+                                    "RuntimeRemoteLinkService", &format!("Space overview delay failed: {error}"));
+                                break;
+                            }
+                        },
                     }
-                    match service.deviceSpaceSnapshot() {
+                    match crate::fault_isolation::run("refresh Space overview", || service.deviceSpaceSnapshot()) {
                         Ok(snapshot) => state.set_value(snapshot),
                         Err(error) => { operit_util::AppLogger::AppLogger::w(
                             "RuntimeRemoteLinkService", &format!("Space overview refresh failed: {error}")); },
@@ -364,6 +365,24 @@ impl RuntimeRemoteLinkService {
             })),
         ).map_err(|error| error.to_string())?;
         Ok(overview)
+    }
+
+    /// Reads only this device's bounded configuration, never a business replica.
+    pub fn devicePreferences(&self, nodeId: String) -> Result<BTreeMap<String, serde_json::Value>, String> {
+        let space = self.spaceStore.space()?;
+        if !space.members.contains(&nodeId) { return Err("Device is not a Space member".into()); }
+        operit_store::DevicePreferencesStore::DevicePreferencesStore::new(self.localRuntime.runtimeStorageHost())
+            .read(&space.spaceId, &nodeId).map(|state| state.values())
+    }
+
+    /// Local configuration editors can configure a member without granting storage.
+    pub fn setDevicePreference(&self, nodeId: String, key: String, value: Option<serde_json::Value>) -> Result<(), String> {
+        let space = self.spaceStore.space()?;
+        if !space.members.contains(&nodeId) || self.networkControlStore.nodeIsDisconnected(&nodeId)? {
+            return Err("Device is not an active Space member".into());
+        }
+        operit_store::DevicePreferencesStore::DevicePreferencesStore::new(self.localRuntime.runtimeStorageHost())
+            .set(&space.spaceId, &nodeId, &self.nodeRouter.localNodeId(), &key, value).map(|_| ())
     }
 
     /// Creates the initial administrator policy for this device's new single-device Space.
@@ -397,6 +416,18 @@ impl RuntimeRemoteLinkService {
         self.networkControlStore.defineRole(role).map(|_| ())
     }
 
+    /// Updates one existing custom role from named capabilities.
+    #[allow(non_snake_case)]
+    pub fn updateDeviceSpaceRole(&self, role: NetworkControlRole) -> Result<(), String> {
+        self.networkControlStore.updateRole(role).map(|_| ())
+    }
+
+    /// Removes one custom role; devices holding it fall back to the default user identity.
+    #[allow(non_snake_case)]
+    pub fn removeDeviceSpaceRole(&self, roleId: String) -> Result<(), String> {
+        self.networkControlStore.removeRole(roleId).map(|_| ())
+    }
+
     /// Sets one existing identity as the device's current identity.
     #[allow(non_snake_case)]
     pub fn setDeviceSpaceIdentity(
@@ -406,7 +437,9 @@ impl RuntimeRemoteLinkService {
         self.networkControlStore.setIdentity(assignment).map(|_| ())
     }
 
-    /// Clears the current identity from one device.
+    /// Resets one device's identity to the default user identity. Members
+    /// keep an identity at all times, so a reset never strips the basic
+    /// capabilities the device's own UI depends on.
     #[allow(non_snake_case)]
     pub fn clearDeviceSpaceIdentity(&self, nodeId: String) -> Result<(), String> {
         self.networkControlStore.clearIdentity(nodeId).map(|_| ())
@@ -426,56 +459,190 @@ impl RuntimeRemoteLinkService {
         self.networkControlStore.admitMember(deviceId).map(|_| ())
     }
 
-    /// Removes a member authorization and immediately ends its local Peer Link.
+    /// Forgets a device completely: the Space policy drops every record for it,
+    /// the Space membership ejects it, its join-request history is deleted, and
+    /// every local pairing credential is removed while its live Peer Link ends.
+    /// The device returns to stranger state — reconnecting requires a fresh
+    /// pairing plus a new join approval.
+    ///
+    /// Before the local erase completes, one best-effort removal notice goes to
+    /// the removed device and to every device this removal cuts off, so a
+    /// bridge's far side learns the removal instead of staying in a stale view.
     #[allow(non_snake_case)]
-    pub fn removeDeviceSpaceMember(&self, deviceId: String) -> Result<(), String> {
+    pub async fn removeDeviceSpaceMember(&self, deviceId: String) -> Result<(), String> {
+        // Links and routes are captured before the policy change: removing one
+        // device can cut devices that were only reachable through it, and the
+        // notice needs the first hop that still reaches them.
+        let notices = self.captureRemovalNotices()?;
         self.networkControlStore.removeMember(deviceId.clone())?;
-        disconnectPeerLink(&self.nodeRouter.localNodeId(), &deviceId)
+        if crate::host_time::timeout(
+            REMOVAL_NOTICES_BUDGET,
+            self.deliverRemovalNotices(&deviceId, notices),
+        )
+        .await
+        .is_err()
+        {
+            operit_util::AppLogger::AppLogger::w(
+                "RuntimeRemoteLinkService",
+                &format!("Removal notice phase exhausted its budget removed={deviceId}"),
+            );
+        }
+        self.spaceStore.removeRemoteMember(deviceId.clone())?;
+        space_join::purgeDevice(self, &deviceId)?;
+        self.nodeServices()?.peers().removePairedPeer(&deviceId).await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Captures the first hop that currently reaches every other member.
+    fn captureRemovalNotices(&self) -> Result<Vec<(String, String)>, String> {
+        let mut notices = Vec::new();
+        for nodeId in self.spaceStore.space()?.members {
+            if nodeId == self.nodeRouter.localNodeId() { continue; }
+            if let Some(plan) = self.nodeRouter.nodeRoutePlan(&nodeId)? {
+                notices.push((nodeId, plan.firstHop().to_string()));
+            }
+        }
+        Ok(notices)
+    }
+
+    /// Delivers one best-effort control exchange along the captured route. The
+    /// notice carries the ordinary control log, so the receiving side
+    /// replay-validates it exactly like a normal synchronization and never
+    /// acts on a bare claim. Failures never block the removal.
+    async fn deliverRemovalNotices(&self, removedNodeId: &str, notices: Vec<(String, String)>) {
+        let operations = match self.networkControlStore.currentSpaceOperations() {
+            Ok(operations) => operations,
+            Err(error) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!("Removal notice skipped removed={removedNodeId} error={error}"),
+                );
+                return;
+            }
+        };
+        let args = match toCoreValue(operations) {
+            Ok(args) => args,
+            Err(error) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!("Removal notice encoding failed removed={removedNodeId} error={error}"),
+                );
+                return;
+            }
+        };
+        for (nodeId, firstHop) in &notices {
+            // Members that stay reachable keep learning through the normal
+            // synchronization loop; only the cut-off devices need this push.
+            if nodeId != removedNodeId
+                && self.nodeRouter.nodeIsReachable(nodeId).unwrap_or(false)
+            {
+                continue;
+            }
+            // The removed device is notified last: its own notice retires it,
+            // and a retired bridge would reject the exchange it must still
+            // forward for the far side.
+            if nodeId == removedNodeId { continue; }
+            self.deliverRemovalNotice(nodeId, firstHop, &args).await;
+        }
+        if let Some((nodeId, firstHop)) = notices
+            .iter()
+            .find(|(nodeId, _)| nodeId == removedNodeId)
+            .cloned()
+        {
+            self.deliverRemovalNotice(&nodeId, &firstHop, &args).await;
+        }
+    }
+
+    /// Delivers one removal notice along the captured first hop.
+    async fn deliverRemovalNotice(&self, nodeId: &str, firstHop: &str, args: &CoreValue) {
+        let request = CoreCallRequest::new(
+            operit_link::nextCoreRouteRequestId("space-removal-notice"),
+            NODE_SPACE_CONTROL_TARGET,
+            "exchange",
+            args.clone(),
+        );
+        let delivery = self
+            .nodeRouter
+            .sendSpaceEnvelopeAlongHop(firstHop, nodeId, request);
+        match crate::host_time::timeout(REMOVAL_NOTICE_TIMEOUT, delivery).await {
+            Ok(response) if response.result.is_ok() => {}
+            Ok(response) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!(
+                        "Removal notice rejected target={nodeId} hop={firstHop} error={:?}",
+                        response.result.err()
+                    ),
+                );
+            }
+            Err(_) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!("Removal notice timed out target={nodeId} hop={firstHop}"),
+                );
+            }
+        }
+    }
+
+    /// Retires this device once the shared policy removed it, dropping every
+    /// pairing it held at that moment. The removal forgets immediately: a
+    /// deferred delete cannot tell those pairings from ones created later by
+    /// pairing again for re-admission.
+    pub(crate) async fn retireRemovedDevice(&self) -> Result<bool, String> {
+        Ok(space_join::retireRemovedLocalDevice(self, None)?.is_some())
     }
 
     /// Prohibits one device from direct connection and route transit immediately.
     #[allow(non_snake_case)]
-    pub fn disconnectDeviceSpaceNode(&self, deviceId: String) -> Result<(), String> {
+    pub async fn disconnectDeviceSpaceNode(&self, deviceId: String) -> Result<(), String> {
         self.networkControlStore.disconnectNode(deviceId.clone())?;
-        disconnectPeerLink(&self.nodeRouter.localNodeId(), &deviceId)
+        self.nodeServices()?.peers().disconnectPeer(&deviceId).await
+            .map_err(|error| error.to_string())
     }
 
     /// Returns the synchronized device metadata and direct-connection graph.
     #[allow(non_snake_case)]
     pub fn deviceSpaceTopology(&self) -> Result<RuntimeDeviceSpaceTopology, String> {
         let space = self.spaceStore.initialize()?;
-        let controlState = self.networkControlStore.currentState()?;
-        let removedNodeIds = controlState.removedNodeIds.clone();
+        let controlState = match self.networkControlStore.currentState() {
+            Ok(state) => Some(state),
+            Err(error) => {
+                operit_util::AppLogger::AppLogger::w("RuntimeRemoteLinkService", &format!("Space {} overview identity labels: {error}", space.spaceId));
+                None
+            }
+        };
         let profiles = self.spaceStore.deviceProfiles()?;
         let currentDeviceId = self.nodeRouter.localNodeId();
-        let activePeers = activePeerNodeIds(&currentDeviceId)?;
-        let removedDevices = removedNodeIds
-            .iter()
-            .map(|deviceId| {
-                let profile = profiles.get(deviceId).ok_or_else(|| {
-                    format!("Device profile is missing for removed device: {deviceId}")
-                })?;
-                Ok(runtimeDeviceSpaceDevice(
-                    profile,
-                    false,
-                    runtimeDeviceSpaceIdentity(&controlState, deviceId),
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let activePeers = self.nodeServices().and_then(|services| services.peers().activePeerNodeIds().map_err(|error| error.to_string()))
+            .unwrap_or_else(|error| {
+                operit_util::AppLogger::AppLogger::w("RuntimeRemoteLinkService", &format!("Space {} overview active links: {error}", space.spaceId));
+                BTreeSet::new()
+            });
         let devices = space
             .members
-            .into_iter()
-            .filter(|deviceId| !removedNodeIds.contains(deviceId))
+            .iter().cloned()
             .map(|deviceId| {
-                let profile = profiles.get(&deviceId).ok_or_else(|| {
-                    format!("Device profile is missing in the current device space: {deviceId}")
-                })?;
-                let online =
-                    deviceId == currentDeviceId || self.nodeRouter.nodeIsReachable(&deviceId)?;
+                let fallback = CoreSpaceDeviceProfile {
+                    protocolVersion: None,
+                    nodeId: deviceId.clone(), displayName: deviceId.clone(), userName: String::new(),
+                    platform: String::new(), model: String::new(), coreVersion: None,
+                    pairingIncarnation: None, updatedAt: 1,
+                };
+                let profile = profiles.get(&deviceId).unwrap_or(&fallback);
+                let routePlan = if deviceId == currentDeviceId {
+                    None
+                } else {
+                    self.nodeRouter.nodeRoutePlan(&deviceId).unwrap_or_else(|error| {
+                        operit_util::AppLogger::AppLogger::w("RuntimeRemoteLinkService", &format!("Space {} device {deviceId} route: {error}", space.spaceId));
+                        None
+                    })
+                };
+                let online = deviceId == currentDeviceId || routePlan.is_some();
                 Ok(runtimeDeviceSpaceDevice(
                     profile,
                     online,
-                    runtimeDeviceSpaceIdentity(&controlState, &deviceId),
+                    routePlan.as_ref(),
+                    controlState.as_ref().and_then(|state| runtimeDeviceSpaceIdentity(state, &deviceId)),
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -485,12 +652,22 @@ impl RuntimeRemoteLinkService {
             .collect::<BTreeMap<_, _>>();
         let connections = self
             .spaceStore
-            .deviceConnections()?
+            .deviceConnectionsForSpace(&space)?
             .into_iter()
-            .filter(|connection| {
-                !removedNodeIds.contains(&connection.firstDeviceId)
-                    && !removedNodeIds.contains(&connection.secondDeviceId)
+            .map(|mut connection| {
+                // Routing announcements are directed and independently owned. The
+                // overview shows device pairs, so merge A -> B and B -> A here
+                // without discarding either owner's routing/quality record.
+                if connection.firstDeviceId > connection.secondDeviceId {
+                    std::mem::swap(
+                        &mut connection.firstDeviceId,
+                        &mut connection.secondDeviceId,
+                    );
+                }
+                connection
             })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .map(|connection| {
                 let first = devicesById.get(&connection.firstDeviceId).ok_or_else(|| {
                     format!(
@@ -524,7 +701,6 @@ impl RuntimeRemoteLinkService {
         Ok(RuntimeDeviceSpaceTopology {
             currentDeviceId,
             devices,
-            removedDevices,
             connections,
         })
     }
@@ -540,6 +716,7 @@ impl RuntimeRemoteLinkService {
         Ok(runtimeDeviceSpaceDevice(
             &profile,
             true,
+            None,
             runtimeDeviceSpaceIdentity(&controlState, &profile.nodeId),
         ))
     }
@@ -572,164 +749,149 @@ impl RuntimeRemoteLinkService {
     /// Leaves the current device space while preserving all direct pairing records.
     #[allow(non_snake_case)]
     pub fn leaveDeviceSpace(&self) -> Result<CoreSpace, String> {
-        self.spaceStore.leave()
+        space_join::leave(self)
     }
 
-    /// Joins the Space exposed by one directly paired CoreNode.
-    #[allow(non_snake_case)]
-    pub async fn joinPairedDeviceSpace(&self, name: String) -> Result<CoreSpace, String> {
-        let (record, session) = self.pairedSession(&name)?;
-        let info = session.sessionInfo().await?;
-        ensureRemoteIdentity(&record, &info.coreDeviceId)?;
-        let peerSpace = info.deviceSpace;
-        self.spaceStore.importDeviceProfiles(info.deviceProfiles)?;
-        if !peerSpace
-            .members
-            .iter()
-            .any(|nodeId| nodeId == &record.coreDeviceId)
-        {
-            return Err("paired device is not present in its advertised device space".to_string());
+    /// 加入直接配对节点的 Space。地址、会话与鉴权由同一个节点通信服务处理。
+    pub async fn joinPairedDeviceSpace(&self, deviceId: String) -> Result<CoreSpace, String> {
+        // Compatibility entry point: never admit a member without local approval.
+        let request = self.requestDeviceSpaceJoin(deviceId).await?;
+        let status = self.refreshDeviceSpaceJoin(request.requestId).await?;
+        if status.status != SpaceJoinStatus::Joined {
+            return Err("SPACE_JOIN_PENDING: Waiting for the target device to approve the join request".into());
         }
-        let localNodeId = self.nodeRouter.localNodeId();
-        let localSpace = self.spaceStore.initialize()?;
-        if localSpace.spaceId == peerSpace.spaceId
-            && peerSpace
-                .members
-                .iter()
-                .any(|nodeId| nodeId == &localNodeId)
-        {
-            self.spaceStore
-                .observePairedDeviceSpace(record.coreDeviceId.clone(), peerSpace)?;
-        } else {
-            // The server accepts a join proposal containing exactly its current
-            // membership plus the authenticated joining device. Do not merge the
-            // joining node's entire local Space here: it may contain stale members
-            // from a previous Space and would be rejected by /link/space/adopt.
-            let mut joinMembers = peerSpace.members.clone();
-            if !joinMembers.iter().any(|nodeId| nodeId == &localNodeId) {
-                joinMembers.push(localNodeId.clone());
-            }
-            let joinRevision = peerSpace
-                .spaceRevision
-                .checked_add(1)
-                .ok_or_else(|| "Device space revision overflow during join".to_string())?;
-            let joinProposal = CoreSpace {
-                spaceId: peerSpace.spaceId.clone(),
-                spaceName: peerSpace.spaceName.clone(),
-                spaceRevision: joinRevision,
-                members: joinMembers,
-            };
-            let deviceProfiles = self.spaceStore.deviceProfilesForCurrentSpace()?;
-            let accepted = session.adoptDeviceSpace(joinProposal, deviceProfiles).await?;
-            self.spaceStore.adopt(accepted)?;
-        }
-        self.persistenceSyncService()
-            .synchronizePeer(name, 512, true)
-            .await?;
         self.spaceStore.space()
     }
 
-    /// Reads paired devices with inbound and outbound records merged by device id.
-    #[allow(non_snake_case)]
-    pub fn pairedDevicesSnapshot(&self) -> Result<BTreeMap<String, RuntimePairedDevice>, String> {
-        mergeEdgePairedDevices(mergePairedDevices(
-            self.linkAccessStore.outboundSessions()?,
-            self.linkAccessStore.inboundSessions()?,
-        )?, self.linkAccessStore.edgeSessions()?)
+    pub async fn requestDeviceSpaceJoin(&self, deviceId: String) -> Result<SpaceJoinRequest, String> {
+        space_join::request(self, deviceId).await
     }
 
-    /// Observes paired devices after merging both connection directions by device id.
+    pub fn outgoingDeviceSpaceJoins(&self) -> Result<Vec<SpaceJoinRequest>, String> {
+        space_join::outgoing(self)
+    }
+
+    pub async fn incomingDeviceSpaceJoins(&self) -> Result<Vec<SpaceJoinRequest>, String> {
+        space_join::incoming(self).await
+    }
+
+    pub async fn refreshDeviceSpaceJoin(&self, requestId: String) -> Result<SpaceJoinRequest, String> {
+        space_join::refresh(self, requestId).await
+    }
+
+    pub async fn decideDeviceSpaceJoin(&self, requestId: String, assignmentVersion: u64, approve: bool) -> Result<SpaceJoinRequest, String> {
+        space_join::decide(self, requestId, assignmentVersion, approve).await
+    }
+
+    pub async fn cancelDeviceSpaceJoin(&self, requestId: String) -> Result<SpaceJoinRequest, String> {
+        space_join::cancel(self, requestId).await
+    }
+
+    /// Captures member profiles and control history for direct Space propagation.
+    pub(crate) fn peerSpaceSnapshot(&self) -> Result<PeerSpaceSnapshot, String> {
+        crate::NodeSpaceService::peerSpaceSnapshot(self)
+    }
+
+    /// Applies a complete peer projection, following only an approved cross-Space merge.
+    pub(crate) fn observePeerSpaceSnapshot(&self, peerNodeId: &str, snapshot: PeerSpaceSnapshot) -> Result<CoreSpace, String> {
+        crate::NodeSpaceService::observePeerSpaceSnapshot(self, peerNodeId, snapshot)
+    }
+
+    /// 仅 Router 验证直接入站授权后调用；身份来自已鉴权连接，不从 args 取身份。
+    pub(crate) fn acceptPeerSpaceCall(
+        &self, peerNodeId: &str, request: CoreCallRequest,
+    ) -> Result<CoreValue, String> {
+        crate::NodeSpaceService::dispatchPeerSpaceCall(self, peerNodeId, request)
+    }
+
+    pub(crate) async fn acceptSpaceApprovalCall(&self, origin: &str, request: CoreCallRequest) -> Result<CoreValue, String> {
+        space_join::receiveApproval(self, origin, request)
+    }
+
+    /// Returns one device-indexed projection from the preserved state files, without exposing sessions.
+    #[allow(non_snake_case)]
+    pub fn pairedDevicesSnapshot(&self) -> Result<BTreeMap<String, RuntimePairedDevice>, String> {
+        let peers = self
+            .nodeServices()?.peers()
+            .pairedPeers()
+            .map_err(|error| error.to_string())?;
+        Ok(peers
+            .into_iter()
+            .map(|peer| {
+                (
+                    peer.nodeId.clone(),
+                    RuntimePairedDevice {
+                        deviceId: peer.nodeId,
+                        deviceInfo: LinkDeviceInfo {
+                            platform: String::new(),
+                            model: peer.displayName.clone(),
+                            pairingIncarnation: peer.pairingIncarnation.clone(),
+                        },
+                        inbound: peer.inbound,
+                        outbound: peer.outbound,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Connectivity and pairing state are exposed by the shared NodeServices instance.
     #[allow(non_snake_case)]
     pub fn pairedDevicesFlow(
         &self,
     ) -> Result<StateFlow<BTreeMap<String, RuntimePairedDevice>>, String> {
-        let inboundFlow = self.linkAccessStore.inboundSessionsFlow();
-        let outboundFlow = self.linkAccessStore.outboundSessionsFlow();
-        let initialInbound = inboundFlow.first().map_err(|error| error.to_string())?;
-        let initialOutbound = outboundFlow.first().map_err(|error| error.to_string())?;
-        mergePairedDevices(initialOutbound.clone(), initialInbound.clone())?;
-        let inboundState =
-            inboundFlow.stateIn(CoroutineScope, SharingStarted::Lazily, initialInbound);
-        let outboundState =
-            outboundFlow.stateIn(CoroutineScope, SharingStarted::Lazily, initialOutbound);
-        let coreDevices = combine2(
-            &outboundState,
-            &inboundState,
-            |outbound, inbound| {
-                mergePairedDevices(outbound, inbound)
-                    .expect("validated Link Access session records must merge by device id")
-            },
-        );
-        let edgeFlow = self.linkAccessStore.edgeSessionsFlow();
-        let initialEdge = edgeFlow.first().map_err(|error| error.to_string())?;
-        mergeEdgePairedDevices(coreDevices.value(), initialEdge.clone())?;
-        let edgeState = edgeFlow.stateIn(CoroutineScope, SharingStarted::Lazily, initialEdge);
-        Ok(combine2(&coreDevices, &edgeState, |devices, edges| {
-            mergeEdgePairedDevices(devices, edges)
-                .expect("validated Edge sessions must merge by device id")
-        }))
+        self.observePeerState(|service| service.pairedDevicesSnapshot())
     }
 
-    /// Observes paired device statuses from paired records and Peer Links.
     #[allow(non_snake_case)]
     pub fn pairedDeviceStatusesFlow(
         &self,
     ) -> Result<StateFlow<BTreeMap<String, RuntimePairedDeviceStatus>>, String> {
-        let pairedDevicesFlow = self.pairedDevicesFlow()?;
-        let activePeerNodeIdsFlow = self.activePeerNodeIdsFlow()?;
-        Ok(combine2(
-            &pairedDevicesFlow,
-            &activePeerNodeIdsFlow,
-            pairedDeviceStatusesFromState,
-        ))
+        self.observePeerState(|service| {
+            Ok(pairedDeviceStatusesFromState(
+                service.pairedDevicesSnapshot()?,
+                service.nodeServices()?.peers().activePeerNodeIds()
+                    .map_err(|error| error.to_string())?,
+            ))
+        })
     }
 
-    /// Observes the active direct Peer Links adjacent to this runtime.
-    #[allow(non_snake_case)]
-    fn activePeerNodeIdsFlow(&self) -> Result<StateFlow<BTreeSet<String>>, String> {
-        let localNodeId = self.nodeRouter.localNodeId();
-        let state = mutableStateFlow(activePeerNodeIds(&localNodeId)?);
-        let stateForTask = state.clone();
-        let mut peerLinkChanges = subscribePeerLinkChanges();
-        defaultHostRuntimeTaskSchedulerHost()
-            .scheduleHostRuntimeAsyncTask(
-                "runtime-remote-link-active-peer-flow",
-                Box::new(move || {
-                    Box::pin(async move {
-                        loop {
-                            match peerLinkChanges.recv().await {
-                                Ok(()) => match activePeerNodeIds(&localNodeId) {
-                                    Ok(peerNodeIds) => stateForTask.set_value(peerNodeIds),
-                                    Err(error) => {
-                                        operit_util::AppLogger::AppLogger::e(
-                                            "RuntimeRemoteLinkService",
-                                            &format!(
-                                                "active Peer Link state refresh failed: {error}"
-                                            ),
-                                        );
-                                    }
-                                },
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    match activePeerNodeIds(&localNodeId) {
-                                        Ok(peerNodeIds) => stateForTask.set_value(peerNodeIds),
-                                        Err(error) => {
-                                            operit_util::AppLogger::AppLogger::e(
-                                                "RuntimeRemoteLinkService",
-                                                &format!(
-                                                    "active Peer Link state refresh failed: {error}"
-                                                ),
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+    /// 先订阅再取快照；断线、配对和撤销都更新观察值，最后一个订阅释放时退出。
+    fn observePeerState<T>(
+        &self,
+        snapshot: fn(&Self) -> Result<T, String>,
+    ) -> Result<StateFlow<T>, String>
+    where
+        T: Clone + PartialEq + Send + 'static,
+    {
+        let mut changes = self.nodeServices()?.peers().subscribePeerChanges();
+        let state = StateFlow::new(snapshot(self)?);
+        let (stop, mut stopped) = oneshot::channel();
+        let watch = spaceOverviewSubscription(&state, stop);
+        let service = self.clone();
+        defaultHostRuntimeTaskSchedulerHost().scheduleHostRuntimeAsyncTask(
+            "node-peer-state-watch",
+            Box::new(move || Box::pin(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        event = changes.recv() => {
+                            if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                                break;
                             }
-                        }
-                    })
-                }),
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(state.asStateFlow())
+                        },
+                    }
+                    match snapshot(&service) {
+                        Ok(value) => state.set_value(value),
+                        Err(error) => {
+                            operit_util::AppLogger::AppLogger::w(
+                                "RuntimeRemoteLinkService", &format!("Peer state refresh failed: {error}"));
+                        },
+                    }
+                }
+            })),
+        ).map_err(|error| error.to_string())?;
+        Ok(watch)
     }
 
     /// Returns whether one paired device currently has an active Peer Link.
@@ -738,7 +900,36 @@ impl RuntimeRemoteLinkService {
         if !self.pairedDevicesSnapshot()?.contains_key(&deviceId) {
             return Err(format!("paired device does not exist: {deviceId}"));
         }
-        isPeerLinkActive(&self.nodeRouter.localNodeId(), &deviceId)
+        Ok(self.nodeServices()?.peers().activePeerNodeIds()
+            .map_err(|error| error.to_string())?.contains(&deviceId))
+    }
+
+    /// Moves one chat whose route metadata cannot be presented onto this device.
+    ///
+    /// This only rewrites the Binding. It does not resume an in-progress turn.
+    #[allow(non_snake_case)]
+    pub fn claimMissingBindingLocal(&self, chatId: String) -> Result<(), String> {
+        if chatId.trim().is_empty() {
+            return Err("route claim chat id must not be empty".to_string());
+        }
+        if self.nodeRouter.bindingRouteStatus(chatId.clone()).is_ok() {
+            return Err("binding owner is already known".to_string());
+        }
+        let localNodeId = self.nodeRouter.localNodeId();
+        let bindingStore = CoreNodeBindingStore::new(self.localRuntime.runtimeStorageHost())?;
+        match bindingStore.bindingOptional(&chatId)? {
+            Some(binding) if binding.nodeId == localNodeId => {
+                Err("current device profile is still missing for this chat binding".to_string())
+            }
+            Some(binding) => {
+                bindingStore.compareAndSet(&chatId, &binding.nodeId, &localNodeId)?;
+                Ok(())
+            }
+            None => {
+                bindingStore.createLocal(&chatId)?;
+                Ok(())
+            }
+        }
     }
 
     /// Commits a chat Binding change, installs it on the target Core, and resumes there.
@@ -748,6 +939,28 @@ impl RuntimeRemoteLinkService {
         chatId: String,
         targetNodeId: String,
         resumeContext: CoreRouteResumeContext,
+    ) -> Result<(), String> {
+        self.changeRoute(chatId, targetNodeId, Some(resumeContext)).await
+    }
+
+    /// Selects the Core for subsequent chat execution without starting a new turn.
+    #[allow(non_snake_case)]
+    pub async fn changeChatExecutionDevice(
+        &self,
+        chatId: String,
+        targetNodeId: String,
+    ) -> Result<BindingRouteStatus, String> {
+        self.changeRoute(chatId.clone(), targetNodeId, None).await?;
+        self.nodeRouter.bindingRouteStatus(chatId)
+    }
+
+    /// Shares route validation, synchronization and binding installation with turn handoff.
+    #[allow(non_snake_case)]
+    async fn changeRoute(
+        &self,
+        chatId: String,
+        targetNodeId: String,
+        resumeContext: Option<CoreRouteResumeContext>,
     ) -> Result<(), String> {
         if chatId.trim().is_empty() {
             return Err("route change chat id must not be empty".to_string());
@@ -761,12 +974,12 @@ impl RuntimeRemoteLinkService {
                 "route change target is not a member of the current device space: {targetNodeId}"
             ));
         }
-        if !self
-            .networkControlStore
-            .nodeHasCapability(&targetNodeId, "runtime.execute", None)?
+        if !self.spaceStore.deviceProfiles()?.get(&targetNodeId)
+            .is_some_and(|profile| profile.coreVersion.is_some())
+            || !self.networkControlStore.nodeHasCapability(&targetNodeId, "runtime.execute", None)?
         {
             return Err(format!(
-                "route change target cannot execute runtime work: {targetNodeId}"
+                "route change target cannot host Core execution: {targetNodeId}"
             ));
         }
         let localNodeId = self.nodeRouter.localNodeId();
@@ -775,8 +988,10 @@ impl RuntimeRemoteLinkService {
                 "route change target is not reachable in the current device space: {targetNodeId}"
             ));
         }
+        let bindingStore = CoreNodeBindingStore::new(self.localRuntime.runtimeStorageHost())?;
+        let currentBinding = bindingStore.binding(&chatId)?;
         self.callChatCoreLifecycle(
-            &localNodeId,
+            &currentBinding.nodeId,
             GeneratedRouteLifecycle::BeforeChangeRoute,
             chatId.clone(),
             None,
@@ -784,9 +999,7 @@ impl RuntimeRemoteLinkService {
         .await?;
 
         let routeChangeStartedAt = currentTimeMillis();
-        let bindingStore = CoreNodeBindingStore::new(self.localRuntime.runtimeStorageHost())?;
-        let currentBinding = bindingStore.binding(&chatId)?;
-        operit_util::AppLogger::AppLogger::trace(
+        operit_util::AppLogger::AppLogger::v_with_level(
             "CoreRouteTrace",
             &format!(
                 "route_change.binding_observed chatId={} local={} currentOwner={} currentGeneration={} target={} elapsedMs={}",
@@ -797,9 +1010,10 @@ impl RuntimeRemoteLinkService {
                 targetNodeId,
                 currentTimeMillis() - routeChangeStartedAt
             ),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
         if currentBinding.nodeId == targetNodeId {
-            operit_util::AppLogger::AppLogger::trace(
+            operit_util::AppLogger::AppLogger::v_with_level(
                 "CoreRouteTrace",
                 &format!(
                     "route_change.noop chatId={} owner={} generation={} elapsedMs={}",
@@ -808,11 +1022,12 @@ impl RuntimeRemoteLinkService {
                     currentBinding.generation,
                     currentTimeMillis() - routeChangeStartedAt
                 ),
+                operit_util::AppLogger::VERBOSE_LEVEL_2,
             );
         }
 
         if targetNodeId != localNodeId {
-            operit_util::AppLogger::AppLogger::trace(
+            operit_util::AppLogger::AppLogger::v_with_level(
                 "CoreRouteTrace",
                 &format!(
                     "route_change.sync_before_commit.start chatId={} fromOwner={} target={} generation={} elapsedMs={}",
@@ -822,11 +1037,12 @@ impl RuntimeRemoteLinkService {
                     currentBinding.generation,
                     currentTimeMillis() - routeChangeStartedAt
                 ),
+                operit_util::AppLogger::VERBOSE_LEVEL_2,
             );
             self.persistenceSyncService()
-                .synchronizeReachablePeer(targetNodeId.clone(), 512, false)
+                .synchronizeReachablePeerForReason(targetNodeId.clone(), 512, &format!("route_change chatId={chatId}"))
                 .await?;
-            operit_util::AppLogger::AppLogger::trace(
+            operit_util::AppLogger::AppLogger::v_with_level(
                 "CoreRouteTrace",
                 &format!(
                     "route_change.sync_before_commit.done chatId={} fromOwner={} target={} generation={} elapsedMs={}",
@@ -836,6 +1052,7 @@ impl RuntimeRemoteLinkService {
                     currentBinding.generation,
                     currentTimeMillis() - routeChangeStartedAt
                 ),
+                operit_util::AppLogger::VERBOSE_LEVEL_2,
             );
         }
 
@@ -846,7 +1063,7 @@ impl RuntimeRemoteLinkService {
                 commit.binding.nodeId
             ));
         }
-        operit_util::AppLogger::AppLogger::trace(
+        operit_util::AppLogger::AppLogger::v_with_level(
             "CoreRouteTrace",
             &format!(
                 "route_change.binding_committed chatId={} fromOwner={} target={} generation={} elapsedMs={}",
@@ -856,12 +1073,17 @@ impl RuntimeRemoteLinkService {
                 commit.binding.generation,
                 currentTimeMillis() - routeChangeStartedAt
             ),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
 
         self.installRouteBindingOnTarget(&targetNodeId, commit.operation.clone())
             .await?;
 
-        operit_util::AppLogger::AppLogger::trace(
+        let Some(resumeContext) = resumeContext else {
+            return Ok(());
+        };
+
+        operit_util::AppLogger::AppLogger::v_with_level(
             "CoreRouteTrace",
             &format!(
                 "route_change.lifecycle.after.start chatId={} target={} generation={} elapsedMs={}",
@@ -870,6 +1092,7 @@ impl RuntimeRemoteLinkService {
                 commit.binding.generation,
                 currentTimeMillis() - routeChangeStartedAt
             ),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
         let lifecycleResult = self
             .callChatCoreLifecycle(
@@ -879,7 +1102,7 @@ impl RuntimeRemoteLinkService {
                 Some(resumeContext),
             )
             .await;
-        operit_util::AppLogger::AppLogger::trace(
+        operit_util::AppLogger::AppLogger::v_with_level(
             "CoreRouteTrace",
             &format!(
                 "route_change.lifecycle.after.done target={} generation={} elapsedMs={} result={}",
@@ -892,13 +1115,14 @@ impl RuntimeRemoteLinkService {
                     "error"
                 }
             ),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
         lifecycleResult
     }
 
     /// Installs one committed Binding operation on the target without advancing sync clocks.
     #[allow(non_snake_case)]
-    async fn installRouteBindingOnTarget(
+    pub(super) async fn installRouteBindingOnTarget(
         &self,
         targetNodeId: &str,
         operation: operit_store::SyncOperationStore::SyncOperation,
@@ -906,20 +1130,10 @@ impl RuntimeRemoteLinkService {
         if targetNodeId == self.nodeRouter.localNodeId() {
             return Ok(());
         }
-        let objectId = self
-            .nodeRouter
-            .targetForSchema("application")
-            .ok_or_else(|| "unknown Core schema key: application".to_string())?;
-        let mut args = BTreeMap::new();
-        args.insert(
-            "operation".to_string(),
-            toCoreValue(operation).map_err(|error| error.to_string())?,
-        );
-        let request = CoreCallRequest::new(
-            format!("core-route-binding-install-{}", currentTimeMillis()),
-            objectId,
-            "syncApplyImmediateBindingOperation".to_string(),
-            CoreValue::Map(args),
+        let request = PeerSyncMethod::SyncApplyImmediateBindingOperation.request(
+            operit_link::nextCoreRouteRequestId("core-route-binding-install"),
+            toCoreValue(serde_json::json!({ "operation": operation }))
+                .map_err(|error| error.to_string())?,
         );
         let response = self
             .nodeRouter
@@ -966,85 +1180,27 @@ impl RuntimeRemoteLinkService {
         fromCoreValue::<()>(value).map_err(|error| error.to_string())
     }
 
-    /// Resolves the persisted pairing and reports revocation or Space removal explicitly.
-    #[allow(non_snake_case)]
+    /// 配对状态来自统一节点服务，不再发送旧 sessionInfo 请求。
     pub async fn pairedDeviceStatus(
         &self,
         deviceId: String,
     ) -> Result<RuntimePairedDeviceStatus, String> {
-        operit_util::AppLogger::AppLogger::trace(
-            "CoreSyncTrace",
-            &format!(
-                "device_status.start local={} device={}",
-                self.nodeRouter.localNodeId(),
-                deviceId
-            ),
-        );
-        let mut devices = self.pairedDevicesSnapshot()?;
-        let Some(device) = devices.remove(&deviceId) else {
-            operit_util::AppLogger::AppLogger::trace(
-                "CoreSyncTrace",
-                &format!("device_status.invalid device={deviceId} reason=not_paired"),
-            );
+        if !self.pairedDevicesSnapshot()?.contains_key(&deviceId) {
             return Ok(RuntimePairedDeviceStatus::Invalid);
-        };
-        let Some(sessionName) = device.outboundSessionName else {
-            operit_util::AppLogger::AppLogger::trace(
-                "CoreSyncTrace",
-                &format!(
-                    "device_status.local_peer device={} activePeer={}",
-                    deviceId,
-                    isPeerLinkActive(&self.nodeRouter.localNodeId(), &deviceId)?
-                ),
-            );
-            return Ok(
-                if isPeerLinkActive(&self.nodeRouter.localNodeId(), &deviceId)? {
-                    RuntimePairedDeviceStatus::Online
-                } else {
-                    RuntimePairedDeviceStatus::Offline
-                },
-            );
-        };
-        let (record, session) = self.pairedSession(&sessionName)?;
-        let info = match session.sessionInfo().await {
-            Ok(info) => {
-                operit_util::AppLogger::AppLogger::trace(
-                    "CoreSyncTrace",
-                    &format!(
-                        "device_status.session_info_online device={} remote={}",
-                        deviceId, info.coreDeviceId
-                    ),
-                );
-                info
-            }
-            Err(error) => {
-                if remoteSessionAuthReason(&error) == Some("invalid_session") {
-                    return Ok(RuntimePairedDeviceStatus::Invalid);
-                }
-                return Err(error);
-            }
-        };
-        ensureRemoteIdentity(&record, &info.coreDeviceId)?;
-        if !info
-            .deviceSpace
-            .members
-            .iter()
-            .any(|member| member == &self.nodeRouter.localNodeId())
-        {
+        }
+        if !self.spaceStore.contains(deviceId.clone())? {
             return Ok(RuntimePairedDeviceStatus::RemovedFromSpace);
         }
-        Ok(
-            if isPeerLinkActive(&self.nodeRouter.localNodeId(), &deviceId)? {
-                RuntimePairedDeviceStatus::Online
-            } else {
-                RuntimePairedDeviceStatus::Offline
-            },
-        )
+        Ok(if self.pairedDeviceOnline(deviceId)? {
+            RuntimePairedDeviceStatus::Online
+        } else {
+            RuntimePairedDeviceStatus::Offline
+        })
     }
 
     /// Disconnects one directly adjacent device while preserving pairing records.
     #[allow(non_snake_case)]
-    pub fn disconnectDeviceSpaceConnection(&self, deviceId: String) -> Result<(), String> {
+    pub async fn disconnectDeviceSpaceConnection(&self, deviceId: String) -> Result<(), String> {
         let localDeviceId = self.nodeRouter.localNodeId();
         let space = self.spaceStore.initialize()?;
         if !space.members.iter().any(|member| member == &deviceId) {
@@ -1055,788 +1211,27 @@ impl RuntimeRemoteLinkService {
         if deviceId == localDeviceId {
             return Err("current device cannot disconnect itself".to_string());
         }
-        kickPeerLink(&localDeviceId, &deviceId)
+        self.nodeServices()?.peers().disconnectPeer(&deviceId).await
+            .map_err(|error| error.to_string())
     }
 
-    /// Removes every local pairing record associated with one device.
-    #[allow(non_snake_case)]
-    pub fn removePairedDevice(&self, deviceId: String) -> Result<(), String> {
-        let edgeNames = self.linkAccessStore.edgeSessions()?.into_iter()
-            .filter(|(_, record)| record.edgeDeviceId == deviceId)
-            .map(|(name, _)| name).collect::<Vec<_>>();
-        let outboundNames = self
-            .linkAccessStore
-            .outboundSessions()?
-            .into_iter()
-            .filter(|(_, record)| record.coreDeviceId == deviceId)
-            .map(|(name, _)| name)
-            .collect::<Vec<_>>();
-        let inboundSessionIds = self
-            .linkAccessStore
-            .inboundSessions()?
-            .into_iter()
-            .filter(|(_, record)| record.deviceId == deviceId)
-            .map(|(sessionId, _)| sessionId)
-            .collect::<Vec<_>>();
-        if outboundNames.is_empty() && inboundSessionIds.is_empty() && edgeNames.is_empty() {
-            return Err(format!("paired device does not exist: {deviceId}"));
-        }
-        disconnectPeerLink(&self.nodeRouter.localNodeId(), &deviceId)?;
-        for name in edgeNames {
-            self.linkAccessStore.removeEdgeSession(&name)?;
-        }
-        for name in outboundNames {
-            self.linkAccessStore.removeOutboundSession(&name)?;
-        }
-        for sessionId in inboundSessionIds {
-            self.linkAccessStore.removeInboundSession(&sessionId)?;
-        }
-        Ok(())
+    /// 按设备撤销两个方向及全部渠道；不再自行编辑旧 session 文件。
+    pub async fn removePairedDevice(&self, deviceId: String) -> Result<(), String> {
+        self.nodeServices()?.peers().removePairedPeer(&deviceId).await
+            .map_err(|error| error.to_string())
     }
 
-    /// Starts the singleton persistent synchronization worker for direct Space peers.
-    #[allow(non_snake_case)]
     pub fn startSpaceSync(&self) -> Result<(), String> {
-        self.persistenceSyncService().start()?;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if self.edgeReconnectRunning.swap(true, Ordering::AcqRel) {
-                return Ok(());
-            }
-            let service = self.clone();
-            if let Err(error) = defaultHostRuntimeTaskSchedulerHost()
-                .scheduleHostRuntimeAsyncTask(
-                    "runtime-edge-peer-reconnect",
-                    Box::new(move || {
-                        Box::pin(async move {
-                            while service.edgeReconnectRunning.load(Ordering::Acquire) {
-                                if let Err(error) = service.reconnectPersistedEdgePeers().await {
-                                    operit_util::AppLogger::AppLogger::trace(
-                                        "RuntimeRemoteLinkService",
-                                        &format!("Edge reconnect worker failed: {error}"),
-                                    );
-                                }
-                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            }
-                        })
-                    }),
-                )
-            {
-                self.edgeReconnectRunning.store(false, Ordering::Release);
-                return Err(error.to_string());
-            }
-        }
-        Ok(())
+        self.persistenceSyncService().start()
     }
-
-    /// Stops the persistent synchronization worker owned by this CoreNode.
-    #[allow(non_snake_case)]
     pub fn stopSpaceSync(&self) -> Result<(), String> {
-        #[cfg(not(target_arch = "wasm32"))]
-        self.edgeReconnectRunning.store(false, Ordering::Release);
         self.persistenceSyncService().stop()
-    }
-
-    /// Discovers nearby Spaces and groups their directly connectable CoreNodes.
-    #[allow(non_snake_case)]
-    pub async fn discoverSpaces(
-        &self,
-        timeoutMs: u64,
-    ) -> Result<Vec<RuntimeRemoteDiscoveredSpace>, String> {
-        if timeoutMs == 0 {
-            return Err("remote discovery timeout must be greater than 0".to_string());
-        }
-        operit_host_api::HostManager::defaultServiceDiscoveryHost()
-            .map_err(|error| error.to_string())?;
-        let (sender, receiver) = oneshot::channel();
-        defaultHostRuntimeTaskSchedulerHost()
-            .scheduleHostRuntimeTask(
-                "runtime-remote-discovery",
-                Box::new(move || {
-                    let _ = sender.send(discoverRemoteDevices(timeoutMs));
-                }),
-            )
-            .map_err(|error| error.to_string())?;
-        let devices = receiver
-            .await
-            .map_err(|_| "runtime discovery task ended before producing a result".to_string())??;
-        self.refreshDiscoveredPairedRemoteEndpoints(&devices)
-            .await?;
-        self.groupDiscoveredSpaces(devices).await
-    }
-
-    /// Discovers raw TCP Edge devices without requiring a token entry. The
-    /// token hash is only an mDNS pairing hint; the authenticated pairing
-    /// exchange still verifies the secret and displays the pairing code.
-    #[allow(non_snake_case)]
-    pub async fn discoverEdges(
-        &self,
-        timeoutMs: u64,
-    ) -> Result<Vec<RuntimeEdgeDiscoveredDevice>, String> {
-        if timeoutMs == 0 {
-            return Err("Edge discovery timeout must be greater than 0".to_string());
-        }
-        operit_host_api::HostManager::defaultServiceDiscoveryHost()
-            .map_err(|error| error.to_string())?;
-        let (sender, receiver) = oneshot::channel();
-        defaultHostRuntimeTaskSchedulerHost()
-            .scheduleHostRuntimeTask(
-                "runtime-edge-discovery",
-                Box::new(move || { let _ = sender.send(discoverEdgeDevices(timeoutMs)); }),
-            )
-            .map_err(|error| error.to_string())?;
-        let devices = receiver.await
-            .map_err(|_| "Edge discovery task ended before producing a result".to_string())??;
-        Ok(devices.into_iter().map(|device: RuntimeEdgeDiscoveryEndpoint| {
-            RuntimeEdgeDiscoveredDevice {
-                deviceId: device.deviceId,
-                displayName: device.displayName,
-                platform: device.platform,
-                model: device.model,
-                endpoint: format!("{}:{}", device.address, device.port),
-                hostname: device.hostname,
-                port: device.port,
-                tokenHash: device.tokenHash,
-                version: device.version,
-            }
-        }).collect())
-    }
-
-    /// Starts a runtime-owned outbound pairing and stores its confidential client state.
-    #[allow(non_snake_case)]
-    pub async fn startPairedRemote(
-        &self,
-        baseUrl: String,
-        tokenHash: String,
-        clientDeviceInfo: RemoteDeviceInfo,
-    ) -> Result<RuntimeRemotePairStartResult, String> {
-        if baseUrl.trim().is_empty() {
-            return Err("paired remote base URL must not be empty".to_string());
-        }
-        if tokenHash.trim().is_empty() {
-            return Err("paired remote token hash must not be empty".to_string());
-        }
-        let client = RemoteLinkClient::new(baseUrl.clone());
-        let hello = client.hello(&tokenHash).await?;
-        let identity = self.linkAccessStore.initializeIdentity(clientDeviceInfo)?;
-        let state = client
-            .pairStart(&tokenHash, identity.deviceId, identity.deviceInfo)
-            .await?;
-        if hello.coreDeviceId != state.coreDeviceId {
-            return Err("paired remote identity changed during pairing".to_string());
-        }
-        self.linkAccessStore.savePendingOutboundPairing(
-            state.pairingId.clone(),
-            PendingOutboundPairingRecord {
-                baseUrl,
-                state: state.clone(),
-            },
-        )?;
-        Ok(RuntimeRemotePairStartResult {
-            pairingId: state.pairingId,
-            pairingServiceVersion: state.pairingServiceVersion,
-            coreDeviceId: state.coreDeviceId,
-            coreDeviceInfo: state.coreDeviceInfo,
-            coreUserName: hello.deviceSpace.userName,
-        })
-    }
-
-    /// Completes a runtime-owned outbound pairing and stores its named direct connection.
-    #[allow(non_snake_case)]
-    pub async fn finishPairedRemote(
-        &self,
-        pairingId: String,
-        pairingCode: String,
-        name: String,
-    ) -> Result<PairedRemoteSessionRecord, String> {
-        if pairingId.trim().is_empty() {
-            return Err("paired remote pairing id must not be empty".to_string());
-        }
-        if pairingCode.trim().is_empty() {
-            return Err("paired remote pairing code must not be empty".to_string());
-        }
-        if name.trim().is_empty() {
-            return Err("paired remote session name must not be empty".to_string());
-        }
-        if self.linkAccessStore.outboundSessions()?.contains_key(&name) {
-            return Err(format!("paired remote session already exists: {name}"));
-        }
-        let pending = self
-            .linkAccessStore
-            .pendingOutboundPairings()?
-            .get(&pairingId)
-            .cloned()
-            .ok_or_else(|| format!("pending paired remote does not exist: {pairingId}"))?;
-        let client = RemoteLinkClient::new(pending.baseUrl);
-        let record = client
-            .pairFinish(&pending.state, &pairingCode)
-            .await?
-            .exportRecord();
-        self.linkAccessStore
-            .saveOutboundSession(name.clone(), record.clone())?;
-        self.linkAccessStore
-            .removePendingOutboundPairing(&pairingId)?;
-        Ok(record)
-    }
-
-    /// Returns the persisted transaction protocol before any pairing side effects.
-    pub fn outboundPairingKind(&self, pairingId: String) -> Result<operit_access_runtime::OutboundPairingKind, String> {
-        self.linkAccessStore.outboundPairingKind(&pairingId)
-    }
-
-    /// Starts the standard Link pairing exchange with a lightweight Edge.
-    /// `tokenHash` is the SHA-256/base64 hash of the Edge token, matching the
-    /// normal Link Access pairing contract.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[allow(non_snake_case)]
-    pub async fn startEdgePairing(
-        &self,
-        endpoint: String,
-        tokenHash: String,
-        clientDeviceInfo: RemoteDeviceInfo,
-    ) -> Result<RuntimeEdgePairStartResult, String> {
-        if endpoint.trim().is_empty() {
-            return Err("Edge endpoint must not be empty".to_string());
-        }
-        if tokenHash.trim().is_empty() {
-            return Err("Edge token hash must not be empty".to_string());
-        }
-        let identity = self
-            .linkAccessStore
-            .initializeIdentity(clientDeviceInfo.clone())?;
-        let channel = connectEdgeChannel(&endpoint).await?;
-        let state = startPairAsClient(
-            channel.clone(),
-            tokenHash,
-            identity.deviceId,
-            LinkDeviceInfo {
-                platform: identity.deviceInfo.platform,
-                model: identity.deviceInfo.model,
-            },
-        )
-        .await?;
-        let result = RuntimeEdgePairStartResult {
-            pairingId: state.pairingId.clone(),
-            pairingServiceVersion: operit_edge_transport::EDGE_PAIRING_SERVICE_VERSION,
-            edgeDeviceId: state.edgeDeviceId.clone(),
-            edgeDeviceInfo: RemoteDeviceInfo {
-                platform: state.edgeDeviceInfo.platform.clone(),
-                model: state.edgeDeviceInfo.model.clone(),
-            },
-        };
-        let pairingState = serde_json::to_value(&state)
-            .map_err(|error| format!("failed to persist Edge pairing state: {error}"))?;
-        self.linkAccessStore.savePendingOutboundEdgePairing(
-            state.pairingId.clone(),
-            PendingOutboundEdgePairingRecord {
-                endpoint: endpoint.clone(),
-                pairingState,
-            },
-        )?;
-        // Pairing transactions survive independently of their initial carrier.
-        channel.close().await;
-        Ok(result)
-    }
-
-    /// Convenience pairing entry point for callers that still hold the raw
-    /// Edge token rather than its Link hash.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[allow(non_snake_case)]
-    pub async fn startEdgePairingWithToken(
-        &self,
-        endpoint: String,
-        token: String,
-        clientDeviceInfo: RemoteDeviceInfo,
-    ) -> Result<RuntimeEdgePairStartResult, String> {
-        self.startEdgePairing(endpoint, linkTokenHash(&token), clientDeviceInfo)
-            .await
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn ensureEdgeChat(&self, edgeDeviceId: &str) -> Result<String, String> {
-        let chatId = format!("edge-chat-{edgeDeviceId}");
-        let bindings = CoreNodeBindingStore::new(self.localRuntime.runtimeStorageHost())?;
-        let commit = if let Some(binding) = bindings.bindingOptional(&chatId)? {
-            bindings.compareAndSet(&chatId, &binding.nodeId, &binding.nodeId)?
-        } else {
-            let local = self.nodeRouter.localNodeId();
-            let direct = activePeerNodeIds(&local)?;
-            let mut members = self.spaceStore.space()?.members;
-            members.sort_by_key(|id| (id != &local, !direct.contains(id), id.clone()));
-            let mut selected = None;
-            for member in members {
-                if member != edgeDeviceId
-                    && self.networkControlStore.nodeHasCapability(&member, "runtime.execute", None)?
-                    && (member == local || self.nodeRouter.nodeIsReachable(&member)?)
-                {
-                    selected = Some(member);
-                    break;
-                }
-            }
-            let selected = selected.ok_or_else(|| "No reachable Space member can execute Edge chat".to_string())?;
-            bindings.create(&chatId, &selected)?
-        };
-        self.installRouteBindingOnTarget(&commit.binding.nodeId, commit.operation).await?;
-        let response = self.nodeRouter.callSpace(CoreCallRequest::new(
-            format!("edge-chat-init-{}", currentTimeMillis()), CORE_INTERNAL_TARGET,
-            "ensureRoutedChat", CoreValue::Map(BTreeMap::from([
-                ("chatId".into(), CoreValue::String(chatId.clone())),
-            ])),
-        )).await;
-        response.result.map_err(|error| error.to_string())?;
-        Ok(chatId)
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn attachEdgePeerChannel(
-        &self,
-        name: String,
-        record: PairedEdgeSessionRecord,
-        channel: Arc<dyn LinkChannel>,
-        session: EdgeSession,
-    ) -> Result<AttachedPeerLink, String> {
-        let localNodeId = self.nodeRouter.localNodeId();
-        if record.deviceId != localNodeId
-            || session.deviceId != localNodeId
-            || session.peerDeviceId != record.edgeDeviceId
-            || session.sessionId != record.sessionId
-        {
-            return Err("Edge session does not match the authenticated Space identities".to_string());
-        }
-        if !self.spaceStore.contains(record.edgeDeviceId.clone())?
-            || self.networkControlStore.nodeIsDisconnected(&record.edgeDeviceId)?
-        {
-            return Err("Edge is not an admitted active member of this Space".to_string());
-        }
-        let chatId = self.ensureEdgeChat(&record.edgeDeviceId).await?;
-        let authenticated = AuthenticatedLinkChannel::new(channel, session);
-        let space = self.spaceStore.space()?;
-        authenticated
-            .send(LinkFrame {
-                messageId: format!("edge-peer-open-{}", currentTimeMillis()),
-                payload: LinkFramePayload::SpaceContext {
-                    spaceId: space.spaceId,
-                    adjacentNodeId: localNodeId,
-                    ttl: u32::try_from(space.members.len()).unwrap_or(u32::MAX).max(1),
-                    chatId,
-                },
-            })
-            .await?;
-        let attached = attachPeerLinkCarrier(
-            self.nodeRouter.localNodeId(),
-            record.edgeDeviceId,
-            format!("edge-peer-{}-{}", name, currentTimeMillis()),
-            Arc::new(RuntimeEdgePeerCarrier {
-                channel: authenticated.clone(),
-            }),
-            coreNodeTransportClient(self.nodeRouter.clone()),
-            self.spaceStore.clone(),
-        )?;
-        self.edgePeerLinks
-            .lock()
-            .await
-            .insert(name, attached.clone());
-        let receiver = authenticated;
-        let receiverAttached = attached.clone();
-        tokio::spawn(async move {
-            loop {
-                let frame = match receiver.receive().await {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => {
-                        receiverAttached.close("Edge PeerLink carrier closed".to_string());
-                        break;
-                    }
-                    Err(error) => {
-                        receiverAttached.close(format!("Edge PeerLink receive failed: {error}"));
-                        break;
-                    }
-                };
-                let LinkFramePayload::PeerFrame(peerFrame) = frame.payload else {
-                    receiverAttached.close("Edge carrier sent a non-PeerLink frame".to_string());
-                    break;
-                };
-                if let Err(error) = receiverAttached.receiveFrame(peerFrame).await {
-                    receiverAttached.close(format!("Edge PeerLink dispatch failed: {error}"));
-                    break;
-                }
-            }
-        });
-        Ok(attached)
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn reconnectPersistedEdgePeers(&self) -> Result<(), String> {
-        for (name, record) in self.linkAccessStore.edgeSessions()? {
-            if !self.spaceStore.contains(record.edgeDeviceId.clone())?
-                || self.networkControlStore.nodeIsDisconnected(&record.edgeDeviceId)?
-            {
-                continue;
-            }
-            if isPeerLinkActive(&self.nodeRouter.localNodeId(), &record.edgeDeviceId)? {
-                continue;
-            }
-            let channel = match connectEdgeChannel(&record.endpoint).await {
-                Ok(channel) => channel,
-                Err(error) => {
-                    operit_util::AppLogger::AppLogger::trace(
-                        "RuntimeRemoteLinkService",
-                        &format!("Edge reconnect skipped name={name}: {error}"),
-                    );
-                    continue;
-                }
-            };
-            let secret = BASE64
-                .decode(record.sessionSecret.as_bytes())
-                .map_err(|error| format!("invalid Edge session secret: {error}"))?;
-            let session = EdgeSession {
-                sessionId: record.sessionId.clone(),
-                deviceId: record.deviceId.clone(),
-                peerDeviceId: record.edgeDeviceId.clone(),
-                sessionSecret: secret,
-            };
-            let sessionName = name.clone();
-            if let Err(error) = self
-                .attachEdgePeerChannel(name, record, channel, session)
-                .await
-            {
-                operit_util::AppLogger::AppLogger::trace(
-                    "RuntimeRemoteLinkService",
-                    &format!("Edge reconnect attach failed name={sessionName}: {error}"),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Completes an Edge pairing after the code displayed by the Edge has
-    /// been entered and keeps the authenticated Link client ready for calls.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[allow(non_snake_case)]
-    pub async fn finishEdgePairing(
-        &self,
-        pairingId: String,
-        pairingCode: String,
-        name: String,
-    ) -> Result<PairedEdgeSessionRecord, String> {
-        if pairingId.trim().is_empty() || pairingCode.trim().is_empty() || name.trim().is_empty() {
-            return Err("Edge pairing id, code, and session name are required".to_string());
-        }
-        if self.linkAccessStore.edgeSessions()?.contains_key(&name) {
-            return Err(format!("Edge session already exists: {name}"));
-        }
-        let localNodeId = self.nodeRouter.localNodeId();
-        self.networkControlStore.initializeCurrentSpace()?;
-        let stored = self.linkAccessStore.pendingOutboundEdgePairings()?
-            .get(&pairingId)
-            .cloned()
-            .ok_or_else(|| format!("pending Edge pairing does not exist: {pairingId}"))?;
-        let state: EdgePairStartState = serde_json::from_value(stored.pairingState)
-            .map_err(|error| format!("invalid persisted Edge pairing state: {error}"))?;
-        if !self.networkControlStore.nodeHasCapability(
-            &localNodeId, "network.members.join", Some(&state.edgeDeviceId),
-        )? {
-            return Err("current device cannot admit an Edge into this Space".to_string());
-        }
-        let channel = connectEdgeChannel(&stored.endpoint).await?;
-        let edgeDeviceInfo = RemoteDeviceInfo {
-            platform: state.edgeDeviceInfo.platform.clone(),
-            model: state.edgeDeviceInfo.model.clone(),
-        };
-        let session =
-            finishPairAsClient(channel.clone(), state, pairingCode).await?;
-        let record = PairedEdgeSessionRecord {
-            endpoint: stored.endpoint,
-            sessionId: session.sessionId.clone(),
-            deviceId: session.deviceId.clone(),
-            edgeDeviceId: session.peerDeviceId.clone(),
-            edgeDeviceInfo,
-            pairingServiceVersion: operit_edge_transport::EDGE_PAIRING_SERVICE_VERSION,
-            sessionSecret: BASE64.encode(&session.sessionSecret),
-        };
-        // Check authorization before mutating either the profile or Space
-        // membership, so a denied pairing cannot leave half-admitted state.
-        let localNodeId = self.nodeRouter.localNodeId();
-        self.networkControlStore.initializeCurrentSpace()?;
-        if !self.networkControlStore.nodeHasCapability(
-            &localNodeId,
-            "network.members.join",
-            Some(&record.edgeDeviceId),
-        )? {
-            return Err("current device cannot admit an Edge into this Space".to_string());
-        }
-        // A completed Edge pairing is a normal Space admission. The Edge only
-        // contributes identity/profile metadata; it does not receive local
-        // business storage or a local Host capability registry.
-        self.spaceStore.admitRemoteMember(
-            record.edgeDeviceId.clone(),
-            format!("Edge {}", record.edgeDeviceId),
-            record.edgeDeviceInfo.platform.clone(),
-            record.edgeDeviceInfo.model.clone(),
-            format!("edge-link-{}", record.pairingServiceVersion),
-        )?;
-        let control = self.networkControlStore.currentState()?;
-        if !control.memberNodeIds.contains(&record.edgeDeviceId) {
-            self.networkControlStore
-                .admitMember(record.edgeDeviceId.clone())?;
-        }
-        self.linkAccessStore
-            .saveEdgeSession(name.clone(), record.clone())?;
-        self.attachEdgePeerChannel(name, record.clone(), channel, session)
-            .await?;
-        self.linkAccessStore.removePendingOutboundEdgePairing(&pairingId)?;
-        Ok(record)
-    }
-
-    /// Executes one standard Link call against a paired lightweight Edge.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[allow(non_snake_case)]
-    pub async fn callEdge(
-        &self,
-        name: String,
-        request: CoreCallRequest,
-    ) -> Result<CoreCallResponse, String> {
-        let _ = (name, request);
-        Err("Edge calls must use the generated Space route; direct callEdge is disabled".to_string())
-    }
-
-    /// Lists the completed lightweight Edge sessions known by this Core.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[allow(non_snake_case)]
-    pub fn edgeSessionsSnapshot(
-        &self,
-    ) -> Result<BTreeMap<String, PairedEdgeSessionRecord>, String> {
-        self.linkAccessStore.edgeSessions()
-    }
-
-
-    /// Bootstraps an outbound pairing from a Web Access URL token.
-    #[allow(non_snake_case)]
-    pub async fn bootstrapPairedRemote(
-        &self,
-        baseUrl: String,
-        tokenHash: String,
-        clientDeviceInfo: RemoteDeviceInfo,
-    ) -> Result<PairedRemoteSessionRecord, String> {
-        if baseUrl.trim().is_empty() {
-            return Err("paired remote base URL must not be empty".to_string());
-        }
-        if tokenHash.trim().is_empty() {
-            return Err("paired remote token hash must not be empty".to_string());
-        }
-        let client = RemoteLinkClient::new(baseUrl);
-        let hello = client.hello(&tokenHash).await?;
-        let name = format!(
-            "{}-{}-{}",
-            hello.coreDeviceInfo.platform, hello.coreDeviceInfo.model, hello.coreDeviceId
-        );
-        if self.linkAccessStore.outboundSessions()?.contains_key(&name) {
-            return Err(format!("paired remote session already exists: {name}"));
-        }
-        let identity = self.linkAccessStore.initializeIdentity(clientDeviceInfo)?;
-        let record = client
-            .pairBootstrap(&tokenHash, identity.deviceId, identity.deviceInfo)
-            .await?
-            .exportRecord();
-        if hello.coreDeviceId != record.coreDeviceId {
-            return Err("paired remote identity changed during pairing".to_string());
-        }
-        self.linkAccessStore
-            .saveOutboundSession(name, record.clone())?;
-        Ok(record)
-    }
-
-    /// Persists the explicit carrier selected for one named outbound session.
-    #[allow(non_snake_case)]
-    pub fn setPairedRemoteTransport(
-        &self,
-        name: String,
-        transport: LinkTransportPreference,
-    ) -> Result<PairedRemoteSessionRecord, String> {
-        let mut record = self
-            .linkAccessStore
-            .outboundSessions()?
-            .get(&name)
-            .cloned()
-            .ok_or_else(|| format!("paired remote runtime does not exist: {name}"))?;
-        record.transport = transport;
-        self.linkAccessStore
-            .saveOutboundSession(name, record.clone())?;
-        Ok(record)
-    }
-
-    /// Persists a verified endpoint, distinguishing an unavailable peer from local failures.
-    #[allow(non_snake_case)]
-    async fn updatePairedRemoteEndpoint(
-        &self,
-        name: String,
-        baseUrl: String,
-    ) -> Result<Option<PairedRemoteSessionRecord>, String> {
-        let sessions = self.linkAccessStore.outboundSessions()?;
-        let record = sessions
-            .get(&name)
-            .cloned()
-            .ok_or_else(|| format!("paired remote runtime does not exist: {name}"))?;
-        let updated = record.withBaseUrl(baseUrl);
-        let session = PairedRemoteSession::fromRecord(updated.clone())?;
-        let Some(info) = discoveredEndpointResponse(
-            session.sessionInfo().await,
-            "session_info",
-            &record.coreDeviceId,
-            &updated.baseUrl,
-        ) else {
-            return Ok(None);
-        };
-        ensureRemoteIdentity(&updated, &info.coreDeviceId)?;
-        if updated.baseUrl != record.baseUrl {
-            self.linkAccessStore
-                .saveOutboundSession(name, updated.clone())?;
-        }
-        Ok(Some(updated))
-    }
-
-    /// Resolves a named persisted outbound record into its authenticated remote session.
-    #[allow(non_snake_case)]
-    fn pairedSession(
-        &self,
-        name: &str,
-    ) -> Result<(PairedRemoteSessionRecord, PairedRemoteSession), String> {
-        let sessions = self.linkAccessStore.outboundSessions()?;
-        let record = sessions
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("paired remote runtime does not exist: {name}"))?;
-        let session = PairedRemoteSession::fromRecord(record.clone())?;
-        Ok((record, session))
-    }
-
-    /// Verifies and persists discovered endpoints for every matching paired remote session.
-    #[allow(non_snake_case)]
-    async fn refreshDiscoveredPairedRemoteEndpoints(
-        &self,
-        devices: &[RuntimeRemoteDiscoveryEndpoint],
-    ) -> Result<(), String> {
-        let sessions = self.linkAccessStore.outboundSessions()?;
-        for device in devices {
-            for name in sessions
-                .iter()
-                .filter(|(_, session)| session.coreDeviceId == device.deviceId)
-                .map(|(name, _)| name)
-            {
-                self.updatePairedRemoteEndpoint(name.clone(), device.baseUrl.clone())
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolves live Space identities for discovered devices and groups them by Space id.
-    #[allow(non_snake_case)]
-    async fn groupDiscoveredSpaces(
-        &self,
-        devices: Vec<RuntimeRemoteDiscoveryEndpoint>,
-    ) -> Result<Vec<RuntimeRemoteDiscoveredSpace>, String> {
-        let mut spaces = BTreeMap::<String, RuntimeRemoteDiscoveredSpace>::new();
-        for endpoint in devices {
-            let Some(hello) = discoveredEndpointResponse(
-                RemoteLinkClient::new(endpoint.baseUrl.clone())
-                    .hello(&endpoint.tokenHash)
-                    .await,
-                "hello",
-                &endpoint.deviceId,
-                &endpoint.baseUrl,
-            ) else {
-                continue;
-            };
-            ensureRemoteIdentityById(&endpoint.deviceId, &hello.coreDeviceId)?;
-            if hello.deviceSpace.deviceCount == 0 {
-                return Err("discovered device space has no devices".to_string());
-            }
-            let device = RuntimeRemoteDiscoveredDevice {
-                deviceId: endpoint.deviceId,
-                displayName: hello.coreDeviceInfo.displayName(),
-                userName: hello.deviceSpace.userName,
-                platform: hello.coreDeviceInfo.platform,
-                model: hello.coreDeviceInfo.model,
-                baseUrl: endpoint.baseUrl,
-                hostname: endpoint.hostname,
-                port: endpoint.port,
-                tokenHash: endpoint.tokenHash,
-                version: endpoint.version,
-            };
-            let memberCount = hello.deviceSpace.deviceCount;
-            match spaces.get_mut(&hello.deviceSpace.spaceId) {
-                Some(space) => {
-                    if hello.deviceSpace.spaceRevision > space.spaceRevision {
-                        space.spaceName = hello.deviceSpace.spaceName.clone();
-                        space.spaceRevision = hello.deviceSpace.spaceRevision;
-                        space.memberCount = memberCount;
-                    } else if hello.deviceSpace.spaceRevision == space.spaceRevision {
-                        if hello.deviceSpace.spaceName != space.spaceName {
-                            return Err(format!(
-                                "device space {} advertises conflicting names at revision {}",
-                                hello.deviceSpace.spaceId, hello.deviceSpace.spaceRevision
-                            ));
-                        }
-                        space.memberCount = space.memberCount.max(memberCount);
-                    }
-                    space.devices.push(device);
-                }
-                None => {
-                    spaces.insert(
-                        hello.deviceSpace.spaceId.clone(),
-                        RuntimeRemoteDiscoveredSpace {
-                            spaceId: hello.deviceSpace.spaceId,
-                            spaceName: hello.deviceSpace.spaceName,
-                            spaceRevision: hello.deviceSpace.spaceRevision,
-                            memberCount,
-                            devices: vec![device],
-                        },
-                    );
-                }
-            }
-        }
-        for space in spaces.values_mut() {
-            space.devices.sort_by(|left, right| {
-                left.displayName
-                    .cmp(&right.displayName)
-                    .then(left.deviceId.cmp(&right.deviceId))
-            });
-        }
-        Ok(spaces.into_values().collect())
     }
 
     /// Builds the persistent synchronization service owned by this runtime facade.
     #[allow(non_snake_case)]
     fn persistenceSyncService(&self) -> SpacePersistenceSyncService {
-        SpacePersistenceSyncService::new(
-            self.localRuntime.clone(),
-            self.nodeRouter.clone(),
-            self.linkAccessStore.clone(),
-            self.spaceStore.clone(),
-        )
-    }
-}
-
-/// Isolates one failed discovery request while retaining its endpoint and error in the log.
-#[allow(non_snake_case)]
-fn discoveredEndpointResponse<T>(
-    response: Result<T, String>,
-    operation: &str,
-    deviceId: &str,
-    baseUrl: &str,
-) -> Option<T> {
-    match response {
-        Ok(response) => Some(response),
-        Err(error) => {
-            operit_util::AppLogger::AppLogger::w(
-                "RuntimeRemoteLinkService",
-                &format!(
-                    "Discovery request failed operation={operation} device={deviceId} \
-                     endpoint={baseUrl}: {error}"
-                ),
-            );
-            None
-        }
+        self.persistenceSync.clone()
     }
 }
 
@@ -1845,8 +1240,15 @@ fn discoveredEndpointResponse<T>(
 fn runtimeDeviceSpaceDevice(
     profile: &CoreSpaceDeviceProfile,
     online: bool,
+    routePlan: Option<&CoreSpaceRoutePlan>,
     currentIdentity: Option<RuntimeDeviceSpaceIdentity>,
 ) -> RuntimeDeviceSpaceDevice {
+    // Only a plan with more than one hop reports a relay: a single-hop plan is the
+    // direct Peer Link the local device already observes itself.
+    let (relayHops, relayPath) = match routePlan {
+        Some(plan) if plan.hops() > 1 => (Some(plan.hops()), Some(plan.path.clone())),
+        _ => (None, None),
+    };
     RuntimeDeviceSpaceDevice {
         deviceId: profile.nodeId.clone(),
         userName: profile.userName.clone(),
@@ -1854,7 +1256,11 @@ fn runtimeDeviceSpaceDevice(
         platform: profile.platform.clone(),
         model: profile.model.clone(),
         coreVersion: profile.coreVersion.clone(),
+        protocolVersion: profile.protocolVersion,
+
         online,
+        relayHops,
+        relayPath,
         currentIdentity,
     }
 }
@@ -1888,12 +1294,12 @@ fn runtimeDeviceSpaceConnectionState(
     if !second.online {
         reasons.push(format!("{} is offline", second.deviceName));
     }
-    let versionsMismatch = match (&first.coreVersion, &second.coreVersion) {
-        (Some(firstVersion), Some(secondVersion)) if firstVersion != secondVersion => {
-            reasons.push(format!(
-                "Core version mismatch: {}={}, {}={}",
-                first.deviceName, firstVersion, second.deviceName, secondVersion
-            ));
+    let firstProtocol = first.protocolVersion;
+    let secondProtocol = second.protocolVersion;
+    let versionsMismatch = match (firstProtocol, secondProtocol) {
+        (Some(firstProtocol), Some(secondProtocol)) if firstProtocol != secondProtocol => {
+            reasons.push(format!("Peer protocol mismatch: {}=v{}, {}=v{}",
+                first.deviceName, firstProtocol, second.deviceName, secondProtocol));
             true
         }
         _ => false,
@@ -1901,17 +1307,19 @@ fn runtimeDeviceSpaceConnectionState(
     if directlyOnline == Some(false) {
         reasons.push("Direct Peer Link is offline".to_string());
     }
-    let status = if !first.online || !second.online || directlyOnline == Some(false) {
-        RuntimeDeviceSpaceConnectionStatus::Offline
-    } else if versionsMismatch {
+    let status = if versionsMismatch {
         RuntimeDeviceSpaceConnectionStatus::VersionMismatch
-    } else if first.coreVersion.is_none() || second.coreVersion.is_none() {
-        reasons.push("Core version is unavailable".to_string());
+    } else if !first.online || !second.online || directlyOnline == Some(false) {
+        RuntimeDeviceSpaceConnectionStatus::Offline
+    } else if firstProtocol.is_none() || secondProtocol.is_none() {
+        reasons.push("Peer protocol version is unavailable".to_string());
         RuntimeDeviceSpaceConnectionStatus::Unknown
     } else if directlyOnline.is_none() {
-        reasons
-            .push("Direct Peer Link status is not observable from the current device".to_string());
-        RuntimeDeviceSpaceConnectionStatus::Unknown
+        reasons.push(
+            "Announced by its owning device; the local device cannot observe this link directly"
+                .to_string(),
+        );
+        RuntimeDeviceSpaceConnectionStatus::Announced
     } else {
         RuntimeDeviceSpaceConnectionStatus::Online
     };
@@ -1942,108 +1350,22 @@ fn pairedDeviceStatusesFromState(
         .collect()
 }
 
-/// Merges inbound and outbound pairing records into one device-indexed projection.
-#[allow(non_snake_case)]
-fn mergePairedDevices(
-    outboundSessions: BTreeMap<String, PairedRemoteSessionRecord>,
-    inboundSessions: BTreeMap<String, AcceptedRemoteSessionRecord>,
-) -> Result<BTreeMap<String, RuntimePairedDevice>, String> {
-    let mut devices = BTreeMap::<String, RuntimePairedDevice>::new();
-    for (sessionName, record) in outboundSessions {
-        let device = devices
-            .entry(record.coreDeviceId.clone())
-            .or_insert_with(|| RuntimePairedDevice {
-                deviceId: record.coreDeviceId.clone(),
-                deviceInfo: record.remoteDeviceInfo.clone(),
-                outboundSessionName: None,
-                outboundBaseUrl: None,
-                outboundTransport: None,
-                inboundSessionIds: Vec::new(),
-            });
-        ensureDeviceInfoMatches(&device.deviceInfo, &record.remoteDeviceInfo)?;
-        if device.outboundSessionName.is_some() {
-            return Err(format!(
-                "multiple outgoing pairings target device {}",
-                record.coreDeviceId
-            ));
-        }
-        device.outboundSessionName = Some(sessionName);
-        device.outboundBaseUrl = Some(record.baseUrl);
-        device.outboundTransport = Some(record.transport);
+/// 只允许当前 Space 加上已鉴权的一个节点；保留原有身份、成员与版本校验。
+fn validateSpaceJoin(current: &CoreSpace, peerNodeId: &str, proposal: &CoreSpace) -> Result<(), String> {
+    let mut expected = current.members.iter().cloned().collect::<BTreeSet<_>>();
+    let isNewMember = expected.insert(peerNodeId.to_string());
+    let proposed = proposal.members.iter().cloned().collect::<BTreeSet<_>>();
+    if proposed != expected || proposed.len() != proposal.members.len() {
+        return Err("join proposal members must equal the current Space plus the authenticated device".into());
     }
-    for (sessionId, record) in inboundSessions {
-        let device =
-            devices
-                .entry(record.deviceId.clone())
-                .or_insert_with(|| RuntimePairedDevice {
-                    deviceId: record.deviceId.clone(),
-                    deviceInfo: record.deviceInfo.clone(),
-                    outboundSessionName: None,
-                    outboundBaseUrl: None,
-                    outboundTransport: None,
-                    inboundSessionIds: Vec::new(),
-                });
-        ensureDeviceInfoMatches(&device.deviceInfo, &record.deviceInfo)?;
-        device.inboundSessionIds.push(sessionId);
+    if proposal.spaceId != current.spaceId || proposal.spaceName != current.spaceName {
+        return Err("join proposal must preserve the server Space identity".into());
     }
-    Ok(devices)
-}
-
-/// Adds authenticated Edge peers without presenting their TCP/UART credentials
-/// as HTTP sessions. The existing device UI uses PeerLink status and removal.
-fn mergeEdgePairedDevices(
-    mut devices: BTreeMap<String, RuntimePairedDevice>,
-    edges: BTreeMap<String, PairedEdgeSessionRecord>,
-) -> Result<BTreeMap<String, RuntimePairedDevice>, String> {
-    for record in edges.into_values() {
-        if let Some(device) = devices.get(&record.edgeDeviceId) {
-            ensureDeviceInfoMatches(&device.deviceInfo, &record.edgeDeviceInfo)?;
-        } else {
-            devices.insert(record.edgeDeviceId.clone(), RuntimePairedDevice {
-                deviceId: record.edgeDeviceId,
-                deviceInfo: record.edgeDeviceInfo,
-                outboundSessionName: None,
-                outboundBaseUrl: None,
-                outboundTransport: None,
-                inboundSessionIds: Vec::new(),
-            });
-        }
-    }
-    Ok(devices)
-}
-
-/// Verifies that the endpoint answered for the paired runtime identity stored locally.
-#[allow(non_snake_case)]
-fn ensureRemoteIdentity(
-    record: &PairedRemoteSessionRecord,
-    coreDeviceId: &str,
-) -> Result<(), String> {
-    if coreDeviceId != record.coreDeviceId {
-        return Err("remote runtime identity changed".to_string());
-    }
-    Ok(())
-}
-
-/// Verifies one observed CoreNode id against an authenticated Link response.
-#[allow(non_snake_case)]
-fn ensureRemoteIdentityById(expectedNodeId: &str, observedNodeId: &str) -> Result<(), String> {
-    if observedNodeId != expectedNodeId {
-        return Err(format!(
-            "paired device identity mismatch: expected={}, observed={observedNodeId}",
-            expectedNodeId
-        ));
-    }
-    Ok(())
-}
-
-/// Verifies that directional session records describe the same paired device.
-#[allow(non_snake_case)]
-fn ensureDeviceInfoMatches(
-    expected: &RemoteDeviceInfo,
-    observed: &RemoteDeviceInfo,
-) -> Result<(), String> {
-    if expected.platform != observed.platform || expected.model != observed.model {
-        return Err("paired device metadata conflicts across session directions".to_string());
+    let revision = if isNewMember {
+        current.spaceRevision.checked_add(1).ok_or("Space revision overflow during join")?
+    } else { current.spaceRevision };
+    if proposal.spaceRevision != revision {
+        return Err("join proposal has an invalid Space revision".into());
     }
     Ok(())
 }
@@ -2051,7 +1373,6 @@ fn ensureDeviceInfoMatches(
 /// Uses map's existing weak target and automatic upstream unsubscription.
 /// The map closure owns the stop sender; removing its last subscriber drops
 /// the sender even while the worker still owns and updates the source state.
-#[cfg(not(target_arch = "wasm32"))]
 fn spaceOverviewSubscription<T>(source: &StateFlow<T>, stop: oneshot::Sender<()>) -> StateFlow<T>
 where
     T: Clone + PartialEq + Send + 'static,
@@ -2063,111 +1384,28 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod device_space_facade_tests {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/device_space/facade_state.rs"));
+}
 
-    /// Verifies both discovery request phases retain healthy peers around failed requests.
-    #[test]
-    fn discovery_requests_isolate_unavailable_devices() {
-        for operation in ["session_info", "hello"] {
-            let responses = [
-                ("offline-first", Err("connection refused".to_string())),
-                ("online-first", Ok("verified-first")),
-                ("offline-middle", Err("request timed out".to_string())),
-                ("online-last", Ok("verified-last")),
-                ("offline-last", Err("connection reset".to_string())),
-            ];
-            let mut verified = Vec::new();
-            for (device_id, response) in responses {
-                let Some(response) = discoveredEndpointResponse(
-                    response,
-                    operation,
-                    device_id,
-                    "http://192.0.2.1:37194",
-                ) else {
-                    continue;
-                };
-                verified.push((device_id, response));
-            }
-            assert_eq!(
-                verified,
-                [
-                    ("online-first", "verified-first"),
-                    ("online-last", "verified-last"),
-                ],
-                "request phase: {operation}"
-            );
+#[async_trait::async_trait(?Send)]
+impl crate::NodeSpaceService::NodeSpaceContext for RuntimeRemoteLinkService {
+    fn storage(&self) -> Arc<dyn operit_host_api::RuntimeStorageHost> { self.localRuntime.runtimeStorageHost() }
+    fn spaceStore(&self) -> &CoreSpaceStore { &self.spaceStore }
+    fn networkControlStore(&self) -> &NetworkControlStore { &self.networkControlStore }
+    fn peers(&self) -> Result<Arc<dyn crate::RuntimePeerService::RuntimePeerService>, String> {
+        Ok(self.nodeServices()?.peers())
+    }
+    fn localNodeId(&self) -> String { self.nodeRouter.localNodeId() }
+    fn nodeIsReachable(&self, node: &str) -> Result<bool, String> { self.nodeRouter.nodeIsReachable(node) }
+    async fn callNode(&self, node: String, request: CoreCallRequest) -> operit_link::CoreCallResponse {
+        let response = self.nodeRouter.callNode(node, request).await;
+        if let Err(error) = &response.result {
+            crate::SpacePersistenceSyncService::recordSyncTransportError(error);
         }
+        response
     }
-
-    /// Verifies failed requests never create a verified endpoint or a discovered device.
-    #[test]
-    fn discovery_requests_do_not_create_results_for_unavailable_devices() {
-        for operation in ["session_info", "hello"] {
-            let response = discoveredEndpointResponse::<()>(
-                Err("connection refused".to_string()),
-                operation,
-                "offline-device",
-                "http://192.0.2.1:37194",
-            );
-            assert!(response.is_none(), "request phase: {operation}");
-        }
-    }
-
-    #[tokio::test]
-    async fn overview_subscription_stops_worker_after_last_watch_is_dropped() {
-        let source = StateFlow::new(1);
-        let (stop, mut stopped) = oneshot::channel::<()>();
-        let watch = spaceOverviewSubscription(&source, stop);
-        let anotherWatch = watch.clone();
-        source.set_value(2);
-        assert_eq!(watch.value(), 2);
-        drop(watch);
-        assert!(matches!(
-            stopped.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        source.set_value(3);
-        assert_eq!(anotherWatch.value(), 3);
-        drop(anotherWatch);
-        // The worker can still own the source; it must not keep the guard alive.
-        assert!(stopped.await.is_err());
-        source.set_value(4);
-    }
-
-    /// Creates one paired-device projection for status mapping tests.
-    fn test_paired_device(device_id: &str) -> RuntimePairedDevice {
-        RuntimePairedDevice {
-            deviceId: device_id.to_string(),
-            deviceInfo: RemoteDeviceInfo {
-                platform: "test".to_string(),
-                model: "peer".to_string(),
-            },
-            outboundSessionName: None,
-            outboundBaseUrl: None,
-            outboundTransport: None,
-            inboundSessionIds: Vec::new(),
-        }
-    }
-
-    /// Verifies paired-device statuses are driven only by active Peer Links.
-    #[test]
-    fn paired_device_statuses_follow_active_peer_links_only() {
-        let statuses = pairedDeviceStatusesFromState(
-            BTreeMap::from([
-                ("node-b".to_string(), test_paired_device("node-b")),
-                ("node-c".to_string(), test_paired_device("node-c")),
-            ]),
-            BTreeSet::from(["node-b".to_string()]),
-        );
-
-        assert_eq!(
-            statuses.get("node-b"),
-            Some(&RuntimePairedDeviceStatus::Online)
-        );
-        assert_eq!(
-            statuses.get("node-c"),
-            Some(&RuntimePairedDeviceStatus::Offline)
-        );
+    async fn afterJoined(&self, _peer: String) -> Result<(), String> {
+        self.persistenceSyncService().scheduleSynchronization("space_joined")
     }
 }

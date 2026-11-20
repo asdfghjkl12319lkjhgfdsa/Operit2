@@ -1,8 +1,9 @@
 use operit_host_api::{
     HostResult, HttpDownloadControl, HttpDownloadProgressCallback, HttpDownloadRequest,
     HttpDownloadResult, HttpHost, HttpRequestData, HttpResponseData, HttpStreamChunkCallback,
-    HttpStreamClosedCallback, HttpStreamHost, HttpStreamOpenedCallback, WebSocketClosedCallback,
-    WebSocketHost, WebSocketMessageCallback, WebSocketOpenedCallback, WebSocketRequestData,
+    HttpStreamClosedCallback, HttpStreamHost, HttpStreamOpenedCallback, HttpStreamResponseCallback,
+    WebSocketClosedCallback, WebSocketHost, WebSocketMessageCallback, WebSocketOpenedCallback,
+    WebSocketRequestData,
 };
 use operit_host_native_common::NativeHttpHost;
 
@@ -12,6 +13,20 @@ pub struct OhosHttpHost {
 }
 
 impl HttpStreamHost for OhosHttpHost {
+    /// Streams response headers and body through the shared native network host.
+    #[allow(non_snake_case)]
+    fn openHttpResponseStream(
+        &self,
+        streamId: String,
+        request: HttpRequestData,
+        onResponse: HttpStreamResponseCallback,
+        onChunk: HttpStreamChunkCallback,
+        onClosed: HttpStreamClosedCallback,
+    ) -> HostResult<()> {
+        self.inner
+            .openHttpResponseStream(streamId, request, onResponse, onChunk, onClosed)
+    }
+
     /// Opens one OpenHarmony HTTP byte stream through the shared native Host implementation.
     #[allow(non_snake_case)]
     fn openHttpByteStream(
@@ -43,9 +58,24 @@ impl OhosHttpHost {
 }
 
 impl HttpHost for OhosHttpHost {
+    /// Declares the image delivery supported by this HTTP host.
+    fn imageDelivery(&self) -> operit_host_api::HttpImageDelivery {
+        self.inner.imageDelivery()
+    }
+
     /// Executes an HTTP request through the OpenHarmony native networking stack.
     fn executeHttpRequest(&self, request: HttpRequestData) -> HostResult<HttpResponseData> {
         self.inner.executeHttpRequest(request)
+    }
+
+    /// Streams one HTTP response directly into the destination file.
+    #[allow(non_snake_case)]
+    fn downloadToFile(
+        &self,
+        request: HttpRequestData,
+        target: &dyn operit_host_api::FileTarget,
+    ) -> HostResult<operit_host_api::HttpFileDownloadResult> {
+        self.inner.downloadToFile(request, target)
     }
 
     /// Downloads files through the native bounded worker pool.
@@ -78,6 +108,12 @@ impl WebSocketHost for OhosHttpHost {
     #[allow(non_snake_case)]
     fn sendWebSocketMessage(&self, streamId: &str, message: Vec<u8>) -> HostResult<()> {
         self.inner.sendWebSocketMessage(streamId, message)
+    }
+
+    /// Sends one UTF-8 text frame through the shared OpenHarmony networking Host.
+    #[allow(non_snake_case)]
+    fn sendWebSocketText(&self, streamId: &str, text: String) -> HostResult<()> {
+        self.inner.sendWebSocketText(streamId, text)
     }
 
     /// Closes one OpenHarmony WebSocket.

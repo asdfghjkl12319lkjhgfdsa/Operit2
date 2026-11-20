@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:operit2/l10n/generated/app_localizations.dart';
 
 import '../../../../../data/preferences/UserPreferencesManager.dart';
+import '../../../../common/ChatMessageIdentity.dart';
 import '../../viewmodel/ChatViewModel.dart';
 
 /// Returns the primary header title for a cursor-style AI message.
@@ -15,10 +16,26 @@ String cursorAiPrimaryTitle(
   ThemePreferenceSnapshot snapshot, {
   AppLocalizations? l10n,
 }) {
+  if (message.roleName.isEmpty ||
+      readChatMessageIdentity(message)?.usesProviderLogo == true) {
+    return message.modelName;
+  }
   if (snapshot.showRoleName && message.roleName.isNotEmpty) {
     return message.roleName;
   }
   return l10n?.chatMessageResponse ?? 'Response';
+}
+
+/// Returns the participant name or the actual model identity for bubble messages.
+String bubbleAiPrimaryTitle(
+  ChatUiMessage message,
+  ThemePreferenceSnapshot snapshot,
+) {
+  if (message.roleName.isEmpty ||
+      readChatMessageIdentity(message)?.usesProviderLogo == true) {
+    return message.modelName;
+  }
+  return snapshot.showRoleName ? message.roleName : '';
 }
 
 /// Returns the compact model and provider label when enabled in preferences.
@@ -26,7 +43,11 @@ String formatModelProviderLabel(
   ChatUiMessage message,
   ThemePreferenceSnapshot snapshot,
 ) {
-  final showModel = snapshot.showModelName && message.modelName.isNotEmpty;
+  final modelIsPrimary =
+      message.roleName.isEmpty ||
+      readChatMessageIdentity(message)?.usesProviderLogo == true;
+  final showModel =
+      !modelIsPrimary && snapshot.showModelName && message.modelName.isNotEmpty;
   final showProvider =
       snapshot.showModelProvider && message.provider.isNotEmpty;
   if (showModel && showProvider) {
@@ -41,7 +62,8 @@ String formatModelProviderLabel(
   return '';
 }
 
-/// Formats token (with cache, cache rate, and speed), timing, and timestamp metrics into a compact single-line summary.
+/// Formats token, cache, speed, timing, and timestamp metrics into a compact
+/// summary that can wrap when displayed.
 String formatMessageStatsText(
   ChatUiMessage message,
   ThemePreferenceSnapshot snapshot, {
@@ -70,7 +92,7 @@ String formatMessageStatsText(
   return parts.join(' · ');
 }
 
-/// Formats input, cached input (with hit rate), output tokens, and token generation speed.
+/// Formats input, output tokens, cached input (with hit rate), and token generation speed.
 String formatCompactTokenStats(
   ChatUiMessage message, {
   AppLocalizations? l10n,
@@ -79,7 +101,7 @@ String formatCompactTokenStats(
       message.inputTokens > 0 ||
       message.outputTokens > 0 ||
       message.cachedInputTokens > 0;
-  if (!hasTokens && message.completedAt <= 0) {
+  if (!hasTokens) {
     return '';
   }
   final inputText = formatCompactTokenCount(message.inputTokens);
@@ -91,9 +113,9 @@ String formatCompactTokenStats(
   final outputText = formatCompactTokenCount(message.outputTokens);
   final speedText = formatTokenSpeed(message);
   if (speedText.isEmpty) {
-    return '↑$inputText ($cachedLabel) ↓$outputText';
+    return '↑$inputText ↓$outputText ($cachedLabel)';
   }
-  return '↑$inputText ($cachedLabel) ↓$outputText $speedText';
+  return '↑$inputText ↓$outputText ($cachedLabel) $speedText';
 }
 
 /// Formats the cache hit rate percentage (e.g., "70%", "0%").
@@ -130,12 +152,12 @@ String formatCompactTokenCount(int count) {
 /// Formats wait and output durations into a compact timing segment.
 String formatCompactTimingStats(ChatUiMessage message) {
   final hasTiming = message.waitDurationMs > 0 || message.outputDurationMs > 0;
-  if (!hasTiming && message.completedAt <= 0) {
+  if (!hasTiming) {
     return '';
   }
   final waitText = formatDurationSeconds(message.waitDurationMs);
   final outputText = formatDurationSeconds(message.outputDurationMs);
-  return '⏱ $waitText+$outputText';
+  return '◷ $waitText+$outputText';
 }
 
 /// Formats token output speed in tokens per second (e.g., "25.4 t/s", "120 t/s").
@@ -150,7 +172,7 @@ String formatTokenSpeed(ChatUiMessage message) {
     return '';
   }
   if (message.outputTokens <= 0 || message.outputDurationMs <= 0) {
-    return '0 t/s';
+    return '';
   }
   final speed = (message.outputTokens * 1000.0) / message.outputDurationMs;
   if (!speed.isFinite || speed <= 0) {
@@ -175,14 +197,17 @@ String formatDurationSeconds(int durationMs) {
   return '${(durationMs / 1000).toStringAsFixed(1)}s';
 }
 
+/// Uses delivery time for prepared messages and completion time for ordinary replies.
+int _messageDisplayTimestamp(ChatUiMessage message) =>
+    message.pluginExtensions.containsKey('host.chat.scheduled')
+    ? message.timestamp
+    : message.completedAt > 0
+    ? message.completedAt
+    : message.timestamp;
+
 /// Formats the message timestamp relative to the current date to avoid truncation.
-String formatSmartMessageTimestamp(
-  ChatUiMessage message, {
-  DateTime? now,
-}) {
-  final rawTimestamp = message.completedAt > 0
-      ? message.completedAt
-      : message.timestamp;
+String formatSmartMessageTimestamp(ChatUiMessage message, {DateTime? now}) {
+  final rawTimestamp = _messageDisplayTimestamp(message);
   if (rawTimestamp <= 0) {
     return '';
   }
@@ -225,8 +250,7 @@ String formatMessageMetadataTooltip(
   if (snapshot.showMessageTokenStats &&
       (message.inputTokens > 0 ||
           message.outputTokens > 0 ||
-          message.cachedInputTokens > 0 ||
-          message.completedAt > 0)) {
+          message.cachedInputTokens > 0)) {
     final inputStr = message.inputTokens.toString();
     final cacheRate = formatCacheHitRate(message);
     final cachedStr = '${message.cachedInputTokens} ($cacheRate)';
@@ -240,9 +264,7 @@ String formatMessageMetadataTooltip(
     );
   }
   if (snapshot.showMessageTimingStats &&
-      (message.waitDurationMs > 0 ||
-          message.outputDurationMs > 0 ||
-          message.completedAt > 0)) {
+      (message.waitDurationMs > 0 || message.outputDurationMs > 0)) {
     final waitSec = '${(message.waitDurationMs / 1000).toStringAsFixed(2)}s';
     final outSec = '${(message.outputDurationMs / 1000).toStringAsFixed(2)}s';
     lines.add(
@@ -251,18 +273,14 @@ String formatMessageMetadataTooltip(
     );
   }
   if (snapshot.showMessageTimestamp) {
-    final rawTimestamp = message.completedAt > 0
-        ? message.completedAt
-        : message.timestamp;
+    final rawTimestamp = _messageDisplayTimestamp(message);
     if (rawTimestamp > 0) {
       final dateTime = DateTime.fromMillisecondsSinceEpoch(rawTimestamp);
       String twoDigits(int value) => value.toString().padLeft(2, '0');
       final timeStr =
           '${dateTime.year}-${twoDigits(dateTime.month)}-${twoDigits(dateTime.day)} '
           '${twoDigits(dateTime.hour)}:${twoDigits(dateTime.minute)}:${twoDigits(dateTime.second)}';
-      lines.add(
-        l10n?.chatMessageTimeTooltip(timeStr) ?? 'Time: $timeStr',
-      );
+      lines.add(l10n?.chatMessageTimeTooltip(timeStr) ?? 'Time: $timeStr');
     }
   }
   return lines.join('\n');
@@ -473,8 +491,7 @@ class _MouseFollowingTooltipState extends State<MouseFollowingTooltip> {
         if (pos == null) {
           return const SizedBox.shrink();
         }
-        final overlayBox =
-            overlay.context.findRenderObject() as RenderBox?;
+        final overlayBox = overlay.context.findRenderObject() as RenderBox?;
         final localPos = overlayBox != null && overlayBox.hasSize
             ? overlayBox.globalToLocal(pos)
             : pos;

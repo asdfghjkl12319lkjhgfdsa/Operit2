@@ -1,3 +1,5 @@
+// ignore_for_file: file_names
+
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -6,6 +8,7 @@ import '../../../../../../../core/application/PluginHotReload.dart';
 import '../../../../../../../core/proxy/generated/CoreProxyModels.g.dart'
     as core_proxy;
 import '../../../../../packages/screens/ToolPkgUiLauncherScreen.dart';
+import '../../../../../../theme/OperitTheme.dart';
 import '../../../../viewmodel/ChatViewModel.dart';
 
 /// Renders enabled Compose DSL contributions for the host-owned composer slot.
@@ -33,7 +36,6 @@ class ChatComposerSlotHost extends StatefulWidget {
 class _ChatComposerSlotHostState extends State<ChatComposerSlotHost> {
   late Future<List<core_proxy.ToolPkgChatComposerSlot>> _slotsFuture =
       _loadSlots();
-  int _contentGeneration = 0;
 
   /// Starts listening for plugin hot-reload notifications.
   @override
@@ -42,15 +44,12 @@ class _ChatComposerSlotHostState extends State<ChatComposerSlotHost> {
     PluginHotReload.revision.addListener(_reloadSlots);
   }
 
-  /// Refreshes slot content when the chat identity or processing state changes.
+  /// Reloads declarations only when the chat identity changes; live inputs update the session.
   @override
   void didUpdateWidget(covariant ChatComposerSlotHost oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.chatId != widget.chatId) {
       _slotsFuture = _loadSlots();
-    }
-    if (oldWidget.isProcessing != widget.isProcessing) {
-      _refreshSlotContent();
     }
   }
 
@@ -68,11 +67,6 @@ class _ChatComposerSlotHostState extends State<ChatComposerSlotHost> {
     });
   }
 
-  /// Recreates mounted composer content after chat processing changes.
-  void _refreshSlotContent() {
-    _contentGeneration++;
-  }
-
   /// Reads host-composed slot declarations for the active chat surface.
   Future<List<core_proxy.ToolPkgChatComposerSlot>> _loadSlots() async {
     return await widget.viewModel.clients.application
@@ -80,45 +74,57 @@ class _ChatComposerSlotHostState extends State<ChatComposerSlotHost> {
         .createSlotDefinitions(slot: 'above_input');
   }
 
-  /// Builds every resolved DSL contribution for the current chat composer.
+  /// Aligns contributions with the input surface edges and builds the current slot.
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<List<core_proxy.ToolPkgChatComposerSlot>>(
-      future: _slotsFuture,
-      builder: (context, snapshot) {
-        if (!snapshot.hasData) {
-          return const SizedBox.shrink();
-        }
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          children: snapshot.data!
-              .map(
-                (contribution) => ToolPkgUiLauncherScreen(
-                  key: ValueKey<String>(
-                    '${widget.chatId}:${contribution.containerPackageName}:'
-                    '${contribution.contributionId}:$_contentGeneration',
-                  ),
-                  clients: widget.viewModel.clients,
-                  plugin: contribution.containerRuntime,
-                  initialRouteId: contribution.contributionId,
-                  showLauncherChrome: false,
-                  showLoadingIndicator: false,
-                  initialState: <String, Object?>{
-                    'chatId': widget.chatId,
-                    'isProcessing': widget.isProcessing,
-                    'pendingQueueCount': widget.pendingQueueCount,
-                  },
-                  initialModuleSpec: <String, Object?>{
-                    'id': contribution.contributionId,
-                    'screen': contribution.screen,
-                    'slot': contribution.slot,
-                    'keepAlive': contribution.keepAlive,
-                  },
-                ),
-              )
-              .toList(growable: false),
-        );
-      },
+    final themeSnapshot = OperitTheme.of(context).themePreferenceSnapshot;
+    return Padding(
+      padding: EdgeInsets.symmetric(
+        horizontal: themeSnapshot.chatInputFloating ? 8 : 0,
+      ),
+      child: SizedBox(
+        width: double.infinity,
+        child: FutureBuilder<List<core_proxy.ToolPkgChatComposerSlot>>(
+          future: _slotsFuture,
+          builder: (context, snapshot) {
+            if (!snapshot.hasData) {
+              return const SizedBox.shrink();
+            }
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: snapshot.data!
+                  .map(
+                    (contribution) => ToolPkgUiLauncherScreen(
+                      key: ValueKey<String>(
+                        '${widget.chatId}:${contribution.containerPackageName}:'
+                        '${contribution.contributionId}',
+                      ),
+                      clients: widget.viewModel.clients,
+                      plugin: contribution.containerRuntime,
+                      initialRouteId: contribution.contributionId,
+                      embeddedScreenPath: contribution.screen,
+                      showLauncherChrome: false,
+                      showLoadingIndicator: false,
+                      initialState: <String, Object?>{
+                        'chatId': widget.chatId,
+                        'isProcessing': widget.isProcessing,
+                        'pendingQueueCount': widget.pendingQueueCount,
+                      },
+                      initialModuleSpec: <String, Object?>{
+                        'id': contribution.contributionId,
+                        'screen': contribution.screen,
+                        if (contribution.screenExport != null)
+                          'screenExport': contribution.screenExport,
+                        'slot': contribution.slot,
+                        'keepAlive': contribution.keepAlive,
+                      },
+                    ),
+                  )
+                  .toList(growable: false),
+            );
+          },
+        ),
+      ),
     );
   }
 }

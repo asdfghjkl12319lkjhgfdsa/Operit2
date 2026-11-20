@@ -8,17 +8,23 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from cli_macos_signing import sign_cli_macos
+from windows_bash import prepare_windows_bash
+from windows_powershell import prepare_windows_powershell
+
 from common import (
     DIST_DIR,
+    release_asset_name,
     REPO_ROOT,
     copy_required_file,
     compress_tar_gz,
     compress_zip,
     host_platform,
+    prepare_plugin_assets,
     require_command,
-    require_web_access_bundle,
     reset_dir,
     run,
+    verify_cli_plugin_assets,
 )
 
 
@@ -33,7 +39,6 @@ CLI_RUST_TARGETS = {
     ("macos", "x86_64"): "x86_64-apple-darwin",
     ("macos", "aarch64"): "aarch64-apple-darwin",
 }
-CLI_WEB_ASSET_MODES = ("embedded", "external")
 
 
 @dataclass(frozen=True)
@@ -72,34 +77,15 @@ def cli_archive_extension(target_platform: str) -> str:
     return "zip" if target_platform == "windows" else "tar.gz"
 
 
-# Returns the package name suffix for the selected Web Access asset mode.
-def cli_web_asset_package_suffix(web_assets: str) -> str:
-    if web_assets == "embedded":
-        return ""
-    if web_assets == "external":
-        return "-external-web"
-    raise RuntimeError(f"Unsupported CLI Web Access asset mode: {web_assets}")
-
-
-# Returns the cargo feature arguments for the selected Web Access asset mode.
-def cli_web_asset_cargo_args(web_assets: str) -> list[str]:
-    if web_assets == "embedded":
-        return []
-    if web_assets == "external":
-        return ["--no-default-features"]
-    raise RuntimeError(f"Unsupported CLI Web Access asset mode: {web_assets}")
-
-
 # Returns the working directory for one packaged CLI target.
-def cli_package_dir(target: CliBuildTarget, web_assets: str = "embedded") -> Path:
-    return CLI_WORK_DIR / f"cli-{target.platform}-{target.arch}{cli_web_asset_package_suffix(web_assets)}"
+def cli_package_dir(target: CliBuildTarget) -> Path:
+    return CLI_WORK_DIR / f"cli-{target.platform}-{target.arch}"
 
 
 # Returns the release archive path for one packaged CLI target.
-def cli_package_path(target: CliBuildTarget, web_assets: str = "embedded") -> Path:
-    return DIST_DIR / (
-        f"operit2-cli-{target.platform}-{target.arch}"
-        f"{cli_web_asset_package_suffix(web_assets)}.{cli_archive_extension(target.platform)}"
+def cli_package_path(target: CliBuildTarget) -> Path:
+    return DIST_DIR / release_asset_name(
+        "cli", target.platform, target.arch, cli_archive_extension(target.platform)
     )
 
 
@@ -311,21 +297,19 @@ def linux_cross_target_env(target: CliBuildTarget) -> dict[str, str]:
     raise RuntimeError(f"Unsupported Linux cross target: {target.rust_target}")
 
 
+# Builds and packages the CLI together with its required native runtime assets.
 def build_cli_target(
     target: CliBuildTarget,
     use_default_target: bool = False,
-    web_assets: str = "embedded",
 ) -> Path:
     require_command("cargo")
-    if web_assets == "embedded":
-        require_web_access_bundle()
+    prepare_plugin_assets()
     binary_name = cli_binary_name(target.platform)
-    package_dir = cli_package_dir(target, web_assets)
-    package_path = cli_package_path(target, web_assets)
-    feature_args = cli_web_asset_cargo_args(web_assets)
+    package_dir = cli_package_dir(target)
+    package_path = cli_package_path(target)
 
     if use_default_target:
-        run(["cargo", "build", "--release", "--manifest-path", CLI_MANIFEST, *feature_args])
+        run(["cargo", "build", "--release", "--manifest-path", CLI_MANIFEST])
         binary_source = REPO_ROOT / "apps" / "cli" / "target" / "release" / binary_name
     else:
         build_env = {**os.environ}
@@ -342,17 +326,25 @@ def build_cli_target(
                 target.rust_target,
                 "--manifest-path",
                 CLI_MANIFEST,
-                *feature_args,
             ],
             env=build_env,
         )
         binary_source = cli_target_binary_path(target)
 
+    verify_cli_plugin_assets(binary_source)
     reset_dir(package_dir)
     copy_required_file(binary_source, package_dir / binary_name)
     write_cli_installer_files(package_dir, target.platform)
+    if target.platform == "macos":
+        sign_cli_macos(package_dir / binary_name)
 
     if target.platform == "windows":
+        prepare_windows_bash(package_dir, target.arch)
+        prepare_windows_powershell(package_dir, target.arch)
+        copy_required_file(
+            binary_source.with_name("operit_local_llm.dll"),
+            package_dir / "operit_local_llm.dll",
+        )
         compress_zip(package_dir, package_path)
     else:
         os.chmod(package_dir / binary_name, 0o755)
@@ -367,7 +359,6 @@ def build_cli_target(
 def build_cli_platform(
     target_platform: str,
     arch_mode: str = "host",
-    web_assets: str = "embedded",
 ) -> None:
     if arch_mode == "host":
         current_platform = host_platform()
@@ -378,19 +369,17 @@ def build_cli_platform(
         build_cli_target(
             cli_target(target_platform, host_arch()),
             use_default_target=True,
-            web_assets=web_assets,
         )
         return
 
     if arch_mode == "all":
         for target in cli_targets_for_platform(target_platform):
-            build_cli_target(target, use_default_target=False, web_assets=web_assets)
+            build_cli_target(target, use_default_target=False)
         return
 
     build_cli_target(
         cli_target(target_platform, arch_mode),
         use_default_target=False,
-        web_assets=web_assets,
     )
 
 
@@ -398,10 +387,3 @@ def parse_cli_arch_mode(value: str) -> str:
     if value in ("host", "all", "x86_64", "aarch64"):
         return value
     raise RuntimeError(f"Unsupported CLI arch mode: {value}")
-
-
-# Parses the Web Access asset mode selected for CLI builds.
-def parse_cli_web_assets(value: str) -> str:
-    if value in CLI_WEB_ASSET_MODES:
-        return value
-    raise RuntimeError(f"Unsupported CLI Web Access asset mode: {value}")

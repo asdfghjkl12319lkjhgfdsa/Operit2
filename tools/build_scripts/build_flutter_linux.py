@@ -5,14 +5,13 @@ from pathlib import Path
 
 from common import (
     DIST_DIR,
+    release_asset_name,
     FLUTTER_APP_DIR,
     compress_tar_gz,
     flutter_command,
     flutter_pub_get,
     host_arch,
-    prepare_web_access_embedded_assets,
     run,
-    staged_non_ohos_flutter_dependencies,
 )
 
 
@@ -29,19 +28,15 @@ def parse_args() -> argparse.Namespace:
 # Builds the Linux Flutter app and writes a release archive.
 def main() -> int:
     args = parse_args()
-    prepare_web_access_embedded_assets()
-    with staged_non_ohos_flutter_dependencies():
-        flutter_pub_get()
-        if args.enforce_lockfile:
-            flutter_pub_get(enforce_lockfile=True)
-        command = [flutter_command(), "build", "linux", "--release", "--no-pub"]
-        if args.build_name:
-            command.extend(["--build-name", args.build_name])
-        if args.build_number:
-            command.extend(["--build-number", args.build_number])
-        run(command, cwd=FLUTTER_APP_DIR)
+    flutter_pub_get(enforce_lockfile=args.enforce_lockfile)
+    command = [flutter_command(), "build", "linux", "--release", "--no-pub"]
+    if args.build_name:
+        command.extend(["--build-name", args.build_name])
+    if args.build_number:
+        command.extend(["--build-number", args.build_number])
+    run(command, cwd=FLUTTER_APP_DIR)
     bundle = FLUTTER_APP_DIR / "build" / "linux" / "x64" / "release" / "bundle"
-    archive_path = args.archive_path or DIST_DIR / f"operit2-app-linux-{host_arch()}.tar.gz"
+    archive_path = args.archive_path or DIST_DIR / release_asset_name("app", "linux", host_arch(), "tar.gz")
     compress_tar_gz(bundle, archive_path)
     print(f"Linux archive: {archive_path}", flush=True)
     return 0

@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:operit_ui/operit_ui.dart';
 
 import '../../core/bridge/ProxyCoreRuntimeBridge.dart';
 import '../../core/proxy/generated/CoreProxyClients.g.dart';
@@ -23,11 +24,13 @@ class ThemeAssetImport {
   final String fileName;
 }
 
-class ThemeAssetStore {
+class ThemeAssetStore implements ThemeAssetResolver {
   /// Creates a store backed by the runtime storage repository.
   ThemeAssetStore({
     GeneratedRepositoryRuntimeStorageRepositoryCoreProxy? runtimeStorage,
-  }) : _runtimeStorage =
+    ThemeFontRegistry? fontRegistry,
+  }) : _fontRegistry = fontRegistry ?? ThemeFontRegistry(),
+       _runtimeStorage =
            runtimeStorage ??
            const GeneratedCoreProxyClients(
              ProxyCoreRuntimeBridge(),
@@ -35,25 +38,38 @@ class ThemeAssetStore {
 
   final GeneratedRepositoryRuntimeStorageRepositoryCoreProxy _runtimeStorage;
 
-  /// Imports one selected file into the runtime theme asset pool.
-  Future<ThemeAssetImport> importFile(XFile file) async {
-    final bytes = await file.readAsBytes();
-    final fileName = _themeAssetFileName(file);
-    return importBytes(bytes: bytes, fileName: fileName);
+  final ThemeFontRegistry _fontRegistry;
+
+  /// Prepares fonts before persisting a path that appearance will activate.
+  Future<ThemeAssetImport> importFontFile(XFile file) async {
+    if (await file.length() > themePrivateFontMaxBytes) {
+      throw StateError(
+        'Theme font exceeds the ${themePrivateFontMaxBytes ~/ (1024 * 1024)} MiB limit',
+      );
+    }
+    return importFontBytes(
+      bytes: await file.readAsBytes(),
+      fileName: _themeAssetFileName(file),
+    );
   }
 
-  /// Imports prepared bytes into the runtime theme asset pool.
-  Future<ThemeAssetImport> importBytes({
+  /// Imports an already-read device face without fabricating a local file path.
+  Future<ThemeAssetImport> importFontBytes({
     required Uint8List bytes,
     required String fileName,
   }) async {
+    if (fileName.trim().isEmpty) {
+      throw StateError('theme asset file name is empty');
+    }
     final extension = _themeAssetExtension(fileName);
+    await _fontRegistry.registerBytes(reference: fileName, bytes: bytes);
     final directory = await _runtimeStorage.themeAssetsDirPath();
     final digest = sha256.convert(bytes).toString().substring(0, 16);
     final storagePath = '$directory/$digest.$extension';
-    await _runtimeStorage.writeBase64(
+    await _runtimeStorage.writeBytesStream(
       path: storagePath,
-      base64Content: base64Encode(bytes),
+      expectedByteLength: bytes.length,
+      bytes: Stream<Uint8List>.fromIterable(_chunks(bytes)),
     );
     return ThemeAssetImport(
       storagePath: storagePath,
@@ -62,17 +78,131 @@ class ThemeAssetStore {
     );
   }
 
-  /// Reads imported theme asset bytes from runtime storage.
-  Future<Uint8List> readBytes(String storagePath) async {
-    final base64Content = await _runtimeStorage.readBase64(path: storagePath);
-    if (base64Content == null) {
-      throw StateError('theme asset is missing: $storagePath');
+  /// Reads saved fonts in bounded frames, including fonts imported before this version.
+  Future<Uint8List> readFontBytes(String storagePath) async {
+    final content = BytesBuilder(copy: false);
+    while (true) {
+      final chunk = await _runtimeStorage.readBase64Chunk(
+        path: storagePath,
+        offset: content.length,
+        length: _chunkBytes,
+      );
+      if (chunk == null) {
+        throw StateError('theme asset is missing: $storagePath');
+      }
+      if (chunk.isEmpty) break;
+      final bytes = base64Decode(chunk);
+      if (bytes.length > _chunkBytes ||
+          content.length + bytes.length > themePrivateFontMaxBytes) {
+        throw StateError('Theme font byte budget exceeded: $storagePath');
+      }
+      content.add(bytes);
     }
-    return base64Decode(base64Content);
+    return content.takeBytes();
+  }
+
+  static const int _chunkBytes = 1024 * 1024;
+
+  static Iterable<Uint8List> _chunks(Uint8List bytes) sync* {
+    for (var offset = 0; offset < bytes.length; offset += _chunkBytes) {
+      final end = offset + _chunkBytes;
+      yield Uint8List.sublistView(
+        bytes,
+        offset,
+        end < bytes.length ? end : bytes.length,
+      );
+    }
+  }
+
+  /// Imports one selected file into the runtime theme asset pool.
+  Future<ThemeAssetImport> importFile(XFile file) async {
+    final requestStack = StackTrace.current;
+    try {
+      final bytes = await file.readAsBytes();
+      final fileName = _themeAssetFileName(file);
+      return await importBytes(bytes: bytes, fileName: fileName);
+    } catch (error, stack) {
+      throw ThemeAssetFailure.capture(
+        reference: file.name,
+        stage: ThemeAssetStage.importAsset,
+        kind: ThemeAssetFailureKind.read,
+        cause: error,
+        originalStackTrace: stack,
+        requestStackTrace: requestStack,
+      );
+    }
+  }
+
+  /// Imports prepared bytes into the runtime theme asset pool.
+  Future<ThemeAssetImport> importBytes({
+    required Uint8List bytes,
+    required String fileName,
+  }) async {
+    final requestStack = StackTrace.current;
+    var reference = fileName;
+    var kind = ThemeAssetFailureKind.read;
+    try {
+      if (bytes.isEmpty) {
+        kind = ThemeAssetFailureKind.empty;
+        throw StateError('Theme asset is empty: $fileName');
+      }
+      final extension = _themeAssetExtension(fileName);
+      final directory = await _runtimeStorage.themeAssetsDirPath();
+      final digest = sha256.convert(bytes).toString().substring(0, 16);
+      final storagePath = '$directory/$digest.$extension';
+      reference = storagePath;
+      await _runtimeStorage.writeBase64(
+        path: storagePath,
+        base64Content: base64Encode(bytes),
+      );
+      return ThemeAssetImport(storagePath: storagePath, bytes: bytes, fileName: fileName);
+    } catch (error, stack) {
+      throw ThemeAssetFailure.capture(
+        reference: reference,
+        stage: ThemeAssetStage.importAsset,
+        kind: kind,
+        cause: error,
+        originalStackTrace: stack,
+        requestStackTrace: requestStack,
+        byteLength: bytes.length,
+      );
+    }
+  }
+
+  /// Reads imported theme asset bytes from runtime storage.
+  @override
+  Future<Uint8List> readBytes(String storagePath) async {
+    final requestStack = StackTrace.current;
+    var kind = ThemeAssetFailureKind.read;
+    int? byteLength;
+    try {
+      final base64Content = await _runtimeStorage.readBase64(path: storagePath);
+      if (base64Content == null) {
+        kind = ThemeAssetFailureKind.missing;
+        throw StateError('theme asset is missing: $storagePath');
+      }
+      final bytes = base64Decode(base64Content);
+      byteLength = bytes.length;
+      if (bytes.isEmpty) {
+        kind = ThemeAssetFailureKind.empty;
+        throw StateError('theme asset is empty: $storagePath');
+      }
+      return bytes;
+    } catch (error, stack) {
+      throw ThemeAssetFailure.capture(
+        reference: storagePath,
+        stage: ThemeAssetStage.read,
+        kind: kind,
+        cause: error,
+        originalStackTrace: stack,
+        requestStackTrace: requestStack,
+        byteLength: byteLength,
+      );
+    }
   }
 }
 
-class ThemeAssetImage extends StatefulWidget {
+class ThemeAssetImage extends StatelessWidget {
   /// Creates an image widget backed by a runtime theme asset.
   const ThemeAssetImage({
     super.key,
@@ -83,61 +213,14 @@ class ThemeAssetImage extends StatefulWidget {
   final String storagePath;
   final BoxFit fit;
 
-  /// Creates the image state that owns the byte-loading future.
-  @override
-  State<ThemeAssetImage> createState() => _ThemeAssetImageState();
-}
-
-class _ThemeAssetImageState extends State<ThemeAssetImage> {
-  late Future<Uint8List> _bytesFuture;
-
-  /// Starts loading theme asset bytes for the first image frame.
-  @override
-  void initState() {
-    super.initState();
-    _bytesFuture = _loadBytes();
-  }
-
-  /// Restarts byte loading when the referenced theme asset changes.
-  @override
-  void didUpdateWidget(covariant ThemeAssetImage oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.storagePath != widget.storagePath) {
-      _bytesFuture = _loadBytes();
-    }
-  }
-
-  /// Builds an image after its runtime storage bytes are available.
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<Uint8List>(
-      future: _bytesFuture,
-      builder: (context, snapshot) {
-        if (snapshot.hasError) {
-          Error.throwWithStackTrace(
-            snapshot.error!,
-            snapshot.stackTrace ?? StackTrace.current,
-          );
-        }
-        final bytes = snapshot.data;
-        if (bytes == null) {
-          return const SizedBox.expand();
-        }
-        return SizedBox.expand(
-          child: Image.memory(
-            bytes,
-            fit: widget.fit,
-            width: double.infinity,
-            height: double.infinity,
-          ),
-        );
-      },
+    final scoped = ThemeAssetScope.of(context);
+    return ResolvedThemeImage(
+      resolver: scoped,
+      reference: storagePath,
+      fit: fit,
     );
-  }
-
-  /// Reads the referenced bytes through the theme asset store.
-  Future<Uint8List> _loadBytes() {
-    return ThemeAssetStore().readBytes(widget.storagePath);
   }
 }
 
@@ -178,6 +261,7 @@ String _themeAssetExtension(String fileName) {
     'jpg',
     'jpeg',
     'png',
+    'svg',
     'webp',
     'bmp',
     'gif',

@@ -18,6 +18,7 @@ pub struct LlmRequestTraceContext {
 /// Concrete provider implementation selected for a resolved model config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderServiceKind {
+    LocalModelProvider,
     OpenAIProvider,
     OpenAIResponsesProvider,
     OpenCodeProvider,
@@ -49,6 +50,7 @@ pub enum ApiKeyProviderSpec {
 /// Provider-specific constructor parameters emitted by the service factory.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProviderCreateParams {
+    LocalModelProvider { model_binding: String, settings: operit_model::ModelConfigData::LocalModelRuntimeSettings },
     OpenAIProvider {
         api_endpoint: String,
         api_key_provider: ApiKeyProviderSpec,
@@ -74,6 +76,7 @@ pub enum ProviderCreateParams {
     },
     OpenCodeProvider {
         api_endpoint: String,
+        provider_id: String,
         api_key_provider: ApiKeyProviderSpec,
         model_name: String,
         custom_headers: BTreeMap<String, String>,
@@ -91,6 +94,7 @@ pub enum ProviderCreateParams {
         custom_headers: BTreeMap<String, String>,
         provider_type: ApiProviderType,
         enable_tool_call: bool,
+        enable_claude_1h_prompt_cache: bool,
     },
     GeminiProvider {
         api_endpoint: String,
@@ -225,8 +229,7 @@ pub enum ProviderCreateParams {
     },
     ToolPkgJsAiProviderService {
         provider_type_id: String,
-        provider_id: String,
-        model_id: String,
+        config: ResolvedModelConfig,
     },
 }
 
@@ -271,8 +274,7 @@ impl AIServiceFactory {
                 kind: ProviderServiceKind::ToolPkgJsAiProviderService,
                 params: ProviderCreateParams::ToolPkgJsAiProviderService {
                     provider_type_id,
-                    provider_id: config.providerId,
-                    model_id: config.modelId,
+                    config,
                 },
             });
         }
@@ -283,6 +285,7 @@ impl AIServiceFactory {
         let supports_audio = config.capabilities.directAudio;
         let supports_video = config.capabilities.directVideo;
         let enable_tool_call = config.capabilities.toolCall;
+        let enable_claude_1h_prompt_cache = config.request.enableClaude1hPromptCache;
         let builtin_tools = config.builtinTools.clone();
         let model_name = config.modelId.clone();
         let provider_type = request.provider_type;
@@ -340,6 +343,7 @@ impl AIServiceFactory {
                     custom_headers,
                     provider_type,
                     enable_tool_call,
+                    enable_claude_1h_prompt_cache,
                 )
             }
             ApiProviderType::GOOGLE | ApiProviderType::GEMINI_GENERIC => Self::gemini_provider(
@@ -373,11 +377,10 @@ impl AIServiceFactory {
                 supports_video,
                 enable_tool_call,
             ),
-            ApiProviderType::LOCAL_MODEL => {
-                return Err(AiServiceError::ProviderNotImplemented(
-                    "LOCAL_MODEL chat inference".to_string(),
-                ));
-            }
+            ApiProviderType::LOCAL_MODEL => Ok(ProviderServiceSpec {
+                kind: ProviderServiceKind::LocalModelProvider,
+                params: ProviderCreateParams::LocalModelProvider { model_binding: model_name, settings: config.localRuntime.clone() },
+            }),
             ApiProviderType::ALIYUN => Self::qwen_provider(
                 api_endpoint,
                 api_key_provider,
@@ -393,7 +396,6 @@ impl AIServiceFactory {
             | ApiProviderType::XUNFEI
             | ApiProviderType::ZHIPU
             | ApiProviderType::BAICHUAN
-            | ApiProviderType::IFLOW
             | ApiProviderType::INFINIAI
             | ApiProviderType::ALIPAY_BAILING
             | ApiProviderType::PPINFRA
@@ -480,6 +482,7 @@ impl AIServiceFactory {
             ApiProviderType::OPENCODE => {
                 Self::open_code_provider(
                     api_endpoint,
+                    config.providerId.clone(),
                     api_key_provider,
                     model_name,
                     custom_headers,
@@ -623,6 +626,7 @@ impl AIServiceFactory {
     /// Builds the OpenCode routing provider spec.
     fn open_code_provider(
         api_endpoint: String,
+        provider_id: String,
         api_key_provider: ApiKeyProviderSpec,
         model_name: String,
         custom_headers: BTreeMap<String, String>,
@@ -650,6 +654,7 @@ impl AIServiceFactory {
             kind: ProviderServiceKind::OpenCodeProvider,
             params: ProviderCreateParams::OpenCodeProvider {
                 api_endpoint,
+                provider_id,
                 api_key_provider,
                 model_name,
                 custom_headers,
@@ -731,6 +736,7 @@ impl AIServiceFactory {
         custom_headers: BTreeMap<String, String>,
         provider_type: ApiProviderType,
         enable_tool_call: bool,
+        enable_claude_1h_prompt_cache: bool,
     ) -> Result<ProviderServiceSpec, AiServiceError> {
         Ok(ProviderServiceSpec {
             kind: ProviderServiceKind::ClaudeProvider,
@@ -741,6 +747,7 @@ impl AIServiceFactory {
                 custom_headers,
                 provider_type,
                 enable_tool_call,
+                enable_claude_1h_prompt_cache,
             },
         })
     }

@@ -10,13 +10,13 @@ work_dir="$cache_dir/work"
 apk_static_dir="$cache_dir/apk-static"
 
 mirror="https://dl-cdn.alpinelinux.org/alpine"
-branch="latest-stable"
+branch="v3.23"
 host_arch="x86_64"
 
 packages=(
     bash
     python3
-    nodejs
+    "nodejs~24"
     npm
     uv
     pnpm
@@ -25,8 +25,6 @@ packages=(
 
 abis=(
     arm64-v8a
-    armeabi-v7a
-    x86_64
 )
 
 alpine_arch_for_abi() {
@@ -123,6 +121,7 @@ minirootfs_metadata() {
     '
 }
 
+## Writes package repositories, DNS and runtime defaults into the packaged rootfs.
 write_rootfs_config() {
     local root_dir="$1"
     local release_branch="$2"
@@ -150,6 +149,7 @@ export LANG=C.UTF-8
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
     printf 'operit-android\n' > "$root_dir/etc/hostname"
+    printf 'nameserver 223.5.5.5\n' > "$root_dir/etc/resolv.conf"
 }
 
 build_rootfs_for_abi() {
@@ -199,6 +199,8 @@ build_rootfs_for_abi() {
         --no-scripts \
         --initdb \
         add "${packages[@]}"
+
+    python3 "$repo_dir/tools/runtime/verify_alpine_node24.py" "$root_dir/lib/apk/db/installed"
 
     rm -rf "$root_dir/var/cache/apk"
     mkdir -p "$root_dir/var/cache/apk"

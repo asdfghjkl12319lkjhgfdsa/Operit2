@@ -19,6 +19,11 @@ pub enum SqliteStoreError {
     MutexPoisoned,
     #[error("sqlite invalidation observer mutex poisoned")]
     ObserverMutexPoisoned,
+    #[error("transaction failed: {action}; explicit rollback failed: {rollback}")]
+    TransactionRollback {
+        action: Box<SqliteStoreError>,
+        rollback: HostError,
+    },
     #[error("{0}")]
     Message(String),
 }
@@ -27,20 +32,65 @@ pub enum SqliteStoreError {
 /// Shared SQLite connection wrapper backed by the registered runtime host.
 pub struct SqliteStore {
     path: PathBuf,
-    connection: Arc<Mutex<Box<dyn RuntimeSqliteConnection>>>,
-    observers: Arc<Mutex<Vec<Arc<dyn Fn() -> Result<(), SqliteStoreError> + Send + Sync>>>>,
+    storagePath: String,
+    pub(crate) storage: Option<Arc<dyn operit_host_api::RuntimeStorageHost>>,
+    sqliteHost: Arc<dyn operit_host_api::RuntimeSqliteHost>,
+    connection: Arc<Mutex<Option<Box<dyn RuntimeSqliteConnection>>>>,
+    observers: Arc<Mutex<Vec<Arc<dyn Fn(&SqliteStore) -> Result<(), SqliteStoreError> + Send + Sync>>>>,
+    pub(crate) executionLeases: Arc<Mutex<crate::ChatExecutionLease::ChatExecutionLeaseState>>,
+}
+
+/// Holds an open connection for the lifetime of a serialized database operation.
+struct LockedConnection<'a>(std::sync::MutexGuard<'a, Option<Box<dyn RuntimeSqliteConnection>>>);
+
+impl std::ops::Deref for LockedConnection<'_> {
+    type Target = dyn RuntimeSqliteConnection;
+
+    /// Borrows the connection whose presence was checked when acquiring the guard.
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("locked SQLite connection").as_ref()
+    }
+}
+
+impl std::ops::DerefMut for LockedConnection<'_> {
+    /// Mutably borrows the connection while all other store access is blocked.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("locked SQLite connection").as_mut()
+    }
 }
 
 impl SqliteStore {
+    /// Locks the currently open database connection.
+    fn lockedConnection(&self) -> Result<LockedConnection<'_>, SqliteStoreError> {
+        let guard = self.connection.lock().map_err(|_| SqliteStoreError::MutexPoisoned)?;
+        if guard.is_none() {
+            return Err(SqliteStoreError::Message("SQLite database is closed".into()));
+        }
+        Ok(LockedConnection(guard))
+    }
+
     /// Opens a runtime-hosted SQLite database and enables foreign keys.
     pub fn open(path: PathBuf) -> Result<Self, SqliteStoreError> {
         let storagePath = runtimeStoragePath(&path);
-        let mut connection = defaultRuntimeSqliteHost().openSqliteDatabase(&storagePath)?;
+        let mut store = Self::openWithHost(defaultRuntimeSqliteHost(), &storagePath)?;
+        store.path = path;
+        Ok(store)
+    }
+
+    /// Opens an explicitly validated host path without platform-specific filesystem access.
+    pub fn openWithHost(host: Arc<dyn operit_host_api::RuntimeSqliteHost>, storagePath: &str) -> Result<Self, SqliteStoreError> {
+        let mut connection = host.openSqliteDatabase(storagePath)?;
         connection.execute("PRAGMA foreign_keys = ON", Vec::new())?;
         Ok(Self {
-            path,
-            connection: Arc::new(Mutex::new(connection)),
+            path: PathBuf::from(storagePath),
+            storagePath: storagePath.to_string(),
+            storage: host.runtimeStorage(),
+            sqliteHost: host,
+            connection: Arc::new(Mutex::new(Some(connection))),
             observers: Arc::new(Mutex::new(Vec::new())),
+            executionLeases: Arc::new(Mutex::new(
+                crate::ChatExecutionLease::ChatExecutionLeaseState::default(),
+            )),
         })
     }
 
@@ -49,24 +99,33 @@ impl SqliteStore {
         &self.path
     }
 
+    /// Closes SQLite while copying its file and reopens the same shared connection afterward.
+    pub fn withDatabaseFile<T>(&self, copy: impl FnOnce() -> Result<T, SqliteStoreError>) -> Result<T, SqliteStoreError> {
+        let mut guard = self.connection.lock().map_err(|_| SqliteStoreError::MutexPoisoned)?;
+        if guard.is_none() {
+            return Err(SqliteStoreError::Message("SQLite database is closed".into()));
+        }
+        drop(guard.take());
+        let result = copy();
+        let connection = self.sqliteHost.openSqliteDatabase(&self.storagePath)?;
+        *guard = Some(connection);
+        guard.as_mut().expect("reopened SQLite connection").execute("PRAGMA foreign_keys = ON", Vec::new())?;
+        result
+    }
+
     #[allow(non_snake_case)]
     /// Executes a SQL batch against the store connection.
     pub fn executeBatch(&self, sql: &str) -> Result<(), SqliteStoreError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| SqliteStoreError::MutexPoisoned)?;
-        connection.executeBatch(sql)?;
-        Ok(())
+        Ok(self.lockedConnection()?.executeBatch(sql)?)
     }
 
     /// Executes a single SQL statement and returns the affected row count.
     pub fn execute(&self, sql: &str, params: Vec<SqliteValue>) -> Result<usize, SqliteStoreError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| SqliteStoreError::MutexPoisoned)?;
-        Ok(connection.execute(sql, params)?)
+        Ok(self.lockedConnection()?.execute(sql, params)?)
+    }
+
+    pub(crate) fn visitRows(&self, sql: &str, params: Vec<SqliteValue>, visitor: &mut dyn FnMut(SqliteRow) -> operit_host_api::HostResult<()>) -> Result<(), SqliteStoreError> {
+        Ok(self.lockedConnection()?.visitRows(sql, params, visitor)?)
     }
 
     /// Runs a query and returns all rows.
@@ -75,11 +134,7 @@ impl SqliteStore {
         sql: &str,
         params: Vec<SqliteValue>,
     ) -> Result<Vec<SqliteRow>, SqliteStoreError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| SqliteStoreError::MutexPoisoned)?;
-        Ok(connection.query(sql, params)?)
+        Ok(self.lockedConnection()?.query(sql, params)?)
     }
 
     /// Runs a query and returns the first row, if one exists.
@@ -88,12 +143,7 @@ impl SqliteStore {
         sql: &str,
         params: Vec<SqliteValue>,
     ) -> Result<Option<SqliteRow>, SqliteStoreError> {
-        let mut rows = self.queryRows(sql, params)?;
-        if rows.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(rows.remove(0)))
-        }
+        Ok(self.queryRows(sql, params)?.into_iter().next())
     }
 
     /// Runs a query and converts the first column of the first row.
@@ -124,21 +174,17 @@ impl SqliteStore {
     #[allow(non_snake_case)]
     /// Checks whether a table with the supplied name exists.
     pub fn tableExists(&self, tableName: &str) -> Result<bool, SqliteStoreError> {
-        let found: Option<i32> = self
-            .queryOne(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
-                vec![toSqliteValue(tableName)],
-            )?
-            .map(|row| row.get(0))
-            .transpose()?;
-        Ok(found.is_some())
+        Ok(self.queryOne(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+            vec![toSqliteValue(tableName)],
+        )?.is_some())
     }
 
     #[allow(non_snake_case)]
-    /// Registers a callback invoked by `notifyInvalidated`.
+    /// Supplies the live store to callbacks so they need not retain their owning store.
     pub fn addInvalidationObserver<F>(&self, observer: F) -> Result<(), SqliteStoreError>
     where
-        F: Fn() -> Result<(), SqliteStoreError> + Send + Sync + 'static,
+        F: Fn(&SqliteStore) -> Result<(), SqliteStoreError> + Send + Sync + 'static,
     {
         let mut observers = self
             .observers
@@ -157,25 +203,32 @@ impl SqliteStore {
             .map_err(|_| SqliteStoreError::ObserverMutexPoisoned)?
             .clone();
         for observer in observers {
-            observer()?;
+            observer(self)?;
         }
         Ok(())
     }
 
-    /// Runs a closure inside a SQLite transaction and commits on success.
+    /// Commits successful actions and explicitly rolls back failed actions on every runtime host.
     pub fn transaction<T, F>(&self, action: F) -> Result<T, SqliteStoreError>
     where
         F: FnOnce(&mut SqliteTransaction<'_>) -> Result<T, SqliteStoreError>,
     {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| SqliteStoreError::MutexPoisoned)?;
+        let mut connection = self.lockedConnection()?;
         let transaction = connection.beginTransaction()?;
         let mut transaction = SqliteTransaction { inner: transaction };
-        let result = action(&mut transaction)?;
-        transaction.inner.commit()?;
-        Ok(result)
+        match action(&mut transaction) {
+            Ok(result) => {
+                transaction.inner.commit()?;
+                Ok(result)
+            }
+            Err(action) => match transaction.inner.rollback() {
+                Ok(()) => Err(action),
+                Err(rollback) => Err(SqliteStoreError::TransactionRollback {
+                    action: Box::new(action),
+                    rollback,
+                }),
+            },
+        }
     }
 }
 
@@ -185,6 +238,8 @@ pub struct SqliteTransaction<'a> {
 }
 
 impl SqliteTransaction<'_> {
+    pub(crate) fn raw(&mut self) -> &mut dyn RuntimeSqliteTransaction { self.inner.as_mut() }
+
     /// Executes a statement within this transaction.
     pub fn execute(
         &mut self,
@@ -192,6 +247,11 @@ impl SqliteTransaction<'_> {
         params: Vec<SqliteValue>,
     ) -> Result<usize, SqliteStoreError> {
         Ok(self.inner.execute(sql, params)?)
+    }
+
+    pub(crate) fn visitRows(&mut self, sql: &str, params: Vec<SqliteValue>, visitor: &mut dyn FnMut(SqliteRow) -> operit_host_api::HostResult<()>) -> Result<(), SqliteStoreError> {
+        self.inner.visitRows(sql, params, visitor)?;
+        Ok(())
     }
 
     /// Runs a query within this transaction and returns all rows.
@@ -209,12 +269,7 @@ impl SqliteTransaction<'_> {
         sql: &str,
         params: Vec<SqliteValue>,
     ) -> Result<Option<SqliteRow>, SqliteStoreError> {
-        let mut rows = self.queryRows(sql, params)?;
-        if rows.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(rows.remove(0)))
-        }
+        Ok(self.queryRows(sql, params)?.into_iter().next())
     }
 
     #[allow(non_snake_case)]
@@ -398,4 +453,202 @@ macro_rules! sqliteParams {
     ($($value:expr),+ $(,)?) => {
         vec![$($crate::SqliteStore::toSqliteValue(&$value)),+]
     };
+}
+
+#[cfg(test)]
+mod transaction_lifecycle_tests {
+    use super::*;
+    use operit_host_api::HostResult;
+
+    /// Records host lifecycle calls without implementing destructor rollback.
+    #[derive(Default)]
+    struct LifecycleState {
+        commits: usize,
+        rollbacks: usize,
+        failRollback: bool,
+    }
+
+    /// Supplies a transaction whose only cleanup path is the explicit host method.
+    struct LifecycleConnection {
+        state: Arc<Mutex<LifecycleState>>,
+    }
+
+    /// Supplies isolated connections without using global runtime registration.
+    struct LifecycleHost {
+        state: Arc<Mutex<LifecycleState>>,
+    }
+
+    impl operit_host_api::RuntimeSqliteHost for LifecycleHost {
+        /// Opens another connection that records the same lifecycle calls.
+        fn openSqliteDatabase(&self, _: &str) -> HostResult<Box<dyn RuntimeSqliteConnection>> {
+            Ok(Box::new(LifecycleConnection { state: self.state.clone() }))
+        }
+    }
+
+    impl RuntimeSqliteConnection for LifecycleConnection {
+        /// Rejects batch statements outside the lifecycle under test.
+        fn executeBatch(&mut self, _: &str) -> HostResult<()> {
+            Err(HostError::new("Unexpected lifecycle batch"))
+        }
+
+        /// Rejects nontransactional statements in this lifecycle test.
+        fn execute(&mut self, _: &str, _: Vec<SqliteValue>) -> HostResult<usize> {
+            Err(HostError::new("Unexpected lifecycle execute"))
+        }
+
+        /// Rejects connection queries that are unrelated to transaction cleanup.
+        fn query(&mut self, _: &str, _: Vec<SqliteValue>) -> HostResult<Vec<SqliteRow>> {
+            Err(HostError::new("Unexpected lifecycle query"))
+        }
+
+        /// Rejects row-id lookups that are unrelated to transaction cleanup.
+        fn lastInsertRowId(&self) -> HostResult<i64> {
+            Err(HostError::new("Unexpected lifecycle row id"))
+        }
+
+        /// Returns a host transaction with recorded explicit terminal calls.
+        fn beginTransaction(&mut self) -> HostResult<Box<dyn RuntimeSqliteTransaction + '_>> {
+            Ok(Box::new(LifecycleTransaction {
+                state: self.state.clone(),
+            }))
+        }
+    }
+
+    /// Uses explicit lifecycle counters rather than RAII to detect missing rollback calls.
+    struct LifecycleTransaction {
+        state: Arc<Mutex<LifecycleState>>,
+    }
+
+    impl RuntimeSqliteTransaction for LifecycleTransaction {
+        /// Reports a deterministic statement error without rolling anything back implicitly.
+        fn execute(&mut self, _: &str, _: Vec<SqliteValue>) -> HostResult<usize> {
+            Err(HostError::new("Injected action SQL failure"))
+        }
+
+        /// Rejects queries that are not needed by the lifecycle test.
+        fn query(&mut self, _: &str, _: Vec<SqliteValue>) -> HostResult<Vec<SqliteRow>> {
+            Err(HostError::new("Unexpected lifecycle transaction query"))
+        }
+
+        /// Rejects row-id lookups that are not needed by the lifecycle test.
+        fn lastInsertRowId(&self) -> HostResult<i64> {
+            Err(HostError::new("Unexpected lifecycle transaction row id"))
+        }
+
+        /// Records the sole successful commit terminal operation.
+        fn commit(self: Box<Self>) -> HostResult<()> {
+            self.state.lock().unwrap().commits += 1;
+            Ok(())
+        }
+
+        /// Records explicit rollback and optionally reports the independent injected cleanup failure.
+        fn rollback(self: Box<Self>) -> HostResult<()> {
+            let mut state = self.state.lock().unwrap();
+            state.rollbacks += 1;
+            if state.failRollback {
+                return Err(HostError::new("Injected host rollback failure"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Builds a store around the lifecycle-only host so destructor cleanup cannot make the test pass.
+    fn lifecycleStore(failRollback: bool) -> (SqliteStore, Arc<Mutex<LifecycleState>>) {
+        let state = Arc::new(Mutex::new(LifecycleState {
+            failRollback,
+            ..LifecycleState::default()
+        }));
+        let store = SqliteStore {
+            storage: None,
+            path: PathBuf::from("transaction-lifecycle-test"),
+            storagePath: "transaction-lifecycle-test".into(),
+            sqliteHost: Arc::new(LifecycleHost { state: state.clone() }),
+            connection: Arc::new(Mutex::new(Some(Box::new(LifecycleConnection {
+                state: state.clone(),
+            })))),
+            observers: Arc::new(Mutex::new(Vec::new())),
+            executionLeases: Arc::new(Mutex::new(
+                crate::ChatExecutionLease::ChatExecutionLeaseState::default(),
+            )),
+        };
+        (store, state)
+    }
+
+    /// Chat observers must not keep their own SQLite connection alive after runtime teardown.
+    #[test]
+    fn chat_observers_release_database_connection() {
+        let root = std::env::temp_dir().join(format!(
+            "operit-observer-lifecycle-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let host = Arc::new(operit_host_native_storage::NativeRuntimeStorageHost::new(
+            root.join("runtime"),
+            root.join("workspaces"),
+        ));
+        let store = SqliteStore::openWithHost(host, "runtime/observers.sqlite").unwrap();
+        store
+            .executeBatch("CREATE TABLE chats (pinned INTEGER, displayOrder INTEGER)")
+            .unwrap();
+        let connection = Arc::downgrade(&store.connection);
+        let flow = crate::dao::ChatDao::ChatDao::new(store.clone())
+            .getAllChats()
+            .unwrap();
+        store.notifyInvalidated().unwrap();
+        assert!(flow.value().is_empty());
+        drop(store);
+        assert!(
+            connection.upgrade().is_none(),
+            "chat observer retains its own database connection"
+        );
+        drop(flow);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Requires exactly one explicit rollback and preserves the original failed statement error.
+    #[test]
+    fn failed_action_rolls_back_explicitly_without_destructor_cleanup() {
+        let (store, state) = lifecycleStore(false);
+        let error = store
+            .transaction::<(), _>(|transaction| {
+                transaction.execute("injected failure", Vec::new())?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "host error: Injected action SQL failure");
+        let state = state.lock().unwrap();
+        assert_eq!((state.commits, state.rollbacks), (0, 1));
+    }
+
+    /// Reports both the action failure and explicit rollback failure instead of losing either error.
+    #[test]
+    fn rollback_failure_preserves_both_action_and_host_errors() {
+        let (store, state) = lifecycleStore(true);
+        let error = store
+            .transaction::<(), _>(|transaction| {
+                transaction.execute("injected failure", Vec::new())?;
+                Ok(())
+            })
+            .unwrap_err();
+        match error {
+            SqliteStoreError::TransactionRollback { action, rollback } => {
+                assert_eq!(
+                    action.to_string(),
+                    "host error: Injected action SQL failure"
+                );
+                assert_eq!(rollback.to_string(), "Injected host rollback failure");
+            }
+            other => panic!("Expected both transaction errors, got {other}"),
+        }
+        let state = state.lock().unwrap();
+        assert_eq!((state.commits, state.rollbacks), (0, 1));
+    }
+
+    /// Requires a successful action to commit exactly once without calling rollback.
+    #[test]
+    fn successful_action_commits_once() {
+        let (store, state) = lifecycleStore(false);
+        assert_eq!(store.transaction(|_| Ok(7)).unwrap(), 7);
+        let state = state.lock().unwrap();
+        assert_eq!((state.commits, state.rollbacks), (1, 0));
+    }
 }

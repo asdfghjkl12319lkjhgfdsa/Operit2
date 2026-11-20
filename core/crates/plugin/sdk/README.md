@@ -19,7 +19,10 @@ implementation. Applications implement the SDK traits and inject their own host 
 - `ToolPkgExecutionEngineFactory` creates JavaScript engines.
 - `ToolPkgAssetSource` supplies embedded ToolPkg archives.
 - `PackageStateResolver` selects conditional JavaScript package states.
-- `ToolPkgPackageHost` supplies ToolPkg persistence and host file access.
+- `ToolPkgPackageHost` supplies ToolPkg persistence and host file access. Its required
+  `getToolPkgContainerRuntime` method resolves one container without cloning the full catalog.
+  `ToolPkgPackageService::prepareToolPkgComposeDslScript` captures the enabled module and
+  declared export for later resource I/O; the synchronous SDK reader uses the same resolution.
 
 ## Entry Points
 
@@ -49,15 +52,35 @@ implementation. Applications implement the SDK traits and inject their own host 
 - `toolpkg::ToolPkgLoader::ToolPkgLoader`: loads external or embedded `.toolpkg` archives.
 - `toolpkg::ToolPkgRegistrationBridge`: returns the fixed `registerToolPkg` JavaScript API.
 - `toolpkg::ToolPkgParser`: exposes manifest, runtime, hook, and archive models.
-- `toolpkg::ToolPkgComposeDslParser`: parses Compose DSL render trees, state, memo values, and
-  action identifiers.
 - `toolpkg::ToolPkgComposeDslBridge`: returns the fixed JavaScript DSL context installed by engine
   implementations.
 - `toolpkg::ToolPkgComposeDslRuntimeScript`: wraps screen scripts with render, rerender, and action
   entry points.
+- [`toolpkg/compose`](src/toolpkg/compose/README.md): separates compilation, callback ownership,
+  retained revisions, state, host adapters, and execution. Its source manifest is shared by
+  Rust builds and Node tooling; the Rust script builders only expose assembled artifacts.
 - `toolpkg::ToolPkgHooks::ToolPkgHookDispatcher`: lets an embedding application trigger package
   hooks when host events occur.
 - `javascript::JsExecutionEngine`: host-supplied JavaScript execution contract.
+
+## JavaScript module exports
+
+`toolpkg/ModuleExports.js` owns function lookup and module/export references for tools,
+public APIs, registered callbacks, providers and Compose screens. CommonJS `require()`
+returns the module's actual `module.exports`, preserving callable modules and ordinary
+object or data exports.
+
+Executable entries accept `exports.default = fn`, `exports.Name = fn` with an explicit
+export name, or `module.exports = fn` as the default entry. Named functions attached to
+callable modules are supported too. Lookup only considers the module's own exports;
+it does not search `window`, same-named globals, inherited methods or a stale `exports`
+alias after `module.exports` has been replaced.
+
+Imported callback references retain both their module path and export name so another
+engine can require the original module and preserve its lexical state. Registration
+captures `.ui.js` references without executing UI code, including named references such
+as `screens.Dialog`. Routes, message-menu dialogs, composer slots and XML render results
+carry that export name through runtime metadata to screen execution.
 
 ## Compressed Artifacts
 
@@ -90,6 +113,12 @@ A JavaScript engine crate implements `JsExecutionProvider`. The top-level applic
 that provider and injects it into the tool system. Package execution is represented by
 `JsPackageExecutor`, which binds one `JsPackageRuntime` and one `JsExecutionHost` without exposing
 engine-specific types.
+
+Providers explicitly implement asynchronous `acquire_toolpkg_execution_engine` in addition to
+synchronous creation. Factories implement `acquireToolPkgExecutionEngine` for the same purpose.
+`ToolPkgManager::acquireToolPkgExecutionEngineAsync` awaits that contract without holding its engine
+registry lock, then publishes a counted lease only if the package and factory generations still
+match. Acquisition futures use `JsExecutionFuture` so the Host can preserve executor affinity.
 
 ## Rust Package Execution Runtime
 

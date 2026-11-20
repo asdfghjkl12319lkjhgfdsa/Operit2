@@ -39,12 +39,11 @@ class _WorkspaceTerminalContentState extends State<WorkspaceTerminalContent> {
   Object? _startupError;
   int? _pendingRows;
   int? _pendingColumns;
-  final StringBuffer _pendingTerminalOutput = StringBuffer();
-  bool _terminalFlushScheduled = false;
   bool _exited = false;
   bool _ctrlLatched = false;
   bool _altLatched = false;
 
+  /// Creates terminal state and requests input focus only for visible content.
   @override
   void initState() {
     super.initState();
@@ -66,7 +65,7 @@ class _WorkspaceTerminalContentState extends State<WorkspaceTerminalContent> {
     };
     WidgetsBinding.instance.endOfFrame.then((_) {
       if (mounted) {
-        _focusNode.requestFocus();
+        if (TickerMode.valuesOf(context).enabled) _focusNode.requestFocus();
         _attachSession();
       }
     });
@@ -85,7 +84,6 @@ class _WorkspaceTerminalContentState extends State<WorkspaceTerminalContent> {
     _exited = true;
     _outputSubscription?.cancel();
     _pty?.kill();
-    _pendingTerminalOutput.clear();
     _focusNode.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -227,10 +225,12 @@ class _WorkspaceTerminalContentState extends State<WorkspaceTerminalContent> {
     );
   }
 
+  /// Attaches the presentation stream to the existing terminal session.
   Future<void> _attachSession() async {
     await _attachPty();
   }
 
+  /// Parses terminal output immediately so protocol replies cannot accumulate.
   Future<void> _attachPty() async {
     try {
       final pty = attachWorkspacePty(widget.sessionId);
@@ -242,10 +242,10 @@ class _WorkspaceTerminalContentState extends State<WorkspaceTerminalContent> {
           .cast<List<int>>()
           .transform(const convert.Utf8Decoder())
           .listen(
-            _queueTerminalWrite,
+            _terminal.write,
             onError: (Object error, StackTrace stackTrace) {
               if (!mounted) return;
-              _queueTerminalWrite('\r\n[终端连接已结束：$error]\r\n');
+              _terminal.write('\r\n[终端连接已结束：$error]\r\n');
               _exited = true;
             },
           );
@@ -253,7 +253,7 @@ class _WorkspaceTerminalContentState extends State<WorkspaceTerminalContent> {
         pty.exitCode.then(
           (code) {
             if (!_exited) {
-              _queueTerminalWrite('\r\n[process exited with code $code]\r\n');
+              _terminal.write('\r\n[process exited with code $code]\r\n');
             }
             _exited = true;
           },
@@ -278,8 +278,6 @@ class _WorkspaceTerminalContentState extends State<WorkspaceTerminalContent> {
     _outputSubscription = null;
     _pty?.kill();
     _pty = null;
-    _pendingTerminalOutput.clear();
-    _terminalFlushScheduled = false;
     _terminal.eraseDisplay();
     _startupError = null;
     _exited = true;
@@ -291,30 +289,6 @@ class _WorkspaceTerminalContentState extends State<WorkspaceTerminalContent> {
 
   void _writeToSession(String data) {
     _pty?.write(const convert.Utf8Encoder().convert(data));
-  }
-
-  void _queueTerminalWrite(String data) {
-    if (data.isEmpty) {
-      return;
-    }
-    _pendingTerminalOutput.write(data);
-    if (_terminalFlushScheduled) {
-      return;
-    }
-    _terminalFlushScheduled = true;
-    WidgetsBinding.instance.scheduleFrameCallback((_) {
-      if (!mounted) {
-        _pendingTerminalOutput.clear();
-        _terminalFlushScheduled = false;
-        return;
-      }
-      final output = _pendingTerminalOutput.toString();
-      _pendingTerminalOutput.clear();
-      _terminalFlushScheduled = false;
-      if (output.isNotEmpty) {
-        _terminal.write(output);
-      }
-    });
   }
 
   void _syncPtySize() {

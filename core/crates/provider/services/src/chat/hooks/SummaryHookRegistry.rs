@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use operit_model::PromptTurn::PromptTurn;
@@ -8,6 +9,8 @@ use operit_model::PromptTurn::PromptTurn;
 #[derive(Clone, Debug)]
 pub struct SummaryHookContext {
     pub stage: String,
+    /// Conversation captured for this summary, independent of the currently open chat.
+    pub chat_id: Option<String>,
     pub use_english: Option<bool>,
     pub previous_summary: Option<String>,
     pub chat_history: Vec<PromptTurn>,
@@ -19,20 +22,32 @@ pub struct SummaryHookContext {
     pub metadata: HashMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SummaryHookMutation {
     pub chat_history: Option<Vec<PromptTurn>>,
     pub prepared_history: Option<Vec<PromptTurn>>,
     pub system_prompt: Option<String>,
     pub summary_prompt: Option<String>,
     pub summary_result: Option<String>,
+    #[serde(default)]
     pub metadata: HashMap<String, Value>,
 }
+
+/// Represents a hook result awaited without holding the registry lock.
+pub type SummaryHookFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<SummaryHookMutation>, String>> + Send + 'a>,
+>;
 
 pub trait SummaryGenerateHook: Send + Sync {
     fn id(&self) -> &str;
     fn on_event(&self, _context: &SummaryHookContext) -> Option<SummaryHookMutation> {
         None
+    }
+
+    /// Adapts an immediate hook result to the asynchronous dispatcher.
+    fn on_event_async<'a>(&'a self, context: &'a SummaryHookContext) -> SummaryHookFuture<'a> {
+        Box::pin(std::future::ready(Ok(self.on_event(context))))
     }
 }
 
@@ -62,7 +77,10 @@ impl SummaryHookRegistry {
     }
 
     #[allow(non_snake_case)]
-    pub fn dispatchSummaryGenerateHooks(initial_context: SummaryHookContext) -> SummaryHookContext {
+    /// Applies summary mutations in order and returns the first execution failure.
+    pub async fn dispatchSummaryGenerateHooks(
+        initial_context: SummaryHookContext,
+    ) -> Result<SummaryHookContext, String> {
         let snapshot = SUMMARY_GENERATE_HOOKS
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
@@ -70,15 +88,17 @@ impl SummaryHookRegistry {
             .clone();
         let mut current = initial_context;
         for hook in snapshot {
-            if let Some(mutation) = hook.on_event(&current) {
-                current = apply_mutation(current, mutation);
+            if let Some(mutation) = hook.on_event_async(&current).await? {
+                current = applySummaryHookMutation(current, mutation);
             }
         }
-        current
+        Ok(current)
     }
 }
 
-fn apply_mutation(
+/// Applies one summary mutation for both native and sequential ToolPkg dispatchers.
+#[allow(non_snake_case)]
+pub fn applySummaryHookMutation(
     mut current: SummaryHookContext,
     mutation: SummaryHookMutation,
 ) -> SummaryHookContext {

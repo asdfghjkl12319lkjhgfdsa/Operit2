@@ -11,6 +11,8 @@ use operit_util::stream::RevisableTextStream::{
 };
 use operit_util::stream::Stream::{Stream, VecStream};
 
+use super::ThinkingDialect::RequestThinking;
+
 use serde_json::Value;
 use thiserror::Error;
 
@@ -21,10 +23,8 @@ pub type SharedAiResponseStream = DelegatingRevisableSharedTextStream;
 pub struct SendMessageRequest {
     pub chat_history: Vec<PromptTurn>,
     pub model_parameters: Vec<ModelParameter<Value>>,
-    pub enable_thinking: bool,
-    pub thinking_quality_level: i32,
-    pub thinking_configurations: String,
-    pub thinking_option_id: String,
+    /// The thinking the request asks for.
+    pub thinking: RequestThinking,
     pub stream: bool,
     pub available_tools: Vec<ToolPrompt>,
     pub preserve_think_in_history: bool,
@@ -77,6 +77,14 @@ pub async fn collect_stream_chunks(mut stream: Box<dyn RevisableTextStreamLike>)
         })
         .await;
     chunks
+}
+
+/// Rejects a failed producer before interpreting any received text as a completed model round.
+pub fn ensure_response_completed(stream: &dyn RevisableTextStreamLike) -> Result<(), AiServiceError> {
+    match stream.terminal_failure() {
+        Some(error) => Err(AiServiceError::RequestFailed(error)),
+        None => Ok(()),
+    }
 }
 
 /// Converts provider errors into user-facing retry status text.

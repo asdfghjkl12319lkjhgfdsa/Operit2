@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import sys
+import zipfile
 from pathlib import Path
 
 from common import (
@@ -8,13 +10,14 @@ from common import (
     DIST_DIR,
     FLUTTER_APP_DIR,
     RELEASE_DIR,
+    release_asset_name,
     copy_required_file,
     flutter_command,
     flutter_pub_get,
+    generate_dart_proxy_artifacts,
     read_properties,
-    prepare_web_access_embedded_assets,
+    require_command,
     run,
-    staged_non_ohos_flutter_dependencies,
     write_properties,
 )
 
@@ -38,7 +41,7 @@ def ensure_android_signing() -> None:
     write_properties(ANDROID_LOCAL_PROPERTIES, local)
 
 
-# Configures Android Gradle to use the official Flutter SDK selected by FVM.
+# Configures Android Gradle to use the project Flutter SDK selected by FVM.
 def configure_android_flutter_sdk(flutter: str) -> None:
     flutter_sdk = Path(flutter).parent.parent
     local = read_properties(ANDROID_LOCAL_PROPERTIES)
@@ -65,37 +68,92 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-name")
     parser.add_argument("--build-number")
     parser.add_argument("--enforce-lockfile", action="store_true")
+    parser.add_argument("--skip-proxy-generation", action="store_true")
     parser.add_argument("--skip-signing", action="store_true")
+    parser.add_argument(
+        "--impeller-backend",
+        choices=["vulkan", "opengles"],
+        help="Force an Impeller rendering backend in the packaged APK; default keeps engine autoselection",
+    )
     parser.add_argument("--dist-dir", type=Path, default=DIST_DIR)
     return parser.parse_args()
 
 
+# Rejects release APKs whose terminal assets do not match the requested ABI.
+def verify_android_runtime_assets(apk_path: Path, abi: str) -> None:
+    prefix = "assets/android-runtime/"
+    with zipfile.ZipFile(apk_path) as archive:
+        if "assets/operit-android-module.json" in archive.namelist():
+            raise RuntimeError("Ordinary Android App release must not contain the module runtime")
+        asset_names = {
+            entry.filename for entry in archive.infolist()
+            if not entry.is_dir() and entry.filename.startswith(prefix)
+        }
+    packaged_abis = {name[len(prefix):].split("/", 1)[0] for name in asset_names}
+    if packaged_abis != {abi}:
+        raise RuntimeError(
+            f"Android APK runtime asset ABIs must be exactly {abi}: "
+            f"{sorted(packaged_abis)} ({apk_path})"
+        )
+    required_assets = {
+        f"{prefix}{abi}/rootfs.tar.gz.bin",
+        f"{prefix}{abi}/rootfs.tar.gz.bin.sha256",
+    }
+    missing_assets = required_assets - asset_names
+    if missing_assets:
+        raise RuntimeError(
+            f"Android APK is missing required runtime assets: {sorted(missing_assets)} ({apk_path})"
+        )
+
+
+# Publishes the APK with the shared full release version in its filename.
+def publish_android_apk(apk_path: Path, dist_dir: Path) -> Path:
+    destination = dist_dir / release_asset_name("app", "android", "arm64-v8a", "apk")
+    copy_required_file(apk_path, destination)
+    print(f"Android APK: {destination}", flush=True)
+    return destination
+
+
+# Builds and verifies the ABI-specific Android release before publishing it.
 def main() -> int:
     args = parse_args()
-    prepare_web_access_embedded_assets()
     if not args.skip_signing:
         ensure_android_signing()
     flutter = flutter_command()
     configure_android_flutter_sdk(flutter)
-    with staged_non_ohos_flutter_dependencies():
-        flutter_pub_get()
-        if args.enforce_lockfile:
-            flutter_pub_get(enforce_lockfile=True)
-        command = [flutter, "build", "apk", "--release", "--no-pub", "--split-per-abi"]
-        if args.build_name:
-            command.extend(["--build-name", args.build_name])
-        if args.build_number:
-            command.extend(["--build-number", args.build_number])
-        run(command, cwd=FLUTTER_APP_DIR)
+    require_command("cargo")
+    if not args.skip_proxy_generation:
+        generate_dart_proxy_artifacts()
+    flutter_pub_get(enforce_lockfile=args.enforce_lockfile)
+    # Omit `--no-pub` on purpose: this build rewrites GeneratedPluginRegistrant.java
+    # for release mode, dropping dev-only plugins (integration_test) that
+    # `flutter pub get` leaves in. Gradle excludes dev-dependency modules from release
+    # builds, so a registrant written by pub get alone cannot resolve those classes.
+    command = [
+        flutter,
+        "build",
+        "apk",
+        "--release",
+        "--split-per-abi",
+        "--target-platform",
+        "android-arm64",
+        "--android-project-arg=operitRuntime=app",
+    ]
+    if args.build_name:
+        command.extend(["--build-name", args.build_name])
+    if args.build_number:
+        command.extend(["--build-number", args.build_number])
+    build_env = None
+    if args.impeller_backend:
+        # Gradle project properties also arrive through ORG_GRADLE_PROJECT_*
+        # environment variables, so the flutter CLI needs no extra flag.
+        build_env = {"ORG_GRADLE_PROJECT_operitImpellerBackend": args.impeller_backend}
+    run(command, cwd=FLUTTER_APP_DIR, env=build_env)
 
     apk_dir = FLUTTER_APP_DIR / "build" / "app" / "outputs" / "flutter-apk"
-    outputs = {
-        "arm64-v8a": "app-arm64-v8a-release.apk",
-        "armeabi-v7a": "app-armeabi-v7a-release.apk",
-        "x86_64": "app-x86_64-release.apk",
-    }
-    for abi, filename in outputs.items():
-        copy_required_file(apk_dir / filename, args.dist_dir / f"operit2-app-android-{abi}.apk")
+    apk_path = apk_dir / "app-arm64-v8a-release.apk"
+    verify_android_runtime_assets(apk_path, "arm64-v8a")
+    publish_android_apk(apk_path, args.dist_dir)
     return 0
 
 

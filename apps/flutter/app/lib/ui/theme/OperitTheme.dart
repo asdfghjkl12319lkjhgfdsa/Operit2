@@ -1,28 +1,34 @@
 // ignore_for_file: file_names
 
 import 'dart:async';
-import 'dart:ui' as ui;
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
+import 'package:operit_ui/operit_ui.dart';
+import 'package:fvp/fvp.dart' show FvpCreateCancelledException;
 import 'package:video_player/video_player.dart';
 
-import '../../core/bridge/ProxyCoreRuntimeBridge.dart';
-import '../../core/proxy/generated/CoreProxyClients.g.dart';
-import '../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
+import '../../core/errors/UnhandledErrorReporter.dart';
+import '../../core/host/AppToastController.dart';
+import '../../core/logging/ClientLogger.dart';
 import '../../core/runtime/RuntimeBootstrapManager.dart';
 import '../../data/preferences/UserPreferencesManager.dart';
 import '../../l10n/generated/app_localizations.dart';
 import '../common/AppToastHost.dart';
+import '../common/MacNoticeScaffoldMessenger.dart';
 import '../common/RuntimeBootstrapScreen.dart';
+import '../common/layout/ApplicationZoom.dart';
+import '../common/layout/ApplicationZoomPreferences.dart';
 import '../features/chat/tts/TtsFloatingPanel.dart';
-import '../features/startup/PluginLoadingOverlay.dart';
+import '../features/startup/RuntimeActivityOverlay.dart';
 import '../../core/host/browser/RuntimeBrowserOwnerHost.dart';
-import '../features/chat/components/workspace/browser/automation/WorkspaceWebVisitHost.dart';
+import '../window/DesktopWindowChrome.dart';
 import 'OperitThemeAssets.dart';
+import 'ThemeAppearanceErrorScreen.dart';
 import 'ThemeCircularRevealHost.dart';
+import 'ThemeVideoAssetLoader.dart';
 
 class OperitTheme extends StatefulWidget {
   /// Creates one themed Flutter application root.
@@ -59,9 +65,19 @@ class OperitTheme extends StatefulWidget {
 class _OperitThemeState extends State<OperitTheme> {
   final RuntimeBootstrapManager _runtimeManager =
       RuntimeBootstrapManager.instance;
+  final ApplicationZoomPreferences _zoomPreferences =
+      const ApplicationZoomPreferences();
+  final ThemeAssetStore _themeAssets = ThemeAssetStore();
+  final ThemeAssetDiagnostics _assetDiagnostics = ThemeAssetDiagnostics();
+  ThemePreferenceSnapshot? _assetSnapshot;
+  int _assetRevision = 0;
+  double _zoom = 1.0;
+  Future<void> _zoomSave = Future<void>.value();
+  StreamSubscription<LongPastedTextInputSettings>? _longPasteSubscription;
   late final OperitThemeController _controller = OperitThemeController(
     onChanged: () {
       if (mounted) {
+        _syncAssetContext();
         setState(() {});
       }
     },
@@ -87,8 +103,9 @@ class _OperitThemeState extends State<OperitTheme> {
     _controller.setInitialThemePreferenceSnapshot(
       widget.initialThemePreferenceSnapshot,
     );
-    _runtimeUiReady =
-        widget.initialThemeIsReady && _runtimeManager.runtimeConfigured;
+    _syncAssetContext();
+    // Each engine prepares its synchronized appearance before mounting the app.
+    _runtimeUiReady = false;
     if (_runtimeManager.runtimeConfigured) {
       unawaited(_startRuntimeUi());
     }
@@ -100,7 +117,19 @@ class _OperitThemeState extends State<OperitTheme> {
     _stopRuntimeStartupStatusPolling();
     _runtimeManager.removeListener(_handleRuntimeBootstrapChanged);
     _controller.dispose();
+    _assetDiagnostics.dispose();
+    _cancelPreferenceSubscriptions();
     super.dispose();
+  }
+
+  void _syncAssetContext() {
+    final snapshot = _controller.themePreferenceSnapshot;
+    if (_assetSnapshot != null && mapEquals(_assetSnapshot!.toJson(), snapshot.toJson())) return;
+    _assetSnapshot = snapshot;
+    _assetDiagnostics.updateContext(
+      themeRevision: ++_assetRevision,
+      activeReferences: _themeAssetReferences(snapshot),
+    );
   }
 
   /// Synchronizes the theme lifecycle with runtime configuration changes.
@@ -109,6 +138,8 @@ class _OperitThemeState extends State<OperitTheme> {
       _runtimeGeneration++;
       _stopRuntimeStartupStatusPolling();
       _controller.dispose();
+      _syncAssetContext();
+      _cancelPreferenceSubscriptions();
       setState(() {
         _runtimeUiReady = false;
         _runtimeStartCompleted = false;
@@ -135,12 +166,22 @@ class _OperitThemeState extends State<OperitTheme> {
     _runtimeStartFuture = startFuture;
     try {
       await startFuture;
+      final zoom = await _zoomPreferences.load();
       if (!mounted ||
           generation != _runtimeGeneration ||
           !_runtimeManager.runtimeConfigured) {
         return;
       }
+      _longPasteSubscription = const UserPreferencesManager()
+          .longPastedTextInputSettingsFlow()
+          .listen((settings) {
+            if (!mounted || generation != _runtimeGeneration) {
+              return;
+            }
+            UserPreferencesManager.longPastedTextInputSettings.value = settings;
+          });
       setState(() {
+        _zoom = zoom;
         _runtimeUiReady = true;
         _runtimeStartCompleted = true;
         _runtimeStartupError = null;
@@ -158,6 +199,7 @@ class _OperitThemeState extends State<OperitTheme> {
         ),
       );
       setState(() {
+        _runtimeUiReady = false;
         _runtimeStartupError = error;
       });
     } finally {
@@ -166,6 +208,12 @@ class _OperitThemeState extends State<OperitTheme> {
         _runtimeStartFuture = null;
       }
     }
+  }
+
+  /// Detaches application-level preference caches from the active runtime.
+  void _cancelPreferenceSubscriptions() {
+    unawaited(_longPasteSubscription?.cancel());
+    _longPasteSubscription = null;
   }
 
   /// Starts reading Android native runtime stages while Core-backed UI is starting.
@@ -204,51 +252,129 @@ class _OperitThemeState extends State<OperitTheme> {
     });
   }
 
+  /// Applies a keyboard-selected zoom and persists changes in input order.
+  void _changeZoom(double zoom) {
+    if (_zoom == zoom) {
+      return;
+    }
+    setState(() {
+      _zoom = zoom;
+    });
+    _zoomSave = _zoomSave.then((_) => _zoomPreferences.save(zoom));
+    unawaited(_zoomSave);
+  }
+
   /// Builds the bootstrap or fully initialized application theme.
   @override
   Widget build(BuildContext context) {
     final runtimeConfigured = _runtimeManager.runtimeConfigured;
     final runtimeReady = runtimeConfigured && _runtimeUiReady;
-    final themeSnapshot = runtimeReady
-        ? _controller.themePreferenceSnapshot
-        : UserPreferencesManager.defaultThemePreferenceSnapshot;
+    final activeThemeReady =
+        runtimeReady &&
+        !_controller.themeIsPreparing &&
+        _controller.themeLoadError == null;
+    final showUnconfiguredApp =
+        !runtimeConfigured &&
+        (widget.unconfiguredChildEnabled || _preserveUnconfiguredChild);
+    final retainApplication =
+        _controller.hasLoadedTheme ||
+        showUnconfiguredApp ||
+        _preserveUnconfiguredChild;
     final themeMode = runtimeReady
         ? _controller.themeMode
         : widget.initialThemeMode ??
               widget.initialThemePreferenceSnapshot.themeMode;
-    final Widget appChild;
-    if (_preserveUnconfiguredChild) {
-      appChild = Stack(
-        fit: StackFit.expand,
-        children: <Widget>[
-          widget.child,
-          if (runtimeConfigured && !runtimeReady)
-            RuntimeBootstrapScreen(
-              message: _runtimeStartupMessage,
-              errorText: _runtimeStartupError?.toString(),
-            ),
-        ],
-      );
-    } else if (!runtimeConfigured) {
-      appChild = widget.unconfiguredChildEnabled
-          ? widget.child
-          : const RuntimeBootstrapScreen(message: '请先在主窗口配置运行时目录和工作区目录');
-    } else if (!runtimeReady) {
-      appChild = RuntimeBootstrapScreen(
-        message: _runtimeStartupMessage,
-        errorText: _runtimeStartupError?.toString(),
-      );
-    } else {
-      appChild = widget.child;
-    }
     return _OperitThemeScope(
       controller: _controller,
-      child: _OperitMaterialApp(
+      child: DesktopWindowChrome(
         themeMode: themeMode,
-        themePreferenceSnapshot: themeSnapshot,
-        hostInteractionHostsEnabled:
-            runtimeReady && widget.hostInteractionHostsEnabled,
-        child: appChild,
+        lightColorScheme: _seedColorScheme(
+          Brightness.light,
+          _controller.themePreferenceSnapshot,
+        ),
+        darkColorScheme: _seedColorScheme(
+          Brightness.dark,
+          _controller.themePreferenceSnapshot,
+        ),
+        child: ThemeRenderStack(
+          children: <Widget>[
+            if (retainApplication)
+              Offstage(
+                key: const ValueKey('appearance-application'),
+                offstage: !activeThemeReady && !showUnconfiguredApp,
+                child: TickerMode(
+                  enabled: activeThemeReady || showUnconfiguredApp,
+                  child: ExcludeFocus(
+                    excluding: !activeThemeReady && !showUnconfiguredApp,
+                    child: ThemeAssetScope(
+                      resolver: _themeAssets,
+                      diagnostics: _assetDiagnostics,
+                      child: _OperitMaterialApp(
+                        themeMode: themeMode,
+                        themePreferenceSnapshot:
+                            _controller.themePreferenceSnapshot,
+                        hostInteractionHostsEnabled:
+                            activeThemeReady &&
+                            widget.hostInteractionHostsEnabled,
+                        zoom: _zoom,
+                        zoomShortcutsEnabled:
+                            runtimeReady && _runtimeStartCompleted,
+                        onZoomChanged: _changeZoom,
+                        assetDiagnostics: _assetDiagnostics,
+                        child: widget.child,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            if (!activeThemeReady && !showUnconfiguredApp)
+              ThemeRenderRoot(
+                key: const ValueKey('appearance-status'),
+                title: 'Operit2',
+                themePreferenceSnapshot: _controller.themePreferenceSnapshot,
+                lightColorScheme: _seedColorScheme(
+                  Brightness.light,
+                  _controller.themePreferenceSnapshot,
+                ),
+                darkColorScheme: _seedColorScheme(
+                  Brightness.dark,
+                  _controller.themePreferenceSnapshot,
+                ),
+                // Startup and repair use system typography while font assets are being prepared.
+                fontFamily: _defaultFontFamily,
+                fontFamilyFallback: _defaultFontFamilyFallback,
+                themeMode: themeMode,
+                localizationsDelegates: AppLocalizations.localizationsDelegates,
+                supportedLocales: AppLocalizations.supportedLocales,
+                builder: (context, child) =>
+                    AnnotatedRegion<SystemUiOverlayStyle>(
+                      value: operitSystemUiOverlayStyle(
+                        Theme.of(context).colorScheme,
+                      ),
+                      child: DesktopWindowFrame(
+                        transparentSurface: _controller
+                            .themePreferenceSnapshot
+                            .transparentSurfaceEnabled,
+                        child: child!,
+                      ),
+                    ),
+                home: runtimeReady && _controller.themeLoadError != null
+                    ? ThemeAppearanceErrorScreen(
+                        error: _controller.themeLoadError!,
+                        onRetry: _controller.reloadTheme,
+                        onReset: _controller.restoreDefaultAppearance,
+                      )
+                    : RuntimeBootstrapScreen(
+                        message: runtimeReady
+                            ? '正在读取外观设置'
+                            : !runtimeConfigured
+                            ? '请先在主窗口配置运行时目录和工作区目录'
+                            : _runtimeStartupMessage,
+                        errorText: _runtimeStartupError?.toString(),
+                      ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -259,12 +385,20 @@ class _OperitMaterialApp extends StatelessWidget {
     required this.themeMode,
     required this.themePreferenceSnapshot,
     required this.hostInteractionHostsEnabled,
+    required this.zoom,
+    required this.zoomShortcutsEnabled,
+    required this.onZoomChanged,
+    required this.assetDiagnostics,
     required this.child,
   });
 
   final ThemeMode themeMode;
   final ThemePreferenceSnapshot themePreferenceSnapshot;
   final bool hostInteractionHostsEnabled;
+  final double zoom;
+  final bool zoomShortcutsEnabled;
+  final ValueChanged<double> onZoomChanged;
+  final ThemeAssetDiagnostics assetDiagnostics;
   final Widget child;
 
   /// Builds the themed application and process-wide host overlays.
@@ -278,129 +412,326 @@ class _OperitMaterialApp extends StatelessWidget {
       Brightness.dark,
       themePreferenceSnapshot,
     );
-    return MaterialApp(
+    return ThemeRenderRoot(
       title: 'Operit2',
-      debugShowCheckedModeBanner: false,
+      themePreferenceSnapshot: themePreferenceSnapshot,
+      lightColorScheme: lightColorScheme,
+      darkColorScheme: darkColorScheme,
+      fontFamily: _fontFamily(themePreferenceSnapshot),
+      fontFamilyFallback: _fontFamilyFallback(themePreferenceSnapshot),
       localizationsDelegates: AppLocalizations.localizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
-      theme: _themeData(lightColorScheme, themePreferenceSnapshot),
-      darkTheme: _themeData(darkColorScheme, themePreferenceSnapshot),
       themeMode: themeMode,
       themeAnimationDuration: OperitTheme.of(context).suppressThemeAnimation
           ? Duration.zero
           : kThemeAnimationDuration,
       builder: (context, materialChild) {
-        return ThemeCircularRevealHost(
+        final appContent = ThemeCircularRevealHost(
           child: AnnotatedRegion<SystemUiOverlayStyle>(
-            value: _systemUiOverlayStyle(Theme.of(context).colorScheme),
-            child: _OperitThemeBackground(
+            value: operitSystemUiOverlayStyle(Theme.of(context).colorScheme),
+            child: OperitThemeBackground(
               themePreferenceSnapshot: themePreferenceSnapshot,
-              child: materialChild!,
+              child: DesktopWindowFrame(
+                transparentSurface:
+                    themePreferenceSnapshot.transparentSurfaceEnabled,
+                zoom: zoom,
+                child: materialChild!,
+              ),
+            ),
+          ),
+        );
+        return ApplicationZoomHost(
+          zoom: zoom,
+          shortcutsEnabled: zoomShortcutsEnabled,
+          onZoomChanged: onZoomChanged,
+          child: AppToastHost(
+            child: ThemeAssetNoticeHost(
+              diagnostics: assetDiagnostics,
+              child: MacNoticeScaffoldMessenger(child: appContent),
             ),
           ),
         );
       },
-      home: RuntimeBrowserOwnerHost(
-        enabled: hostInteractionHostsEnabled,
-        child: WorkspaceWebVisitHost(
-          child: AppToastHost(
-            child: Stack(
-              fit: StackFit.expand,
-              children: <Widget>[
-                Positioned.fill(child: child),
-                const TtsFloatingPanel(),
-                PluginLoadingOverlay(
-                  key: const ValueKey<String>('plugin-loading-overlay'),
-                  enabled: hostInteractionHostsEnabled,
-                ),
-              ],
+      home: UnhandledErrorHost(
+        child: Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            Positioned.fill(
+              child: RuntimeBrowserOwnerHost(
+                enabled: hostInteractionHostsEnabled,
+                child: child,
+              ),
             ),
-          ),
+            const TtsFloatingPanel(),
+            RuntimeActivityOverlay(
+              key: const ValueKey<String>('runtime-activity-overlay'),
+              enabled: hostInteractionHostsEnabled,
+            ),
+          ],
         ),
       ),
     );
   }
 }
 
+/// Displays recoverable resource failures without replacing the application.
+class ThemeAssetNoticeHost extends StatefulWidget {
+  const ThemeAssetNoticeHost({
+    super.key,
+    required this.diagnostics,
+    required this.child,
+    this.inline = false,
+  });
+
+  final ThemeAssetDiagnostics diagnostics;
+  final Widget child;
+  final bool inline;
+
+  @override
+  State<ThemeAssetNoticeHost> createState() => _ThemeAssetNoticeHostState();
+}
+
+class _ThemeAssetNoticeHostState extends State<ThemeAssetNoticeHost> {
+  final Set<String> _shown = {};
+  final Map<String, int> _notices = {};
+  bool _scheduled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.diagnostics.addListener(_schedule);
+    _schedule();
+  }
+
+  @override
+  void didUpdateWidget(covariant ThemeAssetNoticeHost oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.diagnostics, widget.diagnostics)) {
+      oldWidget.diagnostics.removeListener(_schedule);
+      widget.diagnostics.addListener(_schedule);
+      _dismissNotices();
+      _shown.clear();
+    }
+    if (oldWidget.inline != widget.inline) _dismissNotices();
+    _schedule();
+  }
+
+  String _noticeKey(ThemeAssetFailure failure) =>
+      '${failure.key}|${widget.diagnostics.retryEpoch(failure.reference)}';
+
+  void _schedule() {
+    if (!mounted || _scheduled) return;
+    _scheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scheduled = false;
+      if (!mounted) return;
+      final l10n = AppLocalizations.of(context) ?? lookupAppLocalizations(const Locale('en'));
+      final failures = widget.diagnostics.failures;
+      final current = failures.map(_noticeKey).toSet();
+      _shown.retainAll(current);
+      for (final key in _notices.keys.toList()) {
+        if (!current.contains(key)) {
+          AppToastController.instance.dismiss(_notices.remove(key)!);
+        }
+      }
+      for (final failure in failures) {
+        final key = _noticeKey(failure);
+        if (!_shown.add(key)) continue;
+        ClientLogger.w(failure.details, tag: 'ThemeResource', error: failure);
+        if (!widget.inline) {
+          _notices[key] = AppToastController.instance.show(
+            _themeAssetFailureMessage(l10n, failure, widget.diagnostics),
+            // Keep recovery available while a copied/synchronized file arrives.
+            duration: const Duration(minutes: 5),
+            actionLabel: l10n.settingsAppearanceAssetRetry,
+            onAction: () {
+              if (mounted) widget.diagnostics.retry(failure.reference);
+            },
+          );
+        }
+      }
+      if (widget.inline) setState(() {});
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
+  void _dismissNotices() {
+    for (final id in _notices.values) {
+      AppToastController.instance.dismiss(id);
+    }
+    _notices.clear();
+  }
+
+  @override
+  void dispose() {
+    widget.diagnostics.removeListener(_schedule);
+    _dismissNotices();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final failures = widget.diagnostics.failures;
+    final failure = failures.isEmpty ? null : failures.first;
+    final l10n = AppLocalizations.of(context) ?? lookupAppLocalizations(const Locale('en'));
+    final colors = Theme.of(context).colorScheme;
+    // This parent is stable even as notices appear, disappear, or are retried.
+    return Stack(
+      children: [
+        widget.child,
+        if (widget.inline && failure != null)
+          Positioned(
+            left: 8,
+            right: 8,
+            bottom: 8,
+            child: Material(
+              color: colors.errorContainer,
+              borderRadius: BorderRadius.circular(8),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                child: Row(
+                  children: [
+                    Expanded(child: Text(
+                      _themeAssetFailureMessage(l10n, failure, widget.diagnostics),
+                      style: TextStyle(color: colors.onErrorContainer),
+                    )),
+                    TextButton(
+                      onPressed: () => widget.diagnostics.retry(failure.reference),
+                      child: Text(l10n.settingsAppearanceAssetRetry),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+String _themeAssetFailureMessage(
+  AppLocalizations l10n,
+  ThemeAssetFailure failure,
+  ThemeAssetDiagnostics diagnostics,
+) {
+  final reference = ThemeAssetFailure.safeReference(failure.reference)
+      .replaceAll('\\', '/').split('/').last;
+  final extension = reference.split('.').last.toLowerCase();
+  final video = failure.stage == ThemeAssetStage.videoOpen ||
+      failure.stage == ThemeAssetStage.playback ||
+      const {'mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi'}.contains(extension);
+  final message = failure.retainedPrevious
+      ? l10n.settingsAppearanceAssetPreviousRetained(reference)
+      : failure.purpose == ThemeAssetPurpose.bubble
+      ? l10n.settingsAppearanceAssetBubbleFailed(reference)
+      : video
+      ? l10n.settingsAppearanceAssetVideoFailed(reference)
+      : l10n.settingsAppearanceAssetBackgroundFailed(reference);
+  return diagnostics.retryEpoch(failure.reference) == 0
+      ? message
+      : '$message ${l10n.settingsAppearanceAssetReimportHint}';
+}
+
+Set<String> _themeAssetReferences(ThemePreferenceSnapshot snapshot) {
+  final references = <String>{};
+  void add(String? reference) {
+    if (reference != null && reference.isNotEmpty) references.add(reference);
+  }
+  if (snapshot.useBackgroundImage) add(snapshot.backgroundImageUri);
+  if (snapshot.bubbleUserUseImage) add(snapshot.bubbleUserImageUri);
+  if (snapshot.bubbleAiUseImage) add(snapshot.bubbleAiImageUri);
+  if (snapshot.inputUseImage) add(snapshot.inputImageUri);
+  for (final entry in snapshot.toJson().entries) {
+    if (entry.key.endsWith('Asset') && entry.value is String) {
+      add(entry.value as String);
+    }
+  }
+  return references;
+}
+
+/// Observes and edits the ordinary synchronized appearance configuration.
 class OperitThemeController {
   /// Creates the controller that owns the effective application theme.
   OperitThemeController({
     required VoidCallback onChanged,
+    Future<void> Function(ThemeMode)? saveStartupThemeMode,
     UserPreferencesManager preferencesManager = const UserPreferencesManager(),
-    GeneratedCoreProxyClients clients = const GeneratedCoreProxyClients(
-      ProxyCoreRuntimeBridge(),
-    ),
   }) : _onChanged = onChanged,
-       _preferencesManager = preferencesManager,
-       _clients = clients;
+       _saveStartupThemeMode =
+           saveStartupThemeMode ?? _saveStartupThemeModeDefault,
+       _preferencesManager = preferencesManager;
 
   final VoidCallback _onChanged;
+  final Future<void> Function(ThemeMode) _saveStartupThemeMode;
   final UserPreferencesManager _preferencesManager;
-  final GeneratedCoreProxyClients _clients;
-  StreamSubscription<Object?>? _activePromptSubscription;
+  StreamSubscription<ThemePreferenceSnapshot>? _appearanceSubscription;
   ThemePreferenceSnapshot _themePreferenceSnapshot =
       UserPreferencesManager.defaultThemePreferenceSnapshot;
-  String? _activeCharacterCardId;
-  String? _activeCharacterGroupId;
-  String? _activeThemeTargetName;
-  int _activePromptRevision = 0;
+  Object? _themeLoadError;
+  bool _themeIsPreparing = false;
+  bool _hasLoadedState = false;
+  int _themePreferenceRevision = 0;
+  int _lifecycleRevision = 0;
   bool _suppressThemeAnimation = false;
 
   ThemeMode get themeMode => _themePreferenceSnapshot.themeMode;
   ThemePreferenceSnapshot get themePreferenceSnapshot =>
       _themePreferenceSnapshot;
+  Object? get themeLoadError => _themeLoadError;
+  bool get themeIsPreparing => _themeIsPreparing;
+
+  /// Reports whether a complete appearance has finished resource preparation.
+  bool get hasLoadedTheme => _hasLoadedState;
   bool get suppressThemeAnimation => _suppressThemeAnimation;
-  String get activeThemeTargetName {
-    final name = _activeThemeTargetName;
-    if (name == null || name.trim().isEmpty) {
-      throw StateError('No active theme target name');
-    }
-    return name;
-  }
-
-  bool get hasActiveThemeTarget =>
-      _activeCharacterGroupId != null || _activeCharacterCardId != null;
-  bool get isActiveThemeTargetGroup => _activeCharacterGroupId != null;
-
-  /// Returns the currently active character card or group theme target.
-  core_proxy.ActivePrompt get activeThemeTarget {
-    final groupId = _activeCharacterGroupId;
-    if (groupId != null) {
-      return core_proxy.ActivePrompt.characterGroup(id: groupId);
-    }
-    final cardId = _activeCharacterCardId;
-    if (cardId != null) {
-      return core_proxy.ActivePrompt.characterCard(id: cardId);
-    }
-    throw StateError('No active theme target');
-  }
 
   /// Applies the known first-frame theme state before asynchronous startup.
   void setInitialThemePreferenceSnapshot(ThemePreferenceSnapshot snapshot) {
     _themePreferenceSnapshot = snapshot;
   }
 
-  /// Starts core-backed theme preferences and active prompt subscriptions.
+  /// Observes the existing shared appearance owner without retaining a template selection.
   Future<void> start() async {
-    await _activePromptSubscription?.cancel();
-    _activePromptSubscription = null;
-    final activePrompt = await _clients.preferencesActivePromptManager
-        .getActivePrompt();
-    _applyActivePrompt(activePrompt);
-    final revision = ++_activePromptRevision;
-    _activePromptSubscription = _clients.preferencesActivePromptManager
-        .activePromptFlow()
-        .listen((activePrompt) {
-          unawaited(_handleActivePromptChange(activePrompt));
-        });
-    await _loadActiveThemeTarget(revision);
+    final lifecycle = ++_lifecycleRevision;
+    await _appearanceSubscription?.cancel();
+    _appearanceSubscription = null;
+    if (lifecycle != _lifecycleRevision) return;
+    await _reloadThemePreferenceSnapshot();
+    if (lifecycle != _lifecycleRevision) return;
+    _appearanceSubscription = _preferencesManager
+        .themePreferenceSnapshotFlow()
+        .listen(
+          (snapshot) {
+            if (lifecycle != _lifecycleRevision) return;
+            unawaited(
+              _reloadThemePreferenceSnapshot(committedSnapshot: snapshot),
+            );
+          },
+          onError: (Object error, StackTrace stack) {
+            if (lifecycle != _lifecycleRevision) return;
+            ClientLogger.e(
+              'Appearance preference subscription failed lifecycle=$lifecycle '
+              'hasLoadedTheme=$_hasLoadedState',
+              tag: 'ThemeAppearance',
+              error: error,
+              stackTrace: stack,
+            );
+            _themePreferenceRevision++;
+            _themeIsPreparing = false;
+            _themeLoadError = error;
+            _onChanged();
+          },
+        );
   }
 
-  /// Cancels the active prompt subscription.
+  /// Releases the ordinary appearance observer when this controller leaves its runtime.
   void dispose() {
-    _activePromptRevision++;
-    unawaited(_activePromptSubscription?.cancel());
-    _activePromptSubscription = null;
+    _lifecycleRevision++;
+    _themePreferenceRevision++;
+    unawaited(_appearanceSubscription?.cancel());
+    _appearanceSubscription = null;
+    _themePreferenceSnapshot =
+        UserPreferencesManager.defaultThemePreferenceSnapshot;
+    _hasLoadedState = false;
   }
 
   /// Reports whether the effective Material theme is dark.
@@ -423,6 +754,8 @@ class OperitThemeController {
           _suppressThemeAnimation = true;
           try {
             await setThemeMode(nextMode);
+            // Paint the target theme before revealing it through the circle.
+            await WidgetsBinding.instance.endOfFrame;
           } finally {
             _suppressThemeAnimation = false;
           }
@@ -431,16 +764,12 @@ class OperitThemeController {
     );
   }
 
-  /// Persists and applies one theme mode for the active target.
+  /// Persists and applies this node's light/dark/system choice.
   Future<void> setThemeMode(ThemeMode themeMode) async {
     if (_themePreferenceSnapshot.themeMode == themeMode) {
       return;
     }
-    await _preferencesManager.saveThemeSettings(
-      characterCardId: _activeCharacterCardId,
-      characterGroupId: _activeCharacterGroupId,
-      themeMode: themeMode,
-    );
+    await _preferencesManager.saveThemeSettings(themeMode: themeMode);
     await _reloadThemePreferenceSnapshot();
   }
 
@@ -450,6 +779,7 @@ class OperitThemeController {
     double? backgroundBlurRadius,
     double? fontScale,
   }) {
+    // Keep slider previews local until their explicit save operation.
     final snapshot = _themePreferenceSnapshotWith(
       _themePreferenceSnapshot,
       backgroundImageOpacity: backgroundImageOpacity,
@@ -460,10 +790,11 @@ class OperitThemeController {
     _onChanged();
   }
 
-  /// Persists a partial theme update for the active target.
+  /// Persists a partial update through synchronized Space appearance preferences.
   Future<void> saveThemeSettings({
     String? inputStyle,
-    String? chatStyle,
+    String? userChatStyle,
+    String? aiChatStyle,
     bool? bubbleShowAvatar,
     bool? bubbleWideLayoutEnabled,
     bool? bubbleUserRoundedCornersEnabled,
@@ -539,10 +870,9 @@ class OperitThemeController {
     String? bubbleAiCustomFontPath,
   }) async {
     await _preferencesManager.saveThemeSettings(
-      characterCardId: _activeCharacterCardId,
-      characterGroupId: _activeCharacterGroupId,
       inputStyle: inputStyle,
-      chatStyle: chatStyle,
+      userChatStyle: userChatStyle,
+      aiChatStyle: aiChatStyle,
       bubbleShowAvatar: bubbleShowAvatar,
       bubbleWideLayoutEnabled: bubbleWideLayoutEnabled,
       bubbleUserRoundedCornersEnabled: bubbleUserRoundedCornersEnabled,
@@ -620,42 +950,6 @@ class OperitThemeController {
     await _reloadThemePreferenceSnapshot();
   }
 
-  /// Loads every character card available as a theme target.
-  Future<List<core_proxy.CharacterCard>> loadThemeCharacterCards() {
-    return _clients.preferencesCharacterCardManager.getAllCharacterCards();
-  }
-
-  /// Loads every character group available as a theme target.
-  Future<List<core_proxy.CharacterGroupCard>> loadThemeCharacterGroups() {
-    return _clients.preferencesCharacterGroupCardManager
-        .getAllCharacterGroupCards();
-  }
-
-  /// Activates the selected character card or group as the current theme target.
-  Future<void> setActiveThemeTarget(core_proxy.ActivePrompt prompt) async {
-    final id = prompt.id.trim();
-    if (id.isEmpty) {
-      throw ArgumentError.value(
-        prompt.id,
-        'prompt.id',
-        'empty theme target id',
-      );
-    }
-    final normalizedPrompt = switch (prompt.tag) {
-      'CharacterCard' => core_proxy.ActivePrompt.characterCard(id: id),
-      'CharacterGroup' => core_proxy.ActivePrompt.characterGroup(id: id),
-      _ => throw ArgumentError.value(
-        prompt.tag,
-        'prompt.tag',
-        'invalid theme target tag',
-      ),
-    };
-    await _clients.preferencesActivePromptManager.setActivePrompt(
-      prompt: normalizedPrompt,
-    );
-    await _handleActivePromptChange(normalizedPrompt);
-  }
-
   /// Persists the global user avatar shown by the active theme.
   Future<void> saveActiveThemeUserAvatarSettings({
     required String customUserAvatarUri,
@@ -666,142 +960,300 @@ class OperitThemeController {
     await _reloadThemePreferenceSnapshot();
   }
 
-  /// Clears message color overrides for the active target.
   Future<void> resetMessageColorSettings() async {
-    await _resetCurrentTargetMessageColorSettings();
+    await _preferencesManager.saveAppearanceFields(<String, Object?>{
+      'cursorUserBubbleColor': null,
+      'bubbleUserBubbleColor': null,
+      'bubbleAiBubbleColor': null,
+      'bubbleUserTextColor': null,
+      'bubbleAiTextColor': null,
+    });
     await _reloadThemePreferenceSnapshot();
   }
 
-  /// Clears every target-scoped theme preference for the active target.
+  /// Resets appearance using the existing named configuration owner.
   Future<void> resetThemeSettings() async {
-    await _resetCurrentTargetThemeSettings();
+    await _preferencesManager.resetThemeSettings();
     await _reloadThemePreferenceSnapshot();
   }
 
-  /// Reloads and commits the latest snapshot for the active target.
-  Future<void> _reloadThemePreferenceSnapshot() async {
-    final snapshot = await _preferencesManager.resolveThemePreferenceSnapshot(
-      characterCardId: _activeCharacterCardId,
-      characterGroupId: _activeCharacterGroupId,
-    );
-    await _loadCustomFontIfNeeded(snapshot);
-    await RuntimeBootstrapManager.instance.saveStartupThemeMode(
-      snapshot.themeMode,
-    );
-    _themePreferenceSnapshot = snapshot;
-    _onChanged();
+  /// Replaces appearance only after an explicit reset action from the error screen.
+  Future<void> restoreDefaultAppearance() async {
+    await _preferencesManager.restoreDefaultAppearance();
+    await _reloadThemePreferenceSnapshot();
   }
 
-  /// Starts a revision-guarded load when the active prompt target changes.
-  Future<void> _handleActivePromptChange(
-    core_proxy.ActivePrompt? activePrompt,
-  ) async {
-    if (_applyActivePrompt(activePrompt)) {
-      await _loadActiveThemeTarget(++_activePromptRevision);
-    }
+  /// Re-reads committed appearance and renews its subscription for an explicit retry.
+  Future<void> reloadTheme() => start();
+
+  /// Saves ordinary appearance through its synchronized preference owner.
+  Future<void> saveAppearanceFields(Map<String, Object?> updates) async {
+    await _preferencesManager.saveAppearanceFields(updates);
+    await _reloadThemePreferenceSnapshot();
   }
 
-  Future<void> _resetCurrentTargetThemeSettings() async {
-    final groupId = _activeCharacterGroupId;
-    final cardId = _activeCharacterCardId;
-    if (groupId != null) {
-      await _preferencesManager.deleteCharacterGroupTheme(groupId);
-    } else if (cardId != null) {
-      await _preferencesManager.deleteCharacterCardTheme(cardId);
-    } else {
-      throw StateError('No active theme target for theme settings');
-    }
-  }
-
-  Future<void> _resetCurrentTargetMessageColorSettings() async {
-    final groupId = _activeCharacterGroupId;
-    final cardId = _activeCharacterCardId;
-    if (groupId != null) {
-      await _preferencesManager.resetMessageColorSettingsForCharacterGroup(
-        groupId,
-      );
-    } else if (cardId != null) {
-      await _preferencesManager.resetMessageColorSettingsForCharacterCard(
-        cardId,
-      );
-    } else {
-      throw StateError('No active theme target for message color settings');
-    }
-  }
-
-  /// Loads one target snapshot and commits it only while still current.
-  Future<void> _loadActiveThemeTarget(int revision) async {
-    final groupId = _activeCharacterGroupId;
-    final cardId = _activeCharacterCardId;
-    final targetName = await _resolveActiveThemeTargetName(
-      characterCardId: cardId,
-      characterGroupId: groupId,
-    );
-    final snapshot = await _preferencesManager.resolveThemePreferenceSnapshot(
-      characterCardId: cardId,
-      characterGroupId: groupId,
-    );
-    await _loadCustomFontIfNeeded(snapshot);
-    if (revision != _activePromptRevision) {
-      return;
-    }
-    await RuntimeBootstrapManager.instance.saveStartupThemeMode(
-      snapshot.themeMode,
-    );
-    _activeThemeTargetName = targetName;
-    _themePreferenceSnapshot = snapshot;
-    _onChanged();
-  }
-
-  /// Resolves the display name for one explicit theme target.
-  Future<String?> _resolveActiveThemeTargetName({
-    required String? characterCardId,
-    required String? characterGroupId,
+  /// Loads an independent appearance configuration without looking up its creation source.
+  Future<void> _reloadThemePreferenceSnapshot({
+    ThemePreferenceSnapshot? committedSnapshot,
   }) async {
-    if (characterGroupId != null) {
-      final group = await _clients.preferencesCharacterGroupCardManager
-          .getCharacterGroupCard(groupId: characterGroupId);
-      return group?.name;
-    }
-    if (characterCardId != null) {
-      final card = await _clients.preferencesCharacterCardManager
-          .getCharacterCard(id: characterCardId);
-      return card.name;
-    }
-    throw StateError('No active theme target');
-  }
+    final lifecycle = _lifecycleRevision;
+    final revision = ++_themePreferenceRevision;
 
-  /// Applies a generated active prompt to the current theme target ids.
-  bool _applyActivePrompt(core_proxy.ActivePrompt? activePrompt) {
-    String? nextCardId;
-    String? nextGroupId;
-    if (activePrompt != null) {
-      if (activePrompt.tag == 'CharacterCard' &&
-          activePrompt.id.trim().isNotEmpty) {
-        nextCardId = activePrompt.id.trim();
-      } else if (activePrompt.tag == 'CharacterGroup' &&
-          activePrompt.id.trim().isNotEmpty) {
-        nextGroupId = activePrompt.id.trim();
+    /// Checks that asynchronous work still belongs to the current preference revision.
+    bool current() =>
+        lifecycle == _lifecycleRevision && revision == _themePreferenceRevision;
+    if (!_hasLoadedState) _themeIsPreparing = true;
+    var stage = 'read_preferences';
+    try {
+      final snapshot =
+          committedSnapshot ??
+          await _preferencesManager.resolveThemePreferenceSnapshot();
+      if (!current()) return;
+      if (_hasLoadedState &&
+          _themeLoadError == null &&
+          mapEquals(snapshot.toJson(), _themePreferenceSnapshot.toJson())) {
+        return;
       }
+      stage = 'validate_palette';
+      final palette = snapshot.themePaletteJson;
+      if (palette != null) {
+        final colors = jsonDecode(palette) as Map<String, dynamic>;
+        for (final brightness in Brightness.values) {
+          ThemeVisualSpecV1.colorSchemeFromPalette(colors, brightness);
+        }
+      }
+      stage = 'prepare_fonts';
+      final families =
+          !_hasLoadedState ||
+              !listEquals(
+                _themeFontReferences(snapshot),
+                _themeFontReferences(_themePreferenceSnapshot),
+              )
+          ? await _prepareCustomFonts(snapshot)
+          : const <String, String>{};
+      if (!current()) return;
+      stage = 'save_startup_theme_mode';
+      if (!_hasLoadedState || snapshot.themeMode != themeMode) {
+        await _saveStartupThemeMode(snapshot.themeMode);
+      }
+      if (!current()) return;
+      _loadedCustomFontFamilies.addAll(families);
+      _themePreferenceSnapshot = snapshot;
+      _themeLoadError = null;
+      _themeIsPreparing = false;
+      _hasLoadedState = true;
+      _onChanged();
+    } catch (error, stack) {
+      if (!current()) return;
+      ClientLogger.e(
+        'Appearance load failed stage=$stage lifecycle=$lifecycle '
+        'revision=$revision hasLoadedTheme=$_hasLoadedState',
+        tag: 'ThemeAppearance',
+        error: error,
+        stackTrace: stack,
+      );
+      _themeLoadError = error;
+      _themeIsPreparing = false;
+      _onChanged();
     }
-    if (_activeCharacterCardId == nextCardId &&
-        _activeCharacterGroupId == nextGroupId) {
-      return false;
-    }
-    _activeCharacterCardId = nextCardId;
-    _activeCharacterGroupId = nextGroupId;
-    return true;
   }
 }
 
-class _OperitThemeScope extends InheritedWidget {
-  const _OperitThemeScope({required this.controller, required super.child});
+/// Persists the first-frame theme mode through the existing bootstrap host.
+Future<void> _saveStartupThemeModeDefault(ThemeMode themeMode) {
+  return RuntimeBootstrapManager.instance.saveStartupThemeMode(themeMode);
+}
 
-  final OperitThemeController controller;
+/// Renders an inert appearance in its own scope without starting runtime
+/// observers or writing the application's selected theme.
+class OperitThemePreview extends StatefulWidget {
+  const OperitThemePreview({
+    super.key,
+    required this.snapshot,
+    required this.child,
+    this.visual,
+    this.assets,
+  });
+
+  final ThemePreferenceSnapshot snapshot;
+  final PreparedThemeVisual? visual;
+  final ThemeAssetResolver? assets;
+  final Widget child;
 
   @override
+  State<OperitThemePreview> createState() => _OperitThemePreviewState();
+}
+
+class _OperitThemePreviewState extends State<OperitThemePreview> {
+  late final OperitThemeController _controller = OperitThemeController(
+    onChanged: () {},
+  );
+  final _assets = ThemeAssetStore();
+  final _assetDiagnostics = ThemeAssetDiagnostics();
+  PreparedThemeVisual? _boundVisual;
+  ThemeAssetResolver? _boundRuntime;
+  int _assetRevision = 0;
+  Future<void>? _preparation;
+  late ThemeAssetResolver _resolver;
+
+  /// Prepares this preview's initial asset bindings.
+  @override
+  void initState() {
+    super.initState();
+    _prepare();
+  }
+
+  /// Updates presentation without rereading unchanged private font assets.
+  @override
+  void didUpdateWidget(covariant OperitThemePreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!mapEquals(oldWidget.snapshot.toJson(), widget.snapshot.toJson()) ||
+        oldWidget.visual != widget.visual ||
+        oldWidget.assets != widget.assets) {
+      _prepare(
+        prepareFonts:
+            oldWidget.visual != widget.visual ||
+            !listEquals(
+              _themeFontReferences(oldWidget.snapshot),
+              _themeFontReferences(widget.snapshot),
+            ),
+      );
+    }
+  }
+
+  /// Rebinds appearance while retaining any existing font preparation future.
+  void _prepare({bool prepareFonts = true}) {
+    final visual = widget.visual;
+    final runtime = widget.assets ?? _assets;
+    if (_boundRuntime == null ||
+        !identical(_boundVisual, visual) || !identical(_boundRuntime, runtime)) {
+      _resolver = visual == null
+          ? runtime
+          : _PreviewAssetResolver(visual: visual.resources, runtime: runtime);
+      _boundVisual = visual;
+      _boundRuntime = runtime;
+    }
+    final snapshot = visual?.snapshot(widget.snapshot) ?? widget.snapshot;
+    _assetDiagnostics.updateContext(
+      themeRevision: ++_assetRevision,
+      activeReferences: _themeAssetReferences(snapshot),
+    );
+    _controller.setInitialThemePreferenceSnapshot(snapshot);
+    if (visual != null) {
+      for (final font in [
+        visual.resources.sans,
+        visual.resources.user,
+        visual.resources.ai,
+      ]) {
+        _loadedCustomFontFamilies[font.family] = font.family;
+      }
+      _preparation = null;
+    } else if (_usesFontAsset(snapshot.fontType) ||
+        (snapshot.bubbleUserUseCustomFont &&
+            _usesFontAsset(snapshot.bubbleUserFontType)) ||
+        (snapshot.bubbleAiUseCustomFont &&
+            _usesFontAsset(snapshot.bubbleAiFontType))) {
+      if (prepareFonts) {
+        _preparation = _prepareCustomFonts(snapshot).then((families) {
+          _loadedCustomFontFamilies.addAll(families);
+        });
+      }
+    } else {
+      _preparation = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _assetDiagnostics.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<void>(
+      future: _preparation,
+      builder: (context, preparation) {
+        if (preparation.hasError) {
+          return Center(
+            child: Text(
+              AppLocalizations.of(
+                context,
+              )!.settingsAppearanceThemeConfigFailed('${preparation.error}'),
+            ),
+          );
+        }
+        if (_preparation != null &&
+            preparation.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final snapshot = _controller.themePreferenceSnapshot;
+        final brightness = switch (snapshot.themeMode) {
+          ThemeMode.light => Brightness.light,
+          ThemeMode.dark => Brightness.dark,
+          ThemeMode.system => MediaQuery.platformBrightnessOf(context),
+        };
+        return _OperitThemeScope(
+          controller: _controller,
+          child: ThemeAssetScope(
+            resolver: _resolver,
+            diagnostics: _assetDiagnostics,
+            child: Theme(
+              data: buildOperitThemeData(
+                _seedColorScheme(brightness, snapshot),
+                snapshot,
+                fontFamily: _fontFamily(snapshot),
+                fontFamilyFallback: _fontFamilyFallback(snapshot),
+              ),
+              child: Builder(
+                builder: (context) => ThemeAssetNoticeHost(
+                  diagnostics: _assetDiagnostics,
+                  inline: true,
+                  child: DefaultTextStyle(
+                    style: Theme.of(context).textTheme.bodyMedium!,
+                    child: IgnorePointer(child: ExcludeFocus(child: widget.child)),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Template references are checked in memory; saved media uses the same runtime
+/// owner as the catalog. Both are available in previews that mix these sources.
+class _PreviewAssetResolver implements ThemeAssetResolver {
+  const _PreviewAssetResolver({required this.visual, required this.runtime});
+  final ThemeAssetResolver? visual;
+  final ThemeAssetResolver runtime;
+
+  @override
+  Future<Uint8List> readBytes(String reference) =>
+      (reference.startsWith('assets/') ? visual ?? runtime : runtime).readBytes(
+        reference,
+      );
+}
+
+class _OperitThemeScope extends InheritedWidget {
+  /// Captures immutable appearance values for dependency comparisons.
+  _OperitThemeScope({required this.controller, required super.child})
+    : snapshot = controller.themePreferenceSnapshot,
+      suppressAnimation = controller.suppressThemeAnimation;
+
+  final OperitThemeController controller;
+  final ThemePreferenceSnapshot snapshot;
+  final bool suppressAnimation;
+
+  /// Leaves theme consumers untouched when unrelated root state changes.
+  @override
   bool updateShouldNotify(_OperitThemeScope oldWidget) {
-    return true;
+    return controller != oldWidget.controller ||
+        snapshot != oldWidget.snapshot ||
+        suppressAnimation != oldWidget.suppressAnimation;
   }
 }
 
@@ -813,6 +1265,7 @@ ThemePreferenceSnapshot _themePreferenceSnapshotWith(
 }) {
   return ThemePreferenceSnapshot(
     themeMode: snapshot.themeMode,
+    themePaletteJson: snapshot.themePaletteJson,
     useCustomColors: snapshot.useCustomColors,
     customPrimaryColor: snapshot.customPrimaryColor,
     customSecondaryColor: snapshot.customSecondaryColor,
@@ -828,7 +1281,32 @@ ThemePreferenceSnapshot _themePreferenceSnapshotWith(
     transparentSurfaceEnabled: snapshot.transparentSurfaceEnabled,
     chatInputFloating: snapshot.chatInputFloating,
     inputStyle: snapshot.inputStyle,
-    chatStyle: snapshot.chatStyle,
+    inputBackgroundColor: snapshot.inputBackgroundColor,
+    inputRoundedCornersEnabled: snapshot.inputRoundedCornersEnabled,
+    inputUseImage: snapshot.inputUseImage,
+    inputImageUri: snapshot.inputImageUri,
+    inputImageRenderMode: snapshot.inputImageRenderMode,
+    inputImageCropLeft: snapshot.inputImageCropLeft,
+    inputImageCropTop: snapshot.inputImageCropTop,
+    inputImageCropRight: snapshot.inputImageCropRight,
+    inputImageCropBottom: snapshot.inputImageCropBottom,
+    inputImageRepeatStart: snapshot.inputImageRepeatStart,
+    inputImageRepeatEnd: snapshot.inputImageRepeatEnd,
+    inputImageRepeatYStart: snapshot.inputImageRepeatYStart,
+    inputImageRepeatYEnd: snapshot.inputImageRepeatYEnd,
+    inputImageScale: snapshot.inputImageScale,
+    inputSettingsAsset: snapshot.inputSettingsAsset,
+    inputSettingsAssetSize: snapshot.inputSettingsAssetSize,
+    inputAttachmentAsset: snapshot.inputAttachmentAsset,
+    inputAttachmentAssetSize: snapshot.inputAttachmentAssetSize,
+    inputMicAsset: snapshot.inputMicAsset,
+    inputMicAssetSize: snapshot.inputMicAssetSize,
+    inputSendAsset: snapshot.inputSendAsset,
+    inputSendAssetSize: snapshot.inputSendAssetSize,
+    inputStopAsset: snapshot.inputStopAsset,
+    inputStopAssetSize: snapshot.inputStopAssetSize,
+    userChatStyle: snapshot.userChatStyle,
+    aiChatStyle: snapshot.aiChatStyle,
     bubbleShowAvatar: snapshot.bubbleShowAvatar,
     bubbleWideLayoutEnabled: snapshot.bubbleWideLayoutEnabled,
     cursorUserBubbleColor: snapshot.cursorUserBubbleColor,
@@ -894,300 +1372,46 @@ ThemePreferenceSnapshot _themePreferenceSnapshotWith(
   );
 }
 
-/// Builds Material theme data for the effective user theme state.
-ThemeData _themeData(
-  ColorScheme colorScheme,
-  ThemePreferenceSnapshot themePreferenceSnapshot,
-) {
-  final typography = Typography.material2021();
-  final fontFamily = _fontFamily(themePreferenceSnapshot);
-  final fontFamilyFallback = _fontFamilyFallback(themePreferenceSnapshot);
-  final backgroundVisible =
-      themePreferenceSnapshot.useBackgroundImage &&
-      themePreferenceSnapshot.backgroundImageUri != null &&
-      themePreferenceSnapshot.backgroundImageUri!.isNotEmpty;
-  final appBarBackgroundColor =
-      backgroundVisible || themePreferenceSnapshot.transparentSurfaceEnabled
-      ? Colors.transparent
-      : colorScheme.surface;
-  final textTheme =
-      (colorScheme.brightness == Brightness.dark
-              ? typography.white
-              : typography.black)
-          .apply(
-            fontFamily: fontFamily,
-            fontFamilyFallback: fontFamilyFallback,
-            fontSizeFactor: themePreferenceSnapshot.fontScale,
-          );
-  return ThemeData(
-    colorScheme: colorScheme,
-    scaffoldBackgroundColor: Colors.transparent,
-    canvasColor: colorScheme.surface,
-    textTheme: textTheme,
-    inputDecorationTheme: _inputDecorationTheme(colorScheme, textTheme),
-    dropdownMenuTheme: _dropdownMenuTheme(colorScheme, textTheme),
-    menuTheme: _menuTheme(colorScheme, textTheme),
-    menuButtonTheme: _menuButtonTheme(colorScheme, textTheme),
-    popupMenuTheme: _popupMenuTheme(colorScheme, textTheme),
-    buttonTheme: _buttonTheme(colorScheme),
-    dialogTheme: _dialogTheme(colorScheme, textTheme),
-    // ignore: deprecated_member_use
-    progressIndicatorTheme: const ProgressIndicatorThemeData(year2023: false),
-    appBarTheme: AppBarTheme(
-      backgroundColor: appBarBackgroundColor,
-      foregroundColor: colorScheme.onSurface,
-      surfaceTintColor: Colors.transparent,
-      systemOverlayStyle: _systemUiOverlayStyle(colorScheme),
-      elevation: 0,
-      scrolledUnderElevation: 0,
-      centerTitle: false,
-      toolbarHeight: 64,
-      titleTextStyle: textTheme.titleSmall?.copyWith(
-        color: colorScheme.onSurface,
-        fontFamily: fontFamily,
-        fontFamilyFallback: fontFamilyFallback,
-        fontWeight: FontWeight.w600,
-      ),
-    ),
-    fontFamily: fontFamily,
-    fontFamilyFallback: fontFamilyFallback,
-    useMaterial3: true,
-  );
-}
-
-/// Builds the shared theme for Material 3 DropdownMenu widgets.
-DropdownMenuThemeData _dropdownMenuTheme(
-  ColorScheme colorScheme,
-  TextTheme textTheme,
-) {
-  final menuShape = RoundedRectangleBorder(
-    borderRadius: BorderRadius.circular(8),
-  );
-  return DropdownMenuThemeData(
-    textStyle: textTheme.bodyMedium?.copyWith(color: colorScheme.onSurface),
-    menuStyle: MenuStyle(
-      backgroundColor: WidgetStatePropertyAll(colorScheme.surfaceContainerHigh),
-      shadowColor: WidgetStatePropertyAll(
-        colorScheme.shadow.withValues(alpha: 0.18),
-      ),
-      surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
-      elevation: const WidgetStatePropertyAll(3),
-      padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 4)),
-      shape: WidgetStatePropertyAll(menuShape),
-    ),
-  );
-}
-
-/// Builds the shared menu theme used by MenuAnchor and MenuItemButton.
-MenuThemeData _menuTheme(ColorScheme colorScheme, TextTheme textTheme) {
-  final menuShape = RoundedRectangleBorder(
-    borderRadius: BorderRadius.circular(8),
-  );
-  return MenuThemeData(
-    style: MenuStyle(
-      backgroundColor: WidgetStatePropertyAll(colorScheme.surfaceContainerHigh),
-      shadowColor: WidgetStatePropertyAll(
-        colorScheme.shadow.withValues(alpha: 0.18),
-      ),
-      surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
-      elevation: const WidgetStatePropertyAll(3),
-      padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 4)),
-      shape: WidgetStatePropertyAll(menuShape),
-    ),
-  );
-}
-
-/// Builds the shared item style used inside MenuAnchor menus.
-MenuButtonThemeData _menuButtonTheme(
-  ColorScheme colorScheme,
-  TextTheme textTheme,
-) {
-  return MenuButtonThemeData(
-    style: ButtonStyle(
-      foregroundColor: WidgetStatePropertyAll(colorScheme.onSurface),
-      textStyle: WidgetStatePropertyAll(textTheme.bodyMedium),
-      padding: const WidgetStatePropertyAll(
-        EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      ),
-      minimumSize: const WidgetStatePropertyAll(Size(0, 40)),
-      shape: WidgetStatePropertyAll(
-        RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-      ),
-    ),
-  );
-}
-
-/// Builds the shared popup menu theme used by PopupMenuButton.
-PopupMenuThemeData _popupMenuTheme(
-  ColorScheme colorScheme,
-  TextTheme textTheme,
-) {
-  return PopupMenuThemeData(
-    color: colorScheme.surfaceContainerHigh,
-    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-    menuPadding: const EdgeInsets.symmetric(vertical: 4),
-    elevation: 3,
-    shadowColor: colorScheme.shadow.withValues(alpha: 0.18),
-    surfaceTintColor: Colors.transparent,
-    textStyle: textTheme.bodyMedium?.copyWith(color: colorScheme.onSurface),
-  );
-}
-
-/// Builds the legacy button theme values still used by DropdownButton.
-ButtonThemeData _buttonTheme(ColorScheme colorScheme) {
-  return ButtonThemeData(alignedDropdown: true, colorScheme: colorScheme);
-}
-
-DialogThemeData _dialogTheme(ColorScheme colorScheme, TextTheme textTheme) {
-  return DialogThemeData(
-    backgroundColor: colorScheme.surfaceContainerHigh,
-    surfaceTintColor: Colors.transparent,
-    elevation: 6,
-    shadowColor: colorScheme.shadow.withValues(alpha: 0.18),
-    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
-    clipBehavior: Clip.antiAlias,
-    insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
-    actionsPadding: const EdgeInsets.fromLTRB(24, 0, 24, 20),
-    titleTextStyle: textTheme.headlineSmall?.copyWith(
-      color: colorScheme.onSurface,
-      fontWeight: FontWeight.w700,
-    ),
-    contentTextStyle: textTheme.bodyMedium?.copyWith(
-      color: colorScheme.onSurfaceVariant,
-    ),
-    iconColor: colorScheme.primary,
-    barrierColor: Colors.black.withValues(alpha: 0.38),
-  );
-}
-
-InputDecorationTheme _inputDecorationTheme(
-  ColorScheme colorScheme,
-  TextTheme textTheme,
-) {
-  final radius = BorderRadius.circular(8);
-  final baseBorder = OutlineInputBorder(
-    borderRadius: radius,
-    borderSide: BorderSide(
-      color: colorScheme.outlineVariant.withValues(alpha: 0.72),
-      width: 1,
-    ),
-  );
-  final disabledBorder = OutlineInputBorder(
-    borderRadius: radius,
-    borderSide: BorderSide(
-      color: colorScheme.outlineVariant.withValues(alpha: 0.36),
-      width: 1,
-    ),
-  );
-  final focusedBorder = OutlineInputBorder(
-    borderRadius: radius,
-    borderSide: BorderSide(color: colorScheme.primary, width: 1.4),
-  );
-  final errorBorder = OutlineInputBorder(
-    borderRadius: radius,
-    borderSide: BorderSide(color: colorScheme.error, width: 1.2),
-  );
-
-  return InputDecorationTheme(
-    filled: true,
-    fillColor: colorScheme.surfaceContainerHighest.withValues(alpha: 0.34),
-    isDense: true,
-    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
-    border: baseBorder,
-    enabledBorder: baseBorder,
-    disabledBorder: disabledBorder,
-    focusedBorder: focusedBorder,
-    errorBorder: errorBorder,
-    focusedErrorBorder: errorBorder.copyWith(
-      borderSide: BorderSide(color: colorScheme.error, width: 1.4),
-    ),
-    labelStyle: textTheme.labelSmall?.copyWith(
-      color: colorScheme.onSurfaceVariant,
-      fontWeight: FontWeight.w400,
-    ),
-    floatingLabelStyle: textTheme.labelSmall?.copyWith(
-      color: colorScheme.primary,
-      fontWeight: FontWeight.w500,
-    ),
-    hintStyle: textTheme.bodyMedium?.copyWith(
-      color: colorScheme.onSurfaceVariant.withValues(alpha: 0.76),
-    ),
-    helperStyle: textTheme.bodySmall?.copyWith(
-      color: colorScheme.onSurfaceVariant,
-    ),
-    errorStyle: textTheme.bodySmall?.copyWith(color: colorScheme.error),
-    prefixIconColor: colorScheme.onSurfaceVariant,
-    suffixIconColor: colorScheme.onSurfaceVariant,
-  );
-}
-
-class _OperitThemeBackground extends StatelessWidget {
-  const _OperitThemeBackground({
+/// Application adapter for the shared background, including private video presets.
+class OperitThemeBackground extends StatelessWidget {
+  const OperitThemeBackground({
+    super.key,
+    this.fit = StackFit.expand,
+    this.muteVideo = false,
     required this.themePreferenceSnapshot,
     required this.child,
   });
 
-  static const Duration _backgroundAnimationDuration = Duration(
-    milliseconds: 360,
-  );
-
   final ThemePreferenceSnapshot themePreferenceSnapshot;
   final Widget child;
+  final StackFit fit;
+  final bool muteVideo;
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
     final mediaPath = themePreferenceSnapshot.backgroundImageUri;
-    final hasBackgroundMedia =
+    final hasMedia =
         themePreferenceSnapshot.useBackgroundImage &&
         mediaPath != null &&
         mediaPath.isNotEmpty;
-    return LiquidGlassScope(
-      child: Stack(
-        fit: StackFit.expand,
-        children: <Widget>[
-          Positioned.fill(
-            child: GlassBackgroundSource(
-              child: Stack(
-                fit: StackFit.expand,
-                children: <Widget>[
-                  AnimatedContainer(
-                    duration: _backgroundAnimationDuration,
-                    curve: Curves.easeOutCubic,
-                    color: colorScheme.surface,
-                  ),
-                  AnimatedSwitcher(
-                    duration: _backgroundAnimationDuration,
-                    switchInCurve: Curves.easeOutCubic,
-                    switchOutCurve: Curves.easeInCubic,
-                    child: hasBackgroundMedia
-                        ? _ThemeBackgroundMedia(
-                            key: ValueKey<String>(
-                              '${themePreferenceSnapshot.backgroundMediaType}|$mediaPath',
-                            ),
-                            mediaPath: mediaPath,
-                            mediaType:
-                                themePreferenceSnapshot.backgroundMediaType,
-                            opacity:
-                                themePreferenceSnapshot.backgroundImageOpacity,
-                            muted: themePreferenceSnapshot.videoBackgroundMuted,
-                            loop: themePreferenceSnapshot.videoBackgroundLoop,
-                            blurEnabled:
-                                themePreferenceSnapshot.useBackgroundBlur,
-                            blurRadius:
-                                themePreferenceSnapshot.backgroundBlurRadius,
-                          )
-                        : const SizedBox.expand(
-                            key: ValueKey<String>('empty-theme-background'),
-                          ),
-                  ),
-                ],
+    return ThemeBackground(
+      themePreferenceSnapshot: themePreferenceSnapshot,
+      fit: fit,
+      media: hasMedia
+          ? _ThemeBackgroundMedia(
+              key: ValueKey<String>(
+                themePreferenceSnapshot.backgroundMediaType,
               ),
-            ),
-          ),
-          child,
-        ],
-      ),
+              mediaPath: mediaPath,
+              mediaType: themePreferenceSnapshot.backgroundMediaType,
+              opacity: themePreferenceSnapshot.backgroundImageOpacity,
+              muted: muteVideo || themePreferenceSnapshot.videoBackgroundMuted,
+              loop: themePreferenceSnapshot.videoBackgroundLoop,
+              blurEnabled: themePreferenceSnapshot.useBackgroundBlur,
+              blurRadius: themePreferenceSnapshot.backgroundBlurRadius,
+            )
+          : null,
+      child: child,
     );
   }
 }
@@ -1215,22 +1439,19 @@ class _ThemeBackgroundMedia extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final media = mediaType == UserPreferencesManager.MEDIA_TYPE_VIDEO
-        ? _VideoThemeBackground(mediaPath: mediaPath, muted: muted, loop: loop)
-        : ThemeAssetImage(storagePath: mediaPath, fit: BoxFit.cover);
-    final blurred = blurEnabled
-        ? ImageFiltered(
-            imageFilter: ui.ImageFilter.blur(
-              sigmaX: blurRadius,
-              sigmaY: blurRadius,
-            ),
-            child: media,
+        ? _VideoThemeBackground(
+            mediaPath: mediaPath,
+            muted: muted,
+            loop: loop,
+            resolver: ThemeAssetScope.of(context),
+            diagnostics: ThemeAssetScope.diagnosticsOf(context),
           )
-        : media;
-    return AnimatedOpacity(
-      duration: _OperitThemeBackground._backgroundAnimationDuration,
-      curve: Curves.easeOutCubic,
-      opacity: opacity.clamp(0, 1),
-      child: blurred,
+        : ThemeAssetImage(storagePath: mediaPath, fit: BoxFit.cover);
+    return ThemeBackgroundMedia(
+      opacity: opacity,
+      blurEnabled: blurEnabled,
+      blurRadius: blurRadius,
+      child: media,
     );
   }
 }
@@ -1240,11 +1461,15 @@ class _VideoThemeBackground extends StatefulWidget {
     required this.mediaPath,
     required this.muted,
     required this.loop,
+    required this.resolver,
+    required this.diagnostics,
   });
 
   final String mediaPath;
   final bool muted;
   final bool loop;
+  final ThemeAssetResolver resolver;
+  final ThemeAssetDiagnostics? diagnostics;
 
   /// Creates the video state that owns the runtime asset controller.
   @override
@@ -1252,75 +1477,180 @@ class _VideoThemeBackground extends StatefulWidget {
 }
 
 class _VideoThemeBackgroundState extends State<_VideoThemeBackground> {
-  VideoPlayerController? _controller;
-  int _loadToken = 0;
+  ThemeVideoAssetLoader? _activeLoader;
+  ThemeVideoAssetLoader? _pendingLoader;
+  ThemeAssetResolver? _boundResolver;
+  ThemeAssetDiagnostics? _boundDiagnostics;
+  ThemeAssetFailure? _lastFailure;
+  String? _boundReference;
+  Future<void> _settingsUpdate = Future<void>.value();
+  int _retryEpoch = -1;
 
   /// Starts loading the runtime video asset when the widget mounts.
   @override
   void initState() {
     super.initState();
-    unawaited(_loadController());
+    _synchronizeRequest();
+  }
+
+  /// Only a retry of this reference renews an otherwise unchanged video.
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _synchronizeRequest();
   }
 
   /// Updates playback settings or reloads bytes when the video asset changes.
   @override
   void didUpdateWidget(covariant _VideoThemeBackground oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.mediaPath != widget.mediaPath) {
-      unawaited(_loadController());
-      return;
-    }
-    final controller = _controller;
-    if (controller == null) {
-      return;
-    }
-    if (oldWidget.loop != widget.loop) {
-      unawaited(controller.setLooping(widget.loop));
-    }
-    if (oldWidget.muted != widget.muted) {
-      unawaited(controller.setVolume(widget.muted ? 0 : 1));
+    _synchronizeRequest();
+    if (oldWidget.loop != widget.loop || oldWidget.muted != widget.muted) {
+      // Settings errors are observed, including when an older successful video
+      // remains visible while its replacement is being prepared.
+      _settingsUpdate = _settingsUpdate.then((_) => _updatePlaybackSettings());
     }
   }
 
-  /// Creates and starts a controller from imported runtime asset bytes.
-  Future<void> _loadController() async {
-    final token = ++_loadToken;
-    final bytes = await ThemeAssetStore().readBytes(widget.mediaPath);
-    final controller =
-        VideoPlayerController.networkUrl(
-            Uri.dataFromBytes(
-              bytes,
-              mimeType: themeAssetVideoMimeType(widget.mediaPath),
-            ),
-          )
-          ..setLooping(widget.loop)
-          ..setVolume(widget.muted ? 0 : 1);
-    await controller.initialize();
-    await controller.play();
-    if (!mounted || token != _loadToken) {
-      await controller.dispose();
+  void _synchronizeRequest() {
+    final epoch = widget.diagnostics?.retryEpoch(widget.mediaPath) ?? 0;
+    if (!identical(_boundDiagnostics, widget.diagnostics)) {
+      _boundDiagnostics?.release(this);
+      _boundDiagnostics = widget.diagnostics;
+      final failure = _lastFailure;
+      if (failure != null && failure.reference == widget.mediaPath) {
+        widget.diagnostics?.report(failure, owner: this);
+      }
+      if (_boundReference == widget.mediaPath && identical(_boundResolver, widget.resolver)) {
+        // Keep a successful player and pending request; only the diagnostic
+        // owner moves. Its retry epoch now belongs to the new scope.
+        _retryEpoch = epoch;
+        return;
+      }
+    }
+    if (_boundReference == widget.mediaPath &&
+        identical(_boundResolver, widget.resolver) &&
+        epoch == _retryEpoch) {
       return;
     }
-    final previous = _controller;
-    setState(() {
-      _controller = controller;
-    });
-    await previous?.dispose();
+    _boundReference = widget.mediaPath;
+    _boundResolver = widget.resolver;
+    _retryEpoch = epoch;
+    widget.diagnostics?.release(this);
+    _lastFailure = null;
+    final previousRequest = _pendingLoader;
+    previousRequest?.cancel();
+    if (previousRequest != null) unawaited(previousRequest.dispose());
+    late final ThemeVideoAssetLoader loader;
+    loader = ThemeVideoAssetLoader(
+      resolver: widget.resolver,
+      reference: widget.mediaPath,
+      diagnostics: widget.diagnostics,
+      onPlaybackFailure: (failure) => _handlePlaybackFailure(loader, failure),
+    );
+    _pendingLoader = loader;
+    unawaited(_loadController(loader));
+  }
+
+  bool _current(ThemeVideoAssetLoader loader) =>
+      mounted && identical(_pendingLoader, loader);
+
+  /// Keeps the active video until the candidate is completely ready.
+  Future<void> _loadController(ThemeVideoAssetLoader loader) async {
+    try {
+      await loader.initialize(
+        muted: widget.muted,
+        loop: widget.loop,
+      );
+      if (!_current(loader)) {
+        await loader.dispose();
+        return;
+      }
+      while (true) {
+        final muted = widget.muted;
+        final loop = widget.loop;
+        await loader.configure(muted: muted, loop: loop, autoplay: true);
+        if (!_current(loader)) {
+          await loader.dispose();
+          return;
+        }
+        if (muted == widget.muted && loop == widget.loop) break;
+      }
+      // No await between this check and publication: a failed candidate must
+      // never dispose the previous successful video.
+      loader.validateReady();
+      final previous = _activeLoader;
+      _pendingLoader = null;
+      _activeLoader = loader;
+      _lastFailure = null;
+      setState(() {});
+      widget.diagnostics?.resolve(
+        loader.reference,
+        purpose: ThemeAssetPurpose.background,
+        owner: this,
+      );
+      if (previous != null) unawaited(previous.dispose());
+    } on ThemeAssetFailure catch (failure) {
+      if (!_current(loader)) return;
+      _pendingLoader = null;
+      _reportFailure(failure.withContext(retainedPrevious: _activeLoader != null));
+    } on FvpCreateCancelledException {
+      // Superseded requests are cancellation, not a damaged resource.
+    } finally {
+      if (!identical(_activeLoader, loader)) unawaited(loader.dispose());
+    }
+  }
+
+  Future<void> _updatePlaybackSettings() async {
+    final loader = _activeLoader;
+    if (!mounted || loader == null) return;
+    try {
+      await loader.configure(muted: widget.muted, loop: widget.loop);
+    } on ThemeAssetFailure catch (failure) {
+      _handlePlaybackFailure(loader, failure);
+    } on FvpCreateCancelledException {
+      // The widget may have been replaced while updating native settings.
+    }
+  }
+
+  void _handlePlaybackFailure(
+    ThemeVideoAssetLoader loader,
+    ThemeAssetFailure failure,
+  ) {
+    if (!mounted || !identical(_activeLoader, loader)) return;
+    _activeLoader = null;
+    _reportFailure(failure);
+    unawaited(loader.dispose());
+  }
+
+  void _reportFailure(ThemeAssetFailure failure) {
+    _lastFailure = failure;
+    widget.diagnostics?.report(failure, owner: this);
+    setState(() {});
   }
 
   /// Releases the active video controller.
   @override
   void dispose() {
-    _loadToken++;
-    unawaited(_controller?.dispose());
+    _boundDiagnostics?.release(this);
+    final pending = _pendingLoader;
+    final active = _activeLoader;
+    _pendingLoader = null;
+    _activeLoader = null;
+    pending?.cancel();
+    active?.cancel();
+    if (pending != null) unawaited(pending.dispose());
+    if (active != null) unawaited(active.dispose());
     super.dispose();
   }
 
   /// Builds the fitted video once the controller is initialized.
   @override
   Widget build(BuildContext context) {
-    final controller = _controller;
-    if (controller == null || !controller.value.isInitialized) {
+    final controller = _activeLoader?.controller;
+    if (controller == null ||
+        !controller.value.isInitialized ||
+        controller.value.hasError) {
       return const SizedBox.expand();
     }
     return SizedBox.expand(
@@ -1329,7 +1659,14 @@ class _VideoThemeBackgroundState extends State<_VideoThemeBackground> {
         child: SizedBox(
           width: controller.value.size.width,
           height: controller.value.size.height,
-          child: VideoPlayer(controller),
+          child: ValueListenableBuilder<VideoPlayerValue>(
+            valueListenable: controller,
+            child: VideoPlayer(controller),
+            builder: (context, value, child) => LiquidGlassSourceAnimation(
+              active: value.isPlaying,
+              child: child!,
+            ),
+          ),
         ),
       ),
     );
@@ -1389,10 +1726,11 @@ String _fontFamilyForSettings({
   required String? systemFontName,
   required String? customFontPath,
 }) {
-  if (fontType == UserPreferencesManager.FONT_TYPE_FILE) {
-    if (customFontPath != null && customFontPath.isNotEmpty) {
-      return _customFontFamilyForPath(customFontPath);
+  if (_usesFontAsset(fontType)) {
+    if (customFontPath == null || customFontPath.isEmpty) {
+      throw StateError('A file font requires a runtime asset reference');
     }
+    return _customFontFamilyForPath(customFontPath);
   }
   if (fontType != UserPreferencesManager.FONT_TYPE_SYSTEM) {
     return _defaultFontFamily;
@@ -1420,6 +1758,9 @@ List<String> _fontFamilyFallbackForSettings({
   required String fontType,
   required String? systemFontName,
 }) {
+  if (_usesFontAsset(fontType)) {
+    return const <String>[];
+  }
   if (fontType != UserPreferencesManager.FONT_TYPE_SYSTEM) {
     return _defaultFontFamilyFallback;
   }
@@ -1431,47 +1772,66 @@ List<String> _fontFamilyFallbackForSettings({
   };
 }
 
-/// Loads every custom font referenced by the active theme snapshot.
-Future<void> _loadCustomFontIfNeeded(
-  ThemePreferenceSnapshot themePreferenceSnapshot,
+/// Prepares a complete snapshot without publishing aliases from a stale load.
+Future<Map<String, String>> _prepareCustomFonts(
+  ThemePreferenceSnapshot snapshot,
 ) async {
-  final fontPaths = <String?>[
-    if (themePreferenceSnapshot.fontType ==
-        UserPreferencesManager.FONT_TYPE_FILE)
-      themePreferenceSnapshot.customFontPath,
-    if (themePreferenceSnapshot.bubbleUserUseCustomFont &&
-        themePreferenceSnapshot.bubbleUserFontType ==
-            UserPreferencesManager.FONT_TYPE_FILE)
-      themePreferenceSnapshot.bubbleUserCustomFontPath,
-    if (themePreferenceSnapshot.bubbleAiUseCustomFont &&
-        themePreferenceSnapshot.bubbleAiFontType ==
-            UserPreferencesManager.FONT_TYPE_FILE)
-      themePreferenceSnapshot.bubbleAiCustomFontPath,
-  ];
-  for (final fontPath in fontPaths) {
-    if (fontPath == null ||
-        fontPath.isEmpty ||
-        _loadedCustomFontPaths.contains(fontPath)) {
-      continue;
+  final paths = _themeFontReferences(snapshot);
+  final families = <String, String>{};
+  for (final path in paths) {
+    if (path == null || path.isEmpty) {
+      throw StateError(
+        'A file font requires a nonempty runtime asset reference',
+      );
     }
-    final fontBytes = await ThemeAssetStore().readBytes(fontPath);
-    final loader = FontLoader(_customFontFamilyForPath(fontPath))
-      ..addFont(Future<ByteData>.value(ByteData.sublistView(fontBytes)));
-    await loader.load();
-    _loadedCustomFontPaths.add(fontPath);
+    if (families.containsKey(path)) continue;
+    final bytes = await ThemeAssetStore().readFontBytes(path);
+    final prepared = await _customFontRegistry.registerBytes(
+      reference: path,
+      bytes: bytes,
+    );
+    families[path] = prepared.family;
   }
+  return Map<String, String>.unmodifiable(families);
 }
 
-/// Builds a stable in-process font family name for a theme font asset.
-String _customFontFamilyForPath(String fontPath) {
-  return 'OperitCustomFont_${fontPath.hashCode.abs()}';
+/// Identifies the exact font assets that require preparation before publication.
+List<String?> _themeFontReferences(ThemePreferenceSnapshot snapshot) =>
+    <String?>[
+      if (_usesFontAsset(snapshot.fontType)) snapshot.customFontPath,
+      if (snapshot.bubbleUserUseCustomFont &&
+          _usesFontAsset(snapshot.bubbleUserFontType))
+        snapshot.bubbleUserCustomFontPath,
+      if (snapshot.bubbleAiUseCustomFont &&
+          _usesFontAsset(snapshot.bubbleAiFontType))
+        snapshot.bubbleAiCustomFontPath,
+    ];
+
+String _customFontFamilyForPath(String path) {
+  final family = _loadedCustomFontFamilies[path];
+  if (family == null) {
+    throw StateError('Theme font has not completed byte preparation: $path');
+  }
+  return family;
 }
 
-final Set<String> _loadedCustomFontPaths = <String>{};
+/// Identifies persisted faces that must be registered before publishing a theme.
+bool _usesFontAsset(String fontType) =>
+    fontType == UserPreferencesManager.FONT_TYPE_FILE ||
+    fontType == UserPreferencesManager.FONT_TYPE_DEVICE;
+
+final ThemeFontRegistry _customFontRegistry = ThemeFontRegistry();
+final Map<String, String> _loadedCustomFontFamilies = <String, String>{};
 
 const String _defaultFontFamily = 'Aptos';
 
-const List<String> _defaultFontFamilyFallback = <String>[
+// Resolve Chinese glyphs explicitly on iOS before other fallback families.
+List<String> get _defaultFontFamilyFallback =>
+    defaultTargetPlatform == TargetPlatform.iOS
+    ? const <String>['PingFang SC', ..._defaultFontFamilyFallbackBase]
+    : _defaultFontFamilyFallbackBase;
+
+const List<String> _defaultFontFamilyFallbackBase = <String>[
   'Calibri',
   'Segoe UI',
   'Microsoft YaHei UI',
@@ -1499,13 +1859,20 @@ const List<String> _monospaceFontFamilyFallback = <String>[
   'monospace',
 ];
 
-const Color _brandSeedColor = Color(0xFFBBDEFB);
+const Color _brandSeedColor = Color(0xFF3B82F6);
 
 /// Builds one Material color scheme and applies the secondary accent color.
 ColorScheme _seedColorScheme(
   Brightness brightness,
   ThemePreferenceSnapshot themePreferenceSnapshot,
 ) {
+  final palette = themePreferenceSnapshot.themePaletteJson;
+  if (palette != null) {
+    return ThemeVisualSpecV1.colorSchemeFromPalette(
+      jsonDecode(palette) as Map<String, dynamic>,
+      brightness,
+    );
+  }
   final seedColor =
       themePreferenceSnapshot.useCustomColors &&
           themePreferenceSnapshot.customPrimaryColor != null
@@ -1516,24 +1883,47 @@ ColorScheme _seedColorScheme(
     brightness: brightness,
     dynamicSchemeVariant: DynamicSchemeVariant.tonalSpot,
   );
-  if (!themePreferenceSnapshot.useCustomColors ||
-      themePreferenceSnapshot.customSecondaryColor == null) {
-    return scheme;
-  }
-  return scheme.copyWith(
-    secondary: Color(themePreferenceSnapshot.customSecondaryColor!),
-  );
-}
 
-SystemUiOverlayStyle _systemUiOverlayStyle(ColorScheme colorScheme) {
-  final iconBrightness = colorScheme.brightness == Brightness.dark
-      ? Brightness.light
-      : Brightness.dark;
-  return SystemUiOverlayStyle(
-    statusBarColor: Colors.transparent,
-    statusBarIconBrightness: iconBrightness,
-    statusBarBrightness: colorScheme.brightness,
-    systemNavigationBarColor: colorScheme.surface,
-    systemNavigationBarIconBrightness: iconBrightness,
-  );
+  final isDark = brightness == Brightness.dark;
+  final customSecondary =
+      themePreferenceSnapshot.useCustomColors &&
+          themePreferenceSnapshot.customSecondaryColor != null
+      ? Color(themePreferenceSnapshot.customSecondaryColor!)
+      : null;
+
+  // Decouple neutral surface tones from seed color to eliminate cyan/teal tint,
+  // providing a clean, professional neutral dark palette and crisp neutral light palette.
+  if (isDark) {
+    return scheme.copyWith(
+      surface: const Color(0xFF161616),
+      surfaceDim: const Color(0xFF121212),
+      surfaceBright: const Color(0xFF262626),
+      surfaceContainerLowest: const Color(0xFF0D0E10),
+      surfaceContainerLow: const Color(0xFF131314),
+      surfaceContainer: const Color(0xFF18181A),
+      surfaceContainerHigh: const Color(0xFF202023),
+      surfaceContainerHighest: const Color(0xFF26272B),
+      outline: const Color(0xFF4C4D53),
+      outlineVariant: const Color(0xFF262628),
+      onSurface: const Color(0xFFECECEC),
+      onSurfaceVariant: const Color(0xFFA0A1A7),
+      secondary: customSecondary ?? scheme.secondary,
+    );
+  } else {
+    return scheme.copyWith(
+      surface: const Color(0xFFFFFFFF),
+      surfaceDim: const Color(0xFFEDEDF0),
+      surfaceBright: const Color(0xFFFFFFFF),
+      surfaceContainerLowest: const Color(0xFFFFFFFF),
+      surfaceContainerLow: const Color(0xFFF7F8F9),
+      surfaceContainer: const Color(0xFFF0F2F5),
+      surfaceContainerHigh: const Color(0xFFE8EAEF),
+      surfaceContainerHighest: const Color(0xFFE0E3E8),
+      outline: const Color(0xFF8F929A),
+      outlineVariant: const Color(0xFFE2E4E8),
+      onSurface: const Color(0xFF1B1C1E),
+      onSurfaceVariant: const Color(0xFF5A5C63),
+      secondary: customSecondary ?? scheme.secondary,
+    );
+  }
 }

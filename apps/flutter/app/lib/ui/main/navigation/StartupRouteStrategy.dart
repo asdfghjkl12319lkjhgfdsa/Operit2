@@ -2,6 +2,9 @@
 
 import 'package:flutter/material.dart';
 
+import '../../features/announcement/RemoteAnnouncementHost.dart';
+import '../../common/ChatBackupDirectoryPanel.dart';
+
 import '../screens/OperitMainScreen.dart';
 
 typedef StartupRouteCompleteCallback = void Function();
@@ -99,13 +102,17 @@ class _StartupRouteHostState extends State<StartupRouteHost> {
           return const StartupRouteShell();
         }
         if (_startupRouteCompleted) {
-          return const OperitMainScreen();
+          return const ChatBackupHost(
+            child: RemoteAnnouncementHost(child: OperitMainScreen()),
+          );
         }
         final decision = snapshot.data;
         if (decision != null) {
           return decision.builder(context, _completeStartupRoute);
         }
-        return const OperitMainScreen();
+        return const ChatBackupHost(
+          child: RemoteAnnouncementHost(child: OperitMainScreen()),
+        );
       },
     );
   }

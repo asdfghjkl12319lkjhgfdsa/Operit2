@@ -1,14 +1,14 @@
 use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::commands::util::read_content_arg;
 use crate::output::CoreCommandOutput;
 use operit_host_api::HostManager::HostManager;
 use operit_providers::market::MarketStatsApiService::{
-    MarketComment, MarketEntryAsset, MarketEntrySummary, MarketEntryVersion, MarketListPage,
-    MarketNotification, MarketStatsApiService,
+    MarketEntryAsset, MarketEntrySummary, MarketListPage, MarketStatsApiService,
+    MARKET_MAX_APP_VERSION, MARKET_MIN_APP_VERSION,
 };
 use operit_runtime::core::application::OperitApplication::OperitApplication;
 use operit_runtime::data::preferences::GitHubAuthPreferences::GitHubAuthPreferences;
@@ -37,11 +37,9 @@ impl MarketCommand {
         }
     }
 
-    /// Creates an authenticated marketplace service client for this command.
+    /// Creates a marketplace service client signed with the application's GitHub login.
     fn api(&self) -> MarketStatsApiService {
-        MarketStatsApiService::new_with_github_token(
-            GitHubAuthPreferences::getInstance().getCurrentAccessToken(),
-        )
+        MarketStatsApiService::new()
     }
 
     /// Returns the GitHub auth preference service used by market writes.
@@ -156,14 +154,11 @@ pub fn run_market_command(
         "my" => print_my_entries(core, output),
         "publish" => run_publish(core, &args[1..], output),
         "install" => {
-            let entry_id = args.get(1).ok_or_else(|| {
-                "usage: operit2 market install <entryId> <clientAppVersion> [versionId]".to_string()
-            })?;
-            let client_app_version = args.get(2).ok_or_else(|| {
-                "usage: operit2 market install <entryId> <clientAppVersion> [versionId]".to_string()
-            })?;
-            let version_id = args.get(3).map(String::as_str);
-            install_entry(core, entry_id, client_app_version, version_id, output)
+            let entry_id = args
+                .get(1)
+                .ok_or_else(|| "usage: operit2 market install <entryId> [versionId]".to_string())?;
+            let version_id = args.get(2).map(String::as_str);
+            install_entry(core, entry_id, version_id, output)
         }
         "download" => {
             let asset_id = args
@@ -197,12 +192,12 @@ fn print_usage(output: &mut CoreCommandOutput) {
         "comment: operit2 market comment <entryId> <body-or-@file>",
         "comment edit: operit2 market comment edit <commentId> <body-or-@file>",
         "comment delete: operit2 market comment delete <commentId>",
-        "publish artifact: operit2 market publish artifact <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [apiVersion-or-]",
-        "publish repo: operit2 market publish repo <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <sourceUrl> <refType> <refName> <installConfig-or-@file> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or->",
-        "publish version artifact: operit2 market publish version artifact <entryId> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-] [apiVersion-or-]",
-        "publish version repo: operit2 market publish version repo <entryId> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or-> <refType> <refName> <installConfig-or-@file> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-]",
+        "publish artifact: operit2 market publish artifact <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <version> <formatVer> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [apiVersion-or-]",
+        "publish repo: operit2 market publish repo <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <sourceUrl> <refType> <refName> <installConfig-or-@file> <version> <formatVer> <changelog-or->",
+        "publish version artifact: operit2 market publish version artifact <entryId> <version> <formatVer> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-] [apiVersion-or-]",
+        "publish version repo: operit2 market publish version repo <entryId> <version> <formatVer> <changelog-or-> <refType> <refName> <installConfig-or-@file> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-]",
         "publish update-entry: operit2 market publish update-entry <entryId> <title-or-> <description-or-@file-or-> <detail-or-@file-or-> <categoryId-or-> <allowPublicUpdates-or->",
-        "install: operit2 market install <entryId> <clientAppVersion> [versionId]",
+        "install: operit2 market install <entryId> [versionId]",
         "download: operit2 market download <assetId>",
     ];
     for line in &lines {
@@ -569,7 +564,7 @@ fn run_comment(
             let comment_id = args.get(1).ok_or_else(|| "usage: operit2 market comment edit <commentId> <body-or-@file>".to_string())?;
             let body_arg = args.get(2).ok_or_else(|| "usage: operit2 market comment edit <commentId> <body-or-@file>".to_string())?;
             require_login(core)?;
-            let body = read_content_arg(body_arg)?;
+            let body = read_content_arg(&core.context, body_arg)?;
             core.api().edit_entry_comment(comment_id, &body)?;
             output.push_stdout_line(format!("Edited market comment: {comment_id}"));
             output.setJsonStdout(json!({
@@ -592,7 +587,7 @@ fn run_comment(
         Some(entry_id) => {
             let body_arg = args.get(1).ok_or_else(|| "usage: operit2 market comment <entryId> <body-or-@file>".to_string())?;
             require_login(core)?;
-            let body = read_content_arg(body_arg)?;
+            let body = read_content_arg(&core.context, body_arg)?;
             let comment_id = core.api().create_entry_comment(entry_id, &body)?;
             output.push_stdout_line(format!("Created market comment: {comment_id}"));
             output.setJsonStdout(json!({
@@ -631,14 +626,13 @@ fn publish_artifact_cli(
     args: &[String],
     output: &mut CoreCommandOutput,
 ) -> Result<(), String> {
-    if args.len() < 20 {
-        return Err("usage: operit2 market publish artifact <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [apiVersion-or-]".to_string());
+    if args.len() < 18 {
+        return Err("usage: operit2 market publish artifact <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <version> <formatVer> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [apiVersion-or-]".to_string());
     }
     require_login(core)?;
-    let description = read_content_arg(&args[2])?;
-    let detail = read_content_arg(&args[3])?;
-    let max_app_ver = parse_optional_string(&args[9]);
-    let changelog = parse_optional_content_arg(&args[10])?;
+    let description = read_content_arg(&core.context, &args[2])?;
+    let detail = read_content_arg(&core.context, &args[3])?;
+    let changelog = parse_optional_content_arg(&core.context, &args[8])?;
     let resp = core.api().publish_artifact(
         &args[0],
         &args[1],
@@ -648,9 +642,11 @@ fn publish_artifact_cli(
         parse_bool_arg(&args[5])?,
         &args[6],
         &args[7],
-        &args[8],
-        max_app_ver,
+        MARKET_MIN_APP_VERSION,
+        Some(MARKET_MAX_APP_VERSION.to_string()),
         changelog,
+        &args[9],
+        &args[10],
         &args[11],
         &args[12],
         &args[13],
@@ -658,9 +654,7 @@ fn publish_artifact_cli(
         &args[15],
         &args[16],
         &args[17],
-        &args[18],
-        &args[19],
-        parse_optional_string_arg(args.get(20)),
+        parse_optional_string_arg(args.get(18)),
     )?;
     write_publish_response(resp, output);
     Ok(())
@@ -672,13 +666,13 @@ fn publish_repo_cli(
     args: &[String],
     output: &mut CoreCommandOutput,
 ) -> Result<(), String> {
-    if args.len() < 14 {
-        return Err("usage: operit2 market publish repo <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <sourceUrl> <refType> <refName> <installConfig-or-@file> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or->".to_string());
+    if args.len() < 12 {
+        return Err("usage: operit2 market publish repo <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <sourceUrl> <refType> <refName> <installConfig-or-@file> <version> <formatVer> <changelog-or->".to_string());
     }
     require_login(core)?;
-    let description = read_content_arg(&args[2])?;
-    let detail = read_content_arg(&args[3])?;
-    let install_config = read_content_arg(&args[9])?;
+    let description = read_content_arg(&core.context, &args[2])?;
+    let detail = read_content_arg(&core.context, &args[3])?;
+    let install_config = read_content_arg(&core.context, &args[9])?;
     let resp = core.api().publish_repo_entry(
         &args[0],
         &args[1],
@@ -692,9 +686,12 @@ fn publish_repo_cli(
         &install_config,
         &args[10],
         &args[11],
-        &args[12],
-        parse_optional_string(&args[13]),
-        parse_optional_content_arg(args.get(14).map(String::as_str).unwrap_or("-"))?,
+        MARKET_MIN_APP_VERSION,
+        Some(MARKET_MAX_APP_VERSION.to_string()),
+        parse_optional_content_arg(
+            &core.context,
+            args.get(12).map(String::as_str).unwrap_or("-"),
+        )?,
     )?;
     write_publish_response(resp, output);
     Ok(())
@@ -719,17 +716,19 @@ fn publish_artifact_version_cli(
     args: &[String],
     output: &mut CoreCommandOutput,
 ) -> Result<(), String> {
-    if args.len() < 15 {
-        return Err("usage: operit2 market publish version artifact <entryId> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-] [apiVersion-or-]".to_string());
+    if args.len() < 13 {
+        return Err("usage: operit2 market publish version artifact <entryId> <version> <formatVer> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-] [apiVersion-or-]".to_string());
     }
     require_login(core)?;
     let resp = core.api().publish_artifact_version(
         &args[0],
         &args[1],
         &args[2],
-        &args[3],
-        parse_optional_string(&args[4]),
-        parse_optional_content_arg(&args[5])?,
+        MARKET_MIN_APP_VERSION,
+        Some(MARKET_MAX_APP_VERSION.to_string()),
+        parse_optional_content_arg(&core.context, &args[3])?,
+        &args[4],
+        &args[5],
         &args[6],
         &args[7],
         &args[8],
@@ -737,14 +736,18 @@ fn publish_artifact_version_cli(
         &args[10],
         &args[11],
         &args[12],
-        &args[13],
-        &args[14],
-        parse_optional_string_arg(args.get(15)),
-        parse_optional_content_arg(args.get(16).map(String::as_str).unwrap_or("-"))?,
-        parse_optional_content_arg(args.get(17).map(String::as_str).unwrap_or("-"))?,
+        parse_optional_string_arg(args.get(13)),
+        parse_optional_content_arg(
+            &core.context,
+            args.get(14).map(String::as_str).unwrap_or("-"),
+        )?,
+        parse_optional_content_arg(
+            &core.context,
+            args.get(15).map(String::as_str).unwrap_or("-"),
+        )?,
+        parse_optional_string_arg(args.get(16)),
+        parse_optional_bool_arg(args.get(17))?,
         parse_optional_string_arg(args.get(18)),
-        parse_optional_bool_arg(args.get(19))?,
-        parse_optional_string_arg(args.get(20)),
     )?;
     write_publish_response(resp, output);
     Ok(())
@@ -756,26 +759,32 @@ fn publish_repo_version_cli(
     args: &[String],
     output: &mut CoreCommandOutput,
 ) -> Result<(), String> {
-    if args.len() < 9 {
-        return Err("usage: operit2 market publish version repo <entryId> <version> <formatVer> <minAppVer> <maxAppVer-or-> <changelog-or-> <refType> <refName> <installConfig-or-@file> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-]".to_string());
+    if args.len() < 7 {
+        return Err("usage: operit2 market publish version repo <entryId> <version> <formatVer> <changelog-or-> <refType> <refName> <installConfig-or-@file> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-]".to_string());
     }
     require_login(core)?;
-    let install_config = read_content_arg(&args[8])?;
+    let install_config = read_content_arg(&core.context, &args[6])?;
     let resp = core.api().publish_repo_version(
         &args[0],
         &args[1],
         &args[2],
-        &args[3],
-        parse_optional_string(&args[4]),
-        parse_optional_content_arg(&args[5])?,
-        &args[6],
-        &args[7],
+        MARKET_MIN_APP_VERSION,
+        Some(MARKET_MAX_APP_VERSION.to_string()),
+        parse_optional_content_arg(&core.context, &args[3])?,
+        &args[4],
+        &args[5],
         &install_config,
-        parse_optional_string_arg(args.get(9)),
-        parse_optional_content_arg(args.get(10).map(String::as_str).unwrap_or("-"))?,
-        parse_optional_content_arg(args.get(11).map(String::as_str).unwrap_or("-"))?,
-        parse_optional_string_arg(args.get(12)),
-        parse_optional_bool_arg(args.get(13))?,
+        parse_optional_string_arg(args.get(7)),
+        parse_optional_content_arg(
+            &core.context,
+            args.get(8).map(String::as_str).unwrap_or("-"),
+        )?,
+        parse_optional_content_arg(
+            &core.context,
+            args.get(9).map(String::as_str).unwrap_or("-"),
+        )?,
+        parse_optional_string_arg(args.get(10)),
+        parse_optional_bool_arg(args.get(11))?,
     )?;
     write_publish_response(resp, output);
     Ok(())
@@ -794,8 +803,8 @@ fn update_entry_cli(
     let resp = core.api().update_entry(
         &args[0],
         parse_optional_string(&args[1]),
-        parse_optional_content_arg(&args[2])?,
-        parse_optional_content_arg(&args[3])?,
+        parse_optional_content_arg(&core.context, &args[2])?,
+        parse_optional_content_arg(&core.context, &args[3])?,
         parse_optional_string(&args[4]),
         parse_optional_bool_str(&args[5])?,
     )?;
@@ -833,129 +842,51 @@ fn write_update_entry_response(
 fn install_entry(
     core: &mut MarketCommand,
     entry_id: &str,
-    client_app_version: &str,
     version_id: Option<&str>,
     output: &mut CoreCommandOutput,
 ) -> Result<(), String> {
     let entry = core.api().get_entry_by_id(entry_id)?;
-    ensure_entry_app_version_supported(&entry, client_app_version, version_id)?;
     match entry.r#type.as_str() {
+        "a2a" => {
+            let version = version_id
+                .and_then(|id| entry.latest_version.as_ref().filter(|v| v.id == id))
+                .or_else(|| {
+                    if version_id.is_none() {
+                        entry.latest_version.as_ref()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or("A2A market version is not available")?;
+            let config = version
+                .install_config
+                .as_deref()
+                .or_else(|| {
+                    entry
+                        .repo_version
+                        .as_ref()
+                        .and_then(|repo| repo.install_config.as_deref())
+                })
+                .ok_or("A2A market entry has no installation configuration")?;
+            let repository =
+                operit_tools::tools::a2a::A2ARepository::A2ARepository::new(core.context.clone())?;
+            let ids = repository.import_market(config, &entry.id, &version.id)?;
+            core.tool_handler
+                .getOrCreatePackageManager()
+                .lock()
+                .map_err(|e| e.to_string())?
+                .reloadA2APackages();
+            output.push_stdout_line(format!("Installed A2A: {}", ids.join(", ")));
+            output.setJsonStdout(
+                json!({"type":"a2a", "ids":ids, "entryId":entry.id, "versionId":version.id}),
+            );
+            Ok(())
+        }
         "skill" => install_skill_from_entry(core, entry, output),
         "mcp" => install_mcp_from_entry(core, entry, output),
         "package" | "script" => install_artifact_from_entry(core, entry, version_id, output),
         other => Err(format!("unknown market type: {other}")),
     }
-}
-
-/// Describes the numeric app version used by marketplace compatibility metadata.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct MarketAppVersion {
-    major: u64,
-    minor: u64,
-    patch: u64,
-    build: u64,
-}
-
-/// Rejects an installation when the selected marketplace version excludes the client version.
-fn ensure_entry_app_version_supported(
-    entry: &MarketEntrySummary,
-    client_app_version: &str,
-    version_id: Option<&str>,
-) -> Result<(), String> {
-    let client_version = parse_market_app_version(client_app_version, "客户端版本")?;
-    let target_version = resolve_market_install_version(entry, version_id)?;
-
-    let minimum_value = target_version.min_app_ver.trim();
-    if !minimum_value.is_empty() {
-        let minimum_version = parse_market_app_version(minimum_value, "最低支持版本")?;
-        if client_version < minimum_version {
-            return Err(format!(
-                "无法下载：客户端版本 {client_app_version} 低于该资源要求的最低版本 {minimum_value}。请更新客户端后再下载。"
-            ));
-        }
-    }
-
-    if let Some(maximum_value) = target_version
-        .max_app_ver
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let maximum_version = parse_market_app_version(maximum_value, "最高支持版本")?;
-        if client_version > maximum_version {
-            return Err(format!(
-                "无法下载：客户端版本 {client_app_version} 高于该资源最高支持的版本 {maximum_value}。请使用受支持的客户端版本。"
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Resolves the precise marketplace version requested for one installation.
-fn resolve_market_install_version<'a>(
-    entry: &'a MarketEntrySummary,
-    version_id: Option<&str>,
-) -> Result<&'a MarketEntryVersion, String> {
-    match version_id.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(requested_version_id) => entry
-            .versions
-            .iter()
-            .find(|version| version.id == requested_version_id)
-            .ok_or_else(|| {
-                format!(
-                    "market entry has no version metadata for requested version: {requested_version_id}"
-                )
-            }),
-        None => entry
-            .latest_version
-            .as_ref()
-            .ok_or_else(|| "market entry has no latest version metadata".to_string()),
-    }
-}
-
-/// Parses one marketplace app-version value using x.y.z or x.y.z+n notation.
-fn parse_market_app_version(value: &str, label: &str) -> Result<MarketAppVersion, String> {
-    let normalized = value.trim();
-    let mut version_parts = normalized.split('+');
-    let core = version_parts
-        .next()
-        .ok_or_else(|| format!("{label} must use x.y.z or x.y.z+n format"))?;
-    let build = match (version_parts.next(), version_parts.next()) {
-        (None, None) => 0,
-        (Some(value), None) => parse_market_app_version_component(Some(value), label, "build")?,
-        (_, Some(_)) => return Err(format!("{label} must use x.y.z or x.y.z+n format: {value}")),
-    };
-    let mut parts = core.split('.');
-    let major = parse_market_app_version_component(parts.next(), label, "major")?;
-    let minor = parse_market_app_version_component(parts.next(), label, "minor")?;
-    let patch = parse_market_app_version_component(parts.next(), label, "patch")?;
-    if parts.next().is_some() {
-        return Err(format!("{label} must use x.y.z or x.y.z+n format: {value}"));
-    }
-    Ok(MarketAppVersion {
-        major,
-        minor,
-        patch,
-        build,
-    })
-}
-
-/// Parses one numeric component from marketplace compatibility metadata.
-fn parse_market_app_version_component(
-    value: Option<&str>,
-    label: &str,
-    component: &str,
-) -> Result<u64, String> {
-    let value = value.ok_or_else(|| format!("{label} must use x.y.z or x.y.z+n format"))?;
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!(
-            "{label} {component} component must be numeric: {value}"
-        ));
-    }
-    value
-        .parse::<u64>()
-        .map_err(|error| format!("{label} {component} component is invalid: {error}"))
 }
 
 /// Installs a skill marketplace entry from its repository source.
@@ -1070,7 +1001,9 @@ fn install_artifact_from_entry(
     let temp_file = download_asset_to_temp_file(core, asset)?;
     let package_manager = core.package_manager();
     let import_result = package_manager.add_from_external(&temp_file.to_string_lossy());
-    fs::remove_file(&temp_file)
+    core.context
+        .vfs()?
+        .deleteFile(&temp_file.to_string_lossy(), false)
         .map_err(|error| format!("failed to remove market temp file: {error}"))?;
     let import_result = import_result?;
     write_external_package_import_result(&import_result, output);
@@ -1119,7 +1052,10 @@ fn download_asset_to_temp_file(
     let bytes = core.api().download_asset(&asset.id)?;
     verify_market_asset_sha256(&bytes, &asset.sha256)?;
     let tmp = market_asset_temp_path(asset)?;
-    fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    core.context
+        .vfs()?
+        .writeFileBytes(&tmp.to_string_lossy(), &bytes)
+        .map_err(|e| e.to_string())?;
     Ok(tmp)
 }
 
@@ -1151,7 +1087,7 @@ fn market_asset_temp_path(asset: &MarketEntryAsset) -> Result<PathBuf, String> {
     if asset_name.contains('/') || asset_name.contains('\\') {
         return Err("market asset name must not contain a path".to_string());
     }
-    let mut path = env::temp_dir();
+    let mut path = PathBuf::from("/operitapp/data/temp/clean_on_exit");
     path.push(format!("operit_market_{}_{}", current_millis(), asset_name));
     Ok(path)
 }
@@ -1176,7 +1112,12 @@ fn sanitize_id(title: &str) -> String {
 
 /// Requires the GitHub OAuth broker session needed by market write operations.
 fn require_login(core: &mut MarketCommand) -> Result<(), String> {
-    if core.github_auth().getCurrentAccessToken().is_some() {
+    if core
+        .github_auth()
+        .getCurrentAccessToken()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
         Ok(())
     } else {
         Err("GitHub login required.".to_string())
@@ -1229,9 +1170,12 @@ fn parse_optional_string_arg(value: Option<&String>) -> Option<String> {
 }
 
 /// Resolves an optional literal or file-backed content argument.
-fn parse_optional_content_arg(value: &str) -> Result<Option<String>, String> {
+fn parse_optional_content_arg(
+    context: &HostManager,
+    value: &str,
+) -> Result<Option<String>, String> {
     match parse_optional_string(value) {
-        Some(raw) => read_content_arg(&raw).map(Some),
+        Some(raw) => read_content_arg(context, &raw).map(Some),
         None => Ok(None),
     }
 }
@@ -1277,116 +1221,48 @@ fn current_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
 
     use operit_host_api::HostManager::{setDefaultHttpHost, HostManager};
     use operit_host_api::{
-        HostError, HostResult, HttpHost, HttpRequestData, HttpResponseData, RuntimeStorageEntry,
-        RuntimeStorageHost,
+        HostError, HostResult, HttpHost, HttpRequestData, HttpResponseData,
+        HttpStreamChunkCallback, HttpStreamClosedCallback, HttpStreamHost,
+        HttpStreamOpenedCallback,
     };
+    use operit_host_native_filesystem::PosixFileSystemHost;
+    use operit_host_native_scheduler::{
+        NativeHostJavaScriptRuntimeHost, NativeHostRuntimeTaskSchedulerHost,
+    };
+    use operit_host_native_storage::NativeRuntimeStorageHost;
 
-    #[derive(Clone)]
-    struct MemoryStorageHost {
-        files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
-        runtime_root: PathBuf,
-        workspace_root: PathBuf,
+    /// Returns one process-wide temporary root so global runtime defaults stay consistent while
+    /// the market tests run in parallel.
+    fn market_test_root() -> PathBuf {
+        static ROOT: OnceLock<PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root =
+                std::env::temp_dir().join(format!("operit_market_test_{}", current_millis()));
+            std::fs::create_dir_all(root.join("runtime")).expect("create test runtime root");
+            std::fs::create_dir_all(root.join("workspaces")).expect("create test workspace root");
+            root
+        })
+        .clone()
     }
 
-    impl MemoryStorageHost {
-        /// Creates isolated runtime and workspace roots for one market command test.
-        fn new(root: PathBuf) -> Self {
-            let runtime_root = root.join(RUNTIME_ROOT_DIR_PATH);
-            let workspace_root = root.join(WORKSPACE_DIR_PATH);
-            std::fs::create_dir_all(&runtime_root).expect("create test runtime root");
-            std::fs::create_dir_all(&workspace_root).expect("create test workspace root");
-            Self {
-                files: Arc::new(Mutex::new(BTreeMap::new())),
-                runtime_root,
-                workspace_root,
-            }
-        }
-    }
-
-    impl RuntimeStorageHost for MemoryStorageHost {
-        fn runtimeRootDir(&self) -> Option<PathBuf> {
-            Some(self.runtime_root.clone())
-        }
-
-        fn workspaceRootDir(&self) -> Option<PathBuf> {
-            Some(self.workspace_root.clone())
-        }
-
-        fn readBytes(&self, path: &str) -> HostResult<Vec<u8>> {
-            let files = self
-                .files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?;
-            files
-                .get(path)
-                .cloned()
-                .ok_or_else(|| HostError::new(format!("missing runtime storage file: {path}")))
-        }
-
-        fn writeBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
-            let mut files = self
-                .files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?;
-            files.insert(path.to_string(), content.to_vec());
-            Ok(())
-        }
-
-        /// Appends bytes to one market-command test storage entry.
-        fn appendBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
-            self.files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?
-                .entry(path.to_string())
-                .or_default()
-                .extend_from_slice(content);
-            Ok(())
-        }
-
-        fn delete(&self, path: &str, _recursive: bool) -> HostResult<()> {
-            let mut files = self
-                .files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?;
-            files.remove(path);
-            Ok(())
-        }
-
-        fn exists(&self, path: &str) -> HostResult<bool> {
-            let files = self
-                .files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?;
-            Ok(files.contains_key(path))
-        }
-
-        fn list(&self, prefix: &str) -> HostResult<Vec<RuntimeStorageEntry>> {
-            let files = self
-                .files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?;
-            Ok(files
-                .iter()
-                .filter(|(path, _)| path.starts_with(prefix))
-                .map(|(path, content)| RuntimeStorageEntry {
-                    path: path.clone(),
-                    isDirectory: false,
-                    size: content.len() as i64,
-                })
-                .collect())
-        }
-    }
-
-    /// Creates an application configured with isolated runtime storage for market commands.
+    /// Creates an application with native test hosts rooted in the shared temporary directory.
     fn market_test_application(root: PathBuf) -> OperitApplication {
-        let storage_host = Arc::new(MemoryStorageHost::new(root));
-        let mut host_manager = HostManager::new();
-        host_manager.runtimeStorageHost = Some(storage_host);
+        let runtime_root = root.join("runtime");
+        let workspace_root = root.join("workspaces");
+        let storage_host = Arc::new(NativeRuntimeStorageHost::new(runtime_root, workspace_root));
+        let mut host_manager =
+            HostManager::withFileSystemHost(Arc::new(PosixFileSystemHost::new()));
+        host_manager.hostJavaScriptRuntimeHost =
+            Some(Arc::new(NativeHostJavaScriptRuntimeHost::new()));
+        host_manager.hostRuntimeTaskSchedulerHost =
+            Some(Arc::new(NativeHostRuntimeTaskSchedulerHost::new()));
+        host_manager.runtimeStorageHost = Some(storage_host.clone());
+        host_manager.runtimeSqliteHost = Some(storage_host);
         OperitApplication::newWithContext(host_manager)
     }
 
@@ -1416,7 +1292,35 @@ mod tests {
 
     struct ReqwestTestHttpHost;
 
+    impl HttpStreamHost for ReqwestTestHttpHost {
+        /// Market command tests only exercise buffered requests, not streaming responses.
+        fn openHttpByteStream(
+            &self,
+            _streamId: String,
+            _request: HttpRequestData,
+            _onOpened: HttpStreamOpenedCallback,
+            _onChunk: HttpStreamChunkCallback,
+            _onClosed: HttpStreamClosedCallback,
+        ) -> HostResult<()> {
+            Err(HostError::new(
+                "market test HTTP byte streams are not configured",
+            ))
+        }
+
+        /// No streaming request is opened by these tests, so there is no stream to close.
+        fn closeHttpByteStream(&self, _streamId: &str) -> HostResult<()> {
+            Err(HostError::new(
+                "market test HTTP byte stream close is not configured",
+            ))
+        }
+    }
+
     impl HttpHost for ReqwestTestHttpHost {
+        /// Declares the image delivery supported by this HTTP host.
+        fn imageDelivery(&self) -> operit_host_api::HttpImageDelivery {
+            operit_host_api::HttpImageDelivery::Bytes
+        }
+
         /// Executes one test HTTP request through reqwest.
         fn executeHttpRequest(&self, request: HttpRequestData) -> HostResult<HttpResponseData> {
             let method = reqwest::Method::from_bytes(request.method.as_bytes())
@@ -1484,10 +1388,12 @@ mod tests {
     }
 
     fn run_market_cli(args: &[&str]) {
-        let mut root = std::env::temp_dir();
-        root.push(format!("operit_market_test_{}", current_millis()));
-        std::fs::create_dir_all(&root).expect("create test runtime root");
-        let application = market_test_application(root);
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("market test lock must not be poisoned");
+        let application = market_test_application(market_test_root());
         let mut out = CoreCommandOutput::new();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         // Tests that parsing does not panic; network/IO errors are OK at this level.

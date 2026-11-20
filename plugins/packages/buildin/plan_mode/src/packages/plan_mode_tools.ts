@@ -1,5 +1,6 @@
 /* METADATA
 {
+    "api_version": "2.0.0",
     "name": "plan_mode_tools",
     "display_name": {
         "zh": "计划模式工具",
@@ -13,6 +14,7 @@
     "tools": [
         {
             "name": "get_plan",
+            "display": {"label": {"zh": "读取当前计划", "en": "Read current plan"}, "icon": "file"},
             "description": {
                 "zh": "读取当前计划内容。",
                 "en": "Read the current plan content."
@@ -21,6 +23,7 @@
         },
         {
             "name": "complete_plan",
+            "display": {"label": {"zh": "完成当前计划", "en": "Complete current plan"}, "icon": "edit"},
             "description": {
                 "zh": "在所有计划项都真正完成后，完成当前计划。",
                 "en": "Complete the current plan after every planned item is truly done."
@@ -42,7 +45,7 @@ function toErrorText(error: Error | string | null | undefined): string {
   return error || "error";
 }
 
-/** Completes the tool call with the current workspace plan content. */
+/** Completes the tool call with the current plugin-owned chat plan content. */
 export async function get_plan(): Promise<void> {
   const text = resolvePlanModeI18n();
   const chatId = getChatId();
@@ -78,7 +81,7 @@ export async function get_plan(): Promise<void> {
   }
 }
 
-/** Deletes the current workspace plan after implementation completes. */
+/** Deletes the current plugin-owned chat plan after implementation completes. */
 export async function complete_plan(): Promise<void> {
   const chatId = getChatId();
   if (chatId === undefined) {

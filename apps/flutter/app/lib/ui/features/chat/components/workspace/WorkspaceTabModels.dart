@@ -2,6 +2,8 @@
 
 import 'package:flutter/material.dart';
 import 'package:operit2/core/web_visit/WebVisitModels.dart';
+import '../../../../common/contributions/PluginWorkspacePresentation.dart';
+import 'file_preview/WorkspaceTextDocument.dart';
 
 enum WorkspaceTabKind {
   home,
@@ -29,6 +31,7 @@ enum WorkspaceFilePreviewKind {
 }
 
 class WorkspaceTab {
+  /// Creates a workspace tab with optional persistent text editing state.
   const WorkspaceTab({
     required this.kind,
     required this.title,
@@ -36,7 +39,7 @@ class WorkspaceTab {
     this.closable = true,
     this.filePath,
     this.absolutePath,
-    this.fileContent,
+    this.textDocument,
     this.previewKind,
     this.url,
     this.userAgent,
@@ -46,9 +49,11 @@ class WorkspaceTab {
     this.terminalSessionId,
     this.terminalType,
     this.terminalWorkingDir,
+    this.browserSessionId,
     this.pluginEntryId,
     this.pluginPackageName,
     this.pluginUiModuleId,
+    this.pluginPresentation,
     this.identityToken = '',
   });
 
@@ -58,7 +63,7 @@ class WorkspaceTab {
   final bool closable;
   final String? filePath;
   final String? absolutePath;
-  final String? fileContent;
+  final WorkspaceTextDocument? textDocument;
   final WorkspaceFilePreviewKind? previewKind;
   final String? url;
   final String? userAgent;
@@ -68,10 +73,49 @@ class WorkspaceTab {
   final String? terminalSessionId;
   final String? terminalType;
   final String? terminalWorkingDir;
+  final String? browserSessionId;
   final String? pluginEntryId;
   final String? pluginPackageName;
   final String? pluginUiModuleId;
+  final PluginWorkspacePresentation? pluginPresentation;
   final String identityToken;
+
+  WorkspaceTab withFileOpener(
+    PluginWorkspacePresentation? opener,
+    WorkspaceTextDocument? document,
+  ) => WorkspaceTab(
+    kind: kind,
+    title: title,
+    icon: icon,
+    closable: closable,
+    filePath: filePath,
+    absolutePath: absolutePath,
+    previewKind: previewKind,
+    textDocument: document,
+    pluginPresentation: opener,
+    identityToken: identityToken,
+  );
+
+  /// Preserves an open file's draft and zoom when its path changes.
+  WorkspaceTab withFileLocation(String path, String? absolute) {
+    assert(
+      kind == WorkspaceTabKind.filePreview || kind == WorkspaceTabKind.files,
+    );
+    final preview = kind == WorkspaceTabKind.filePreview
+        ? workspacePreviewKindForPath(path)
+        : null;
+    return WorkspaceTab(
+      kind: kind,
+      title: path.split('/').last,
+      icon: preview == null ? icon : workspacePreviewIconForKind(preview),
+      closable: closable,
+      filePath: path,
+      absolutePath: absolute,
+      textDocument: textDocument,
+      previewKind: preview,
+      identityToken: identityToken,
+    );
+  }
 }
 
 /// Carries a regular workspace tab through an internal pane drag operation.
@@ -92,6 +136,8 @@ WorkspaceFilePreviewKind workspacePreviewKindForPath(String path) {
     case 'gif':
     case 'bmp':
     case 'webp':
+    case 'heic':
+    case 'heif':
     case 'svg':
       return WorkspaceFilePreviewKind.image;
     case 'mp3':

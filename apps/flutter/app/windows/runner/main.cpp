@@ -18,8 +18,10 @@
 #include <vector>
 
 #include "crash_channel.h"
+#include "native_crash_report.h"
 #include "engine_channel_lifetime.h"
 #include "flutter_window.h"
+#include "keyboard_message_normalizer.h"
 #include "operit_runtime_channel.h"
 #include "system_audio_input_channel.h"
 #include "utils.h"
@@ -60,11 +62,13 @@ void ConfigureOperitWindowsToastIdentity() {
       ::SHGetKnownFolderPath(FOLDERID_StartMenu, KF_FLAG_CREATE, nullptr,
                              &start_menu_path),
       "Failed to resolve the Windows Start Menu path.");
+  const std::filesystem::path shortcut_directory =
+      std::filesystem::path(start_menu_path) / L"Programs" / L"Operit2";
   const std::filesystem::path shortcut_path =
-      std::filesystem::path(start_menu_path) / L"Programs" / L"Operit2.lnk";
+      shortcut_directory / L"Operit2.lnk";
   ::CoTaskMemFree(start_menu_path);
   std::error_code directory_error;
-  std::filesystem::create_directories(shortcut_path.parent_path(), directory_error);
+  std::filesystem::create_directories(shortcut_directory, directory_error);
   if (directory_error) {
     throw std::runtime_error("Failed to create the Windows Start Menu shortcut directory.");
   }
@@ -102,6 +106,15 @@ void ConfigureOperitWindowsToastIdentity() {
   RequireWindowsToastSuccess(
       persist_file->Save(shortcut_path.c_str(), TRUE),
       "Failed to save the Operit Start Menu shortcut.");
+
+  RequireWindowsToastSuccess(
+      shell_link->SetArguments(L"--data-rescue"),
+      "Failed to set the Operit data rescue shortcut arguments.");
+  const std::filesystem::path rescue_shortcut_path =
+      shortcut_directory / L"Operit2 Data Rescue.lnk";
+  RequireWindowsToastSuccess(
+      persist_file->Save(rescue_shortcut_path.c_str(), TRUE),
+      "Failed to save the Operit data rescue shortcut.");
 }
 
 /// Registers this executable as the handler for Operit notification protocol URLs.
@@ -186,9 +199,8 @@ bool ForwardNotificationActivationToExistingWindow(const std::string& uri) {
 }  // namespace
 
 /// Presents the native crash dialog for unhandled Windows exceptions.
-LONG WINAPI OperitUnhandledExceptionFilter(EXCEPTION_POINTERS*) {
-  ShowOperitWindowsCrashScreen("Unhandled Windows exception outside Flutter.");
-  return EXCEPTION_EXECUTE_HANDLER;
+LONG WINAPI OperitUnhandledExceptionFilter(EXCEPTION_POINTERS* exception) {
+  return ReportOperitWindowsNativeCrash(exception);
 }
 
 /// Runs the Windows Flutter application message loop.
@@ -205,24 +217,53 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     // Initialize COM, so that it is available for use in the library and/or
     // plugins.
     ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    ConfigureOperitWindowsToastIdentity();
-    ConfigureOperitNotificationProtocol();
-
     std::vector<std::string> command_line_arguments =
         GetCommandLineArguments();
+    const bool data_rescue = std::find(command_line_arguments.begin(),
+        command_line_arguments.end(), "--data-rescue") != command_line_arguments.end();
+    if (!data_rescue) {
+      ConfigureOperitWindowsToastIdentity();
+      ConfigureOperitNotificationProtocol();
+    }
     // SDK activations share the primary process even while its Core is initializing.
-    const bool sdk_activation = std::find(command_line_arguments.begin(),
+    const bool sdk_activation = !data_rescue && std::find(command_line_arguments.begin(),
         command_line_arguments.end(), "operit2://plugin-sdk") != command_line_arguments.end();
     const bool child_window = !command_line_arguments.empty() &&
         command_line_arguments.front() == "multi_window";
     HANDLE sdk_owner = nullptr;
-    if (!child_window) {
+    if (!data_rescue && !child_window) {
       sdk_owner = ::CreateMutexW(nullptr, FALSE, L"Local\\Operit2.PluginSdkOwner");
       if (sdk_owner == nullptr) {
         throw std::runtime_error("Cannot create Operit Plugin SDK process identity");
       }
       const bool existing_owner = ::GetLastError() == ERROR_ALREADY_EXISTS;
-      if (sdk_activation && existing_owner) {
+      if (existing_owner) {
+        if (sdk_activation) {
+          ::CloseHandle(sdk_owner);
+          ::CoUninitialize();
+          return EXIT_SUCCESS;
+        }
+        // A duplicate launch must not start a second Core with the same identity:
+        // a paired phone accepts one authenticated channel per peer, so two Cores
+        // evict each other in a sync retry loop. Hand off to the running instance,
+        // waiting briefly for its window while it finishes starting up.
+        const std::optional<std::string> pending_notification =
+            NotificationActivationArgument(command_line_arguments);
+        for (int attempt = 0; attempt < 100; ++attempt) {
+          if (pending_notification.has_value()) {
+            if (ForwardNotificationActivationToExistingWindow(*pending_notification)) {
+              break;
+            }
+          } else {
+            HWND window = ::FindWindowW(L"FLUTTER_RUNNER_WIN32_WINDOW", L"Operit2");
+            if (window != nullptr) {
+              ::ShowWindow(window, ::IsIconic(window) ? SW_RESTORE : SW_SHOW);
+              ::SetForegroundWindow(window);
+              break;
+            }
+          }
+          ::Sleep(100);
+        }
         ::CloseHandle(sdk_owner);
         ::CoUninitialize();
         return EXIT_SUCCESS;
@@ -230,7 +271,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     }
     const std::optional<std::string> notification_activation =
         NotificationActivationArgument(command_line_arguments);
-    if (notification_activation.has_value() &&
+    if (!data_rescue && notification_activation.has_value() &&
         ForwardNotificationActivationToExistingWindow(*notification_activation)) {
       ::CoUninitialize();
       return EXIT_SUCCESS;
@@ -240,7 +281,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
     project.set_dart_entrypoint_arguments(std::move(command_line_arguments));
 
-    FlutterWindow window(project);
+    FlutterWindow window(project, data_rescue);
     Win32Window::Point origin(10, 10);
     Win32Window::Size size(1280, 720);
     if (!window.Create(L"Operit2", origin, size)) {
@@ -250,14 +291,16 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
     ::MSG msg;
     while (::GetMessage(&msg, nullptr, 0, 0)) {
+      // TranslateMessage must see the same scan code as Flutter so generated
+      // WM_CHAR events preserve the injected key's physical identity too.
+      msg.lParam = NormalizeOperitKeyboardMessage(msg.message, msg.wParam,
+                                                 msg.lParam);
       ::TranslateMessage(&msg);
       ::DispatchMessage(&msg);
     }
 
-    ShutdownOperitRuntimeChannel();
-    ShutdownAllOperitEngineChannels();
-    ShutdownSystemAudioInputChannel();
-    ShutdownOperitCrashChannel();
+    // Destroy all Flutter windows while their host services and COM are alive.
+    window.Destroy();
     ::CoUninitialize();
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {

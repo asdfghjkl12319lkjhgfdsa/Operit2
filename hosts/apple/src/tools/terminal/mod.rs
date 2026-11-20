@@ -1,3 +1,8 @@
+// Share the tested ARM64 protocol and session lifecycle with the iOS owner.
+#[cfg(all(feature = "arm64-runtime", target_os = "macos", target_arch = "aarch64"))]
+#[path = "../../../../ios/src/terminal.rs"]
+mod arm64;
+
 #[cfg(target_os = "macos")]
 #[path = "terminal_macos.rs"]
 mod platform;
@@ -23,6 +28,17 @@ mod ios {
     }
 
     impl TerminalHost for AppleTerminalHost {
+        /// Rejects directory resolution because this terminal host is unavailable.
+        fn resolveWorkingDirectory(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &dyn Fn(&str) -> HostResult<String>,
+        ) -> HostResult<String> {
+            Err(HostError::new("iOS does not expose a local PTY host"))
+        }
+
         fn terminalInfo(&self) -> HostResult<TerminalInfo> {
             Err(HostError::new("iOS does not expose a local PTY host"))
         }
@@ -64,6 +80,11 @@ mod ios {
         }
 
         fn createOrGetSession(&self, _: &str) -> HostResult<TerminalSessionInfo> {
+            Err(HostError::new("iOS does not expose a local PTY host"))
+        }
+
+        /// Reports that this host cannot create an explicitly typed terminal session.
+        fn createOrGetTypedSession(&self, _: &str, _: &str) -> HostResult<TerminalSessionInfo> {
             Err(HostError::new("iOS does not expose a local PTY host"))
         }
 
@@ -120,6 +141,17 @@ mod non_apple_target {
     }
 
     impl TerminalHost for AppleTerminalHost {
+        /// Rejects directory resolution because this terminal host is unavailable.
+        fn resolveWorkingDirectory(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &dyn Fn(&str) -> HostResult<String>,
+        ) -> HostResult<String> {
+            Err(HostError::new("Apple terminal host is available only on iOS or macOS"))
+        }
+
         fn terminalInfo(&self) -> HostResult<TerminalInfo> {
             Err(HostError::new(
                 "Apple terminal host is available only on iOS or macOS",
@@ -175,6 +207,13 @@ mod non_apple_target {
         }
 
         fn createOrGetSession(&self, _: &str) -> HostResult<TerminalSessionInfo> {
+            Err(HostError::new(
+                "Apple terminal host is available only on iOS or macOS",
+            ))
+        }
+
+        /// Reports that this host cannot create an explicitly typed terminal session.
+        fn createOrGetTypedSession(&self, _: &str, _: &str) -> HostResult<TerminalSessionInfo> {
             Err(HostError::new(
                 "Apple terminal host is available only on iOS or macOS",
             ))

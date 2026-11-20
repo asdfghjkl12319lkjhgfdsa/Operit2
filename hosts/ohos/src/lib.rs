@@ -7,6 +7,7 @@ use operit_host_api::HostManager::HostManager;
 
 mod audio_playback;
 mod bluetooth;
+pub mod documents;
 mod filesystem;
 mod http;
 mod local_inference;
@@ -75,6 +76,8 @@ pub fn createRuntimeHostManager(
         systemOperationHost,
     );
     context.httpHost = Some(Arc::new(OhosHttpHost::new()));
+    context.httpServerHost = Some(Arc::new(operit_host_native_common::NativeHttpServerHost));
+    context.tcpHost = Some(Arc::new(operit_host_native_common::NativeTcpHost));
     context.serialPortHost = Some(Arc::new(operit_host_native_common::NativeSerialPortHost));
     context.webSocketHost = Some(Arc::new(OhosHttpHost::new()));
     context.managedRuntimeHost = Some(managedRuntimeHost);
@@ -82,7 +85,7 @@ pub fn createRuntimeHostManager(
     context.runtimeSqliteHost = Some(runtimeSqliteHost);
     context = context.withArchiveStagingHost(archiveStagingHost);
     context = context.withRuntimeStorageWriteHost(runtimeStorageWriteHost);
-    context = context.withLocalInferenceHost(Arc::new(OhosLocalInferenceHost::new()));
+    context = context.withLocalInferenceHost(Arc::new(operit_host_local_inference::NativeLocalInferenceHost::withSpeech(Arc::new(OhosLocalInferenceHost::new()))));
     context = context
         .withHostRuntimeEventSchedulerHost(Arc::new(OhosHostRuntimeEventSchedulerHost::new()));
     context = context.withHostJavaScriptRuntimeHost(Arc::new(OhosHostJavaScriptRuntimeHost::new()));

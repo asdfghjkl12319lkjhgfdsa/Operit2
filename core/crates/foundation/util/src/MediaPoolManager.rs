@@ -1,5 +1,6 @@
+use operit_host_api::AtomicCounter::AtomicU64;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -50,7 +51,7 @@ impl MediaPoolManager {
                 .lock()
                 .expect("MediaPool mutex poisoned")
                 .max_pool_size = value;
-            AppLogger::d(TAG, &format!("pool size limit updated: {value}"));
+            AppLogger::v_with_level(TAG, &format!("pool size limit updated: {value}"), crate::AppLogger::VERBOSE_LEVEL_4);
         }
     }
 

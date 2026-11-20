@@ -6,10 +6,10 @@ import 'package:flutter/material.dart';
 
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as generated;
 import '../../../../l10n/generated/app_localizations.dart';
+import '../../../common/device/DeviceSphere.dart';
 
 part 'DeviceSpaceGraphLayout.dart';
 part 'DeviceSpaceGraphPainter.dart';
-part 'DeviceSpaceGraphSphere.dart';
 
 /// One continuous scene: space membership unfolds into recorded connections.
 class DeviceSpaceGraph extends StatefulWidget {
@@ -426,6 +426,7 @@ class _DeviceSpaceGraphState extends State<DeviceSpaceGraph>
       motion: motion,
       frame: () => layout.frameAt(index, _mode.value, _orbit.value),
       current: current,
+      incompatible: _deviceVersionMismatch(widget.topology, device),
       selected: _selectedId == id,
       topologyMode: _topologyMode,
       reduceMotion: _reduceMotion,
@@ -504,6 +505,7 @@ class _GraphDeviceNode extends StatefulWidget {
     required this.motion,
     required this.frame,
     required this.current,
+    required this.incompatible,
     required this.selected,
     required this.topologyMode,
     required this.reduceMotion,
@@ -517,6 +519,7 @@ class _GraphDeviceNode extends StatefulWidget {
   final Listenable motion;
   final ValueGetter<_GraphNodeFrame> frame;
   final bool current;
+  final bool incompatible;
   final bool selected;
   final bool topologyMode;
   final bool reduceMotion;
@@ -575,7 +578,11 @@ class _GraphDeviceNodeState extends State<_GraphDeviceNode>
     final metrics = widget.metrics;
     final highlighted = _hovered || _focused || widget.selected;
     final active = current || widget.device.online;
-    final accent = active ? scheme.primary : scheme.outline;
+    final accent = widget.incompatible
+        ? deviceCompatibilityColor(scheme)
+        : active
+        ? scheme.primary
+        : scheme.outline;
     final duration = widget.reduceMotion
         ? Duration.zero
         : const Duration(milliseconds: 200);
@@ -585,7 +592,9 @@ class _GraphDeviceNodeState extends State<_GraphDeviceNode>
     final action = widget.topologyMode
         ? copy.showRelationships
         : copy.showTopology;
-    final status = widget.device.online
+    final status = widget.incompatible
+        ? deviceCompatibilityLabel(context)
+        : widget.device.online
         ? l10n.settingsRuntimePairedOnline
         : l10n.settingsRuntimePairedOffline;
     final diameter = current ? metrics.currentDiameter : metrics.remoteDiameter;
@@ -635,17 +644,18 @@ class _GraphDeviceNodeState extends State<_GraphDeviceNode>
                 child: Stack(
                   clipBehavior: Clip.none,
                   children: <Widget>[
-                    _GraphDeviceSphere(
+                    DeviceSphere(
                       diameter: diameter,
-                      icon: _deviceIcon(widget.device.platform),
+                      icon: devicePlatformIcon(widget.device.platform),
                       iconSize: current
                           ? metrics.currentIcon
                           : metrics.remoteIcon,
                       current: current,
                       online: widget.device.online,
+                      incompatible: widget.incompatible,
                       motion: widget.motion,
                       elevation: _elevation,
-                      frame: widget.frame,
+                      pose: widget.frame,
                     ),
                     if (current)
                       Positioned(
@@ -863,7 +873,7 @@ class _GraphDeviceDetails extends StatelessWidget {
           Row(
             children: <Widget>[
               Icon(
-                _deviceIcon(device.platform),
+                devicePlatformIcon(device.platform),
                 color: scheme.primary,
                 size: 22,
               ),
@@ -882,16 +892,35 @@ class _GraphDeviceDetails extends StatelessWidget {
                     ),
                     Text(
                       [
-                        device.online
+                        _deviceVersionMismatch(topology, device)
+                            ? deviceCompatibilityLabel(context)
+                            : device.online
                             ? l10n.settingsRuntimePairedOnline
                             : l10n.settingsRuntimePairedOffline,
+                        if (!current && device.online)
+                          device.relayHops == null
+                              ? l10n.deviceSpaceDirectLink
+                              : l10n.deviceSpaceRelayHops(device.relayHops!),
                         device.platform,
                         if (device.coreVersion != null) device.coreVersion!,
+                        if (device.protocolVersion != null)
+                          '${Localizations.localeOf(context).languageCode == "zh" ? "协议" : "Protocol"} v${device.protocolVersion}',
                       ].join(' · '),
                       style: Theme.of(context).textTheme.labelSmall?.copyWith(
                         color: scheme.onSurfaceVariant,
                       ),
                     ),
+                    if ((device.relayPath ?? const <String>[]).isNotEmpty)
+                      Text(
+                        '${l10n.deviceSpaceRelayPath}: ${[
+                          l10n.deviceSpaceLocalDevice,
+                          for (final hop in device.relayPath!)
+                            peers[hop]?.deviceName ?? hop,
+                        ].join(' → ')}',
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
                   ],
                 ),
               ),
@@ -971,8 +1000,8 @@ class _GraphCopy {
       ? '悬停或点击查看设备 · 点击中心展开拓扑'
       : 'Hover or select a device · Select the center to explore connections';
   String get topologyHint => zh
-      ? '实线在线 · 虚线未连通 · 点击当前设备返回'
-      : 'Solid: online · Dashed: not connected · Select your device to return';
+      ? '实线直连在线 · 虚线已宣告 · 点击当前设备返回'
+      : 'Solid: direct online · Dashed: announced · Select your device to return';
   String get empty => zh
       ? '空间已就绪，连接另一台设备，让协作从这里开始'
       : 'Your space is ready. Connect another device to get started.';
@@ -981,7 +1010,7 @@ class _GraphCopy {
       ? '点击查看设备 · 点击中心展开拓扑'
       : 'Tap a device for details · Tap the center for connections';
   String get compactTopologyHint =>
-      zh ? '实线在线 · 点击当前设备返回' : 'Solid: online · Select your device to return';
+      zh ? '实线直连在线 · 点击当前设备返回' : 'Solid: direct online · Select your device to return';
   String get noConnections => zh ? '尚无连接记录' : 'No recorded connections';
 
   String connectionStatus(
@@ -991,23 +1020,24 @@ class _GraphCopy {
     generated.RuntimeDeviceSpaceConnectionStatus.offline =>
       zh ? '离线' : 'Offline',
     generated.RuntimeDeviceSpaceConnectionStatus.versionMismatch =>
-      zh ? 'Core 版本不匹配' : 'Core version mismatch',
+      zh ? '版本不兼容 · 连接不可用' : 'Version incompatible · Connection unavailable',
+    generated.RuntimeDeviceSpaceConnectionStatus.announced =>
+      zh ? '已宣告' : 'Announced',
     generated.RuntimeDeviceSpaceConnectionStatus.unknown =>
       zh ? '状态未知' : 'Unknown',
   };
 }
 
-IconData _deviceIcon(String platform) {
-  final name = platform.trim().toLowerCase();
-  if (name.contains('android')) return Icons.android_rounded;
-  if (name.contains('windows')) return Icons.laptop_windows_rounded;
-  if (name.contains('mac') || name.contains('darwin')) {
-    return Icons.laptop_mac_rounded;
-  }
-  if (name.contains('linux')) return Icons.dns_outlined;
-  if (name.contains('ios')) return Icons.phone_iphone_rounded;
-  return Icons.devices_other_rounded;
-}
+/// Reads version compatibility relative to the local device, including offline peers.
+bool _deviceVersionMismatch(
+  generated.RuntimeDeviceSpaceTopology topology,
+  generated.RuntimeDeviceSpaceDevice device,
+) => deviceProtocolMismatch(
+  topology.devices
+      .firstWhere((item) => item.deviceId == topology.currentDeviceId)
+      .protocolVersion,
+  device.protocolVersion,
+);
 
 Color _connectionColor(
   generated.RuntimeDeviceSpaceConnectionStatus status,
@@ -1015,6 +1045,8 @@ Color _connectionColor(
 ) => switch (status) {
   generated.RuntimeDeviceSpaceConnectionStatus.online => scheme.primary,
   generated.RuntimeDeviceSpaceConnectionStatus.offline => scheme.outline,
-  generated.RuntimeDeviceSpaceConnectionStatus.versionMismatch => scheme.error,
+  generated.RuntimeDeviceSpaceConnectionStatus.versionMismatch =>
+    deviceCompatibilityColor(scheme),
+  generated.RuntimeDeviceSpaceConnectionStatus.announced => scheme.secondary,
   generated.RuntimeDeviceSpaceConnectionStatus.unknown => scheme.tertiary,
 };

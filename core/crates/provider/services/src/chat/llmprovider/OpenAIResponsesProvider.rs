@@ -1,13 +1,15 @@
+use super::ApiKeyProvider::KeyGetter;
+use super::ProviderHttp::KeyAuthentication;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
 use super::OpenAIProvider::OpenAIProvider;
 use super::StructuredToolCallBridge::StructuredToolCallBridge;
-use super::ThinkingConfiguration::ThinkingConfigurationApplier;
+use super::ThinkingDialect::ThinkingDialect;
 use crate::chat::llmprovider::AIService::{
     response_stream_from_chunks, AIService, AiServiceError, SendMessageRequest, TokenCounts,
 };
@@ -16,7 +18,8 @@ use operit_model::ModelConfigData::{BuiltinToolRequestFormat, ModelBuiltinTool};
 use operit_model::PromptTurn::PromptTurn;
 use operit_model::ToolPrompt::ToolPrompt;
 use operit_util::stream::RevisableTextStream::{
-    with_event_channel, RevisableTextStreamLike, TextStreamEventCarrier,
+    with_event_channel_and_failure, RevisableTextStream, RevisableTextStreamLike,
+    TerminalFailureState, TextStreamEventCarrier,
 };
 use operit_util::stream::Stream::{FnStream, Stream};
 use operit_util::ChatMarkupRegex::{attr_value, tag_body, tag_ranges};
@@ -28,7 +31,8 @@ pub(crate) const RESPONSES_OUTPUT_ITEM_META_PROVIDER: &str = "openai:responses_o
 #[derive(Clone)]
 pub struct OpenAIResponsesProvider {
     pub responsesApiEndpoint: String,
-    pub api_key: String,
+    pub key_getter: KeyGetter,
+
     pub modelName: String,
     pub responsesProviderType: String,
     pub supportsVision: bool,
@@ -84,7 +88,7 @@ impl OpenAIResponsesProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         responsesApiEndpoint: String,
-        api_key: String,
+        key_getter: KeyGetter,
         modelName: String,
         responsesProviderType: String,
         customHeaders: Vec<(String, String)>,
@@ -97,7 +101,7 @@ impl OpenAIResponsesProvider {
     ) -> Self {
         Self {
             responsesApiEndpoint,
-            api_key,
+            key_getter,
             modelName,
             responsesProviderType,
             supportsVision,
@@ -119,6 +123,23 @@ impl OpenAIResponsesProvider {
         }
     }
 
+    /// Reads the active transport's live counters until its final usage is committed locally.
+    fn currentTokenCounts(&self) -> TokenCounts {
+        let state = self.state.lock().expect("OpenAIResponsesProvider state mutex poisoned");
+        match state.activeParent.as_ref() {
+            Some(parent) => TokenCounts {
+                input: parent.input_token_count(),
+                cached_input: parent.cached_input_token_count(),
+                output: parent.output_token_count(),
+            },
+            None => TokenCounts {
+                input: state.inputTokenCount,
+                cached_input: state.cachedInputTokenCount,
+                output: state.outputTokenCount,
+            },
+        }
+    }
+
     fn setActiveParent(&self, parent: OpenAIProvider) -> u64 {
         let mut state = self
             .state
@@ -136,32 +157,49 @@ impl OpenAIResponsesProvider {
             .cancelled
     }
 
-    fn clearActiveParent(&self, generation: u64) {
+    /// Commits only this transport's usage; a paused request cannot overwrite a newer request.
+    fn finishActiveParent(&self, generation: u64, usage: &UsageCounts) {
         let mut state = self
             .state
             .lock()
             .expect("OpenAIResponsesProvider state mutex poisoned");
         if state.activeParentGeneration == generation {
+            state.inputTokenCount = usage.actualInputTokens;
+            state.cachedInputTokenCount = usage.cachedInputTokens;
+            state.outputTokenCount = usage.outputTokens;
             state.activeParent = None;
         }
     }
 
-    pub fn create_request_body(
-        &self,
-        request: &SendMessageRequest,
-    ) -> Result<Value, AiServiceError> {
-        let parent = OpenAIProvider::new_with_capabilities(
+    /// Creates the transport that owns both request token counting and live response usage.
+    fn parentProvider(&self) -> OpenAIProvider {
+        OpenAIProvider::new_with_capabilities(
             self.responsesApiEndpoint.clone(),
-            self.api_key.clone(),
+            self.key_getter.clone(),
             self.modelName.clone(),
-            "OPENAI_RESPONSES_PARENT".to_string(),
+            self.responsesProviderType.clone(),
             self.customHeaders.clone(),
             self.supportsVision,
             self.supportsAudio,
             self.supportsVideo,
             self.enableToolCall,
-        );
-        let request_history = if request.enable_thinking {
+        )
+
+        .with_responses_api(true)
+    }
+
+    /// Encodes a Responses payload with the same provider serializer used for transmission.
+    pub fn create_request_body(&self, request: &SendMessageRequest) -> Result<Value, AiServiceError> {
+        self.createRequestBodyWithParent(request, &self.parentProvider())
+    }
+
+    /// Retains preflight token counters on the parent that will send this request.
+    fn createRequestBodyWithParent(
+        &self,
+        request: &SendMessageRequest,
+        parent: &OpenAIProvider,
+    ) -> Result<Value, AiServiceError> {
+        let request_history = if request.thinking.is_on() {
             request.chat_history.clone()
         } else {
             request
@@ -173,16 +211,7 @@ impl OpenAIResponsesProvider {
         let mut requestObject = OpenAIResponsesPayloadAdapter::to_responses_request(
             parent.create_request_body_without_thinking_for_history(request, &request_history)?,
         );
-        ThinkingConfigurationApplier::apply(
-            &mut requestObject,
-            &self.responsesProviderType,
-            &self.modelName,
-            &self.responsesApiEndpoint,
-            request.enable_thinking,
-            request.thinking_quality_level,
-            &request.thinking_configurations,
-            &request.thinking_option_id,
-        )?;
+        ThinkingDialect::Responses.apply(&mut requestObject, &request.thinking)?;
 
         let messagesArray = requestObject
             .get("input")
@@ -220,7 +249,7 @@ impl OpenAIResponsesProvider {
             .saveCodexTokens(tokens.clone())
             .map_err(AiServiceError::RequestFailed)?;
         let account_id = crate::chat::llmprovider::CodexOAuth::account_id_from_tokens(&tokens)?;
-        self.api_key = tokens.accessToken;
+        self.key_getter = tokens.accessToken.into();
         self.customHeaders
             .retain(|(name, _)| !name.eq_ignore_ascii_case("ChatGPT-Account-Id"));
         self.customHeaders
@@ -254,57 +283,6 @@ impl OpenAIResponsesProvider {
             return;
         };
         object.insert("prompt_cache_key".to_string(), json!(promptCacheKey));
-    }
-
-    pub fn apply_responses_reasoning_effort(
-        &self,
-        requestJson: &mut Value,
-        enableThinking: bool,
-    ) -> Result<(), AiServiceError> {
-        if !enableThinking {
-            return Ok(());
-        }
-        let Some(object) = requestJson.as_object_mut() else {
-            return Ok(());
-        };
-        match object.get("reasoning") {
-            Some(Value::Object(reasoning))
-                if reasoning
-                    .get("effort")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.trim().is_empty()) =>
-            {
-                return Ok(());
-            }
-            Some(Value::Object(_)) | None => {}
-            Some(_) => return Ok(()),
-        }
-
-        let Some(effort) = self.resolve_responses_reasoning_effort()? else {
-            return Ok(());
-        };
-        let reasoningObject = object
-            .entry("reasoning".to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Value::Object(reasoning) = reasoningObject {
-            reasoning.insert("effort".to_string(), json!(effort));
-        }
-        Ok(())
-    }
-
-    fn resolve_responses_reasoning_effort(&self) -> Result<Option<&'static str>, AiServiceError> {
-        let qualityLevel = self
-            .runtimeContext
-            .support()
-            .thinkingQualityLevel()
-            .map_err(AiServiceError::RequestFailed)?;
-        Ok(match qualityLevel.clamp(1, 4) {
-            1 => Some("low"),
-            2 => Some("medium"),
-            3 => Some("high"),
-            4 => Some("xhigh"),
-            _ => None,
-        })
     }
 
     fn should_attach_prompt_cache_key(&self) -> bool {
@@ -409,14 +387,6 @@ impl OpenAIResponsesProvider {
     fn headers(&self) -> Result<HeaderMap, AiServiceError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if !self.api_key.trim().is_empty() {
-            let value = format!("Bearer {}", self.api_key);
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&value)
-                    .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?,
-            );
-        }
         if self.responsesProviderType == "OPENAI_CODEX" {
             apply_codex_headers(&mut headers, &self.customHeaders)?;
         }
@@ -935,6 +905,22 @@ impl OpenAIResponsesPayloadAdapter {
                                 );
                             }
                         }
+                        "video_url" | "input_video" => {
+                            let videoUrl = if partType == "input_video" {
+                                part.get("video_url")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                            } else {
+                                part.pointer("/video_url/url")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| part.get("video_url").and_then(Value::as_str))
+                                    .unwrap_or_default()
+                            };
+                            if !videoUrl.is_empty() {
+                                convertedParts
+                                    .push(json!({"type": "input_video", "video_url": videoUrl}));
+                            }
+                        }
                         _ => {
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
                                 if !text.is_empty() {
@@ -1253,24 +1239,15 @@ fn commentary_to_reasoning_content(content: &[Value]) -> Vec<Value> {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl AIService for OpenAIResponsesProvider {
     fn input_token_count(&self) -> i64 {
-        self.state
-            .lock()
-            .map(|state| state.inputTokenCount)
-            .unwrap_or(0)
+        self.currentTokenCounts().input
     }
 
     fn cached_input_token_count(&self) -> i64 {
-        self.state
-            .lock()
-            .map(|state| state.cachedInputTokenCount)
-            .unwrap_or(0)
+        self.currentTokenCounts().cached_input
     }
 
     fn output_token_count(&self) -> i64 {
-        self.state
-            .lock()
-            .map(|state| state.outputTokenCount)
-            .unwrap_or(0)
+        self.currentTokenCounts().output
     }
 
     fn provider_model(&self) -> String {
@@ -1279,6 +1256,8 @@ impl AIService for OpenAIResponsesProvider {
 
     fn reset_token_counts(&mut self) {
         if let Ok(mut state) = self.state.lock() {
+            state.activeParentGeneration = state.activeParentGeneration.wrapping_add(1);
+            state.activeParent = None;
             state.inputTokenCount = 0;
             state.cachedInputTokenCount = 0;
             state.outputTokenCount = 0;
@@ -1308,7 +1287,7 @@ impl AIService for OpenAIResponsesProvider {
         // ProviderNotImplemented implementation.
         let parent = OpenAIProvider::new_with_capabilities(
             self.responsesApiEndpoint.clone(),
-            self.api_key.clone(),
+            self.key_getter.clone(),
             self.modelName.clone(),
             "OPENAI_RESPONSES_PARENT".to_string(),
             self.customHeaders.clone(),
@@ -1316,10 +1295,13 @@ impl AIService for OpenAIResponsesProvider {
             self.supportsAudio,
             self.supportsVideo,
             self.enableToolCall,
-        );
+        )
+
+        .with_responses_api(true);
         AIService::calculate_input_tokens(&parent, chat_history, available_tools).await
     }
 
+    /// Sends an OpenAI Responses request through a failure-aware cold stream.
     async fn send_message(
         &mut self,
         request: SendMessageRequest,
@@ -1333,21 +1315,13 @@ impl AIService for OpenAIResponsesProvider {
         if self.responsesProviderType == "OPENAI_CODEX" {
             request.stream = true;
         }
-        let requestBody = self.create_request_body(&request)?;
+        let mut parent = self.parentProvider();
+        let requestBody = self.createRequestBodyWithParent(&request, &parent)?;
         if request.stream {
-            let mut parent = OpenAIProvider::new_with_capabilities(
-                self.responsesApiEndpoint.clone(),
-                self.api_key.clone(),
-                self.modelName.clone(),
-                self.responsesProviderType.clone(),
-                self.customHeaders.clone(),
-                self.supportsVision,
-                self.supportsAudio,
-                self.supportsVideo,
-                self.enableToolCall,
-            );
             let mut parent_stream = parent.send_prepared_request(request, requestBody).await?;
             let event_channel = parent_stream.event_channel().clone();
+            let terminalFailure = TerminalFailureState::new();
+            let producerTerminalFailure = terminalFailure.clone();
             let mut provider = self.clone();
             let activeParentGeneration = provider.setActiveParent(parent.clone());
             if provider.isCancelled() {
@@ -1366,35 +1340,40 @@ impl AIService for OpenAIResponsesProvider {
                 let mut provider = ownedProvider
                     .take()
                     .expect("OpenAI Responses parent stream must only be collected once");
+                let producerTerminalFailure = producerTerminalFailure.clone();
                 Box::pin(async move {
                     parentStream.collect(emit).await;
-                    provider.apply_usage_counts(&UsageCounts {
+                    if let Some(error) = parentStream.terminal_failure() {
+                        producerTerminalFailure.set(error);
+                    }
+                    provider.finishActiveParent(activeParentGeneration, &UsageCounts {
                         totalInputTokens: parent.input_token_count()
                             + parent.cached_input_token_count(),
                         actualInputTokens: parent.input_token_count(),
                         cachedInputTokens: parent.cached_input_token_count(),
                         outputTokens: parent.output_token_count(),
                     });
-                    provider.clearActiveParent(activeParentGeneration);
                 })
             });
-            return Ok(Box::new(with_event_channel(cold_stream, event_channel)));
+            return Ok(Box::new(with_event_channel_and_failure(
+                cold_stream,
+                event_channel,
+                terminalFailure,
+            )));
         }
 
-        let response = reqwest::Client::new()
-            .post(&self.responsesApiEndpoint)
+        let response = super::ProviderHttp::post(&self.responsesApiEndpoint)
+            .key_getter(self.key_getter.clone(), KeyAuthentication::Bearer)
             .headers(self.headers()?)
             .json(&requestBody)
             .send()
-            .await
-            .map_err(|error| AiServiceError::ConnectionFailed(error.to_string()))?;
+            .await?;
 
         let status = response.status();
         if !status.is_success() {
             let message = response
                 .text()
-                .await
-                .map_err(|error| AiServiceError::ConnectionFailed(error.to_string()))?;
+                .await?;
             return Err(AiServiceError::RequestFailed(format!(
                 "{status}: {message}"
             )));
@@ -1402,8 +1381,7 @@ impl AIService for OpenAIResponsesProvider {
 
         let jsonResponse: Value = response
             .json()
-            .await
-            .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?;
+            .await?;
         let parsed = OpenAIResponsesPayloadAdapter::parse_non_streaming_response(&jsonResponse);
         if let Some(usage) = parsed.usage {
             self.apply_usage_counts(&usage);
@@ -1683,92 +1661,9 @@ fn escape_xml_attribute(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        build_responses_web_search_chunks, extract_responses_metadata,
-        normalize_codex_responses_body, strip_responses_protocol_markup,
-        OpenAIResponsesPayloadAdapter, UsageCounts, RESPONSES_OUTPUT_ITEM_META_PROVIDER,
-    };
-    use serde_json::json;
+#[path = "../../../../tests/OpenAIResponsesProviderTests.rs"]
+mod tests;
 
-    /// Renders search queries, citations, and replay metadata together.
-    #[test]
-    fn renders_responses_web_search_output() {
-        let item = json!({
-            "type": "web_search_call",
-            "id": "search_1",
-            "status": "completed",
-            "action": {
-                "type": "search",
-                "queries": ["DeepSeek V4"],
-                "sources": [{"title": "DeepSeek", "url": "https://deepseek.com"}]
-            }
-        });
-        let chunks = build_responses_web_search_chunks(&[item.clone()], &json!({}));
-        assert!(chunks[0].contains("<query>DeepSeek V4</query>"));
-        assert!(chunks[0].contains("url=\"https://deepseek.com\""));
-        assert_eq!(chunks.len(), 1);
-        let metadata = OpenAIResponsesPayloadAdapter::create_output_item_metadata_tag(&item)
-            .expect("web search item metadata");
-        assert_eq!(
-            extract_responses_metadata(&metadata, RESPONSES_OUTPUT_ITEM_META_PROVIDER),
-            vec![item]
-        );
-    }
-
-    /// Removes search presentation and hidden replay metadata from model text.
-    #[test]
-    fn strips_responses_search_protocol_markup() {
-        let chunks = build_responses_web_search_chunks(
-            &[json!({"type": "web_search_call", "id": "search_1"})],
-            &json!({}),
-        );
-        let content = format!("before{}after", chunks.join(""));
-        assert_eq!(strip_responses_protocol_markup(&content), "beforeafter");
-    }
-
-    /// Preserves an explicitly reported all-zero usage payload.
-    #[test]
-    fn parses_zero_usage_payload() {
-        assert_eq!(
-            OpenAIResponsesPayloadAdapter::parse_usage_counts(Some(&json!({
-                "input_tokens": 0,
-                "output_tokens": 0
-            }))),
-            Some(UsageCounts {
-                totalInputTokens: 0,
-                actualInputTokens: 0,
-                cachedInputTokens: 0,
-                outputTokens: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn codex_fast_model_normalizes_to_base_model_and_priority_tier() {
-        let mut request = json!({
-            "model": "gpt-5.5-fast",
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_output_tokens": 1000,
-            "temperature": 0.7
-        });
-        normalize_codex_responses_body(&mut request);
-        assert_eq!(request["model"], "gpt-5.5");
-        assert_eq!(request["service_tier"], "priority");
-        assert_eq!(request["store"], false);
-        assert_eq!(request["stream"], true);
-        assert!(request.get("max_output_tokens").is_none());
-        assert!(request.get("temperature").is_none());
-    }
-
-    #[test]
-    fn codex_standard_model_removes_service_tier() {
-        let mut request = json!({
-            "model": "gpt-5.5",
-            "messages": [{"role": "user", "content": "hello"}]
-        });
-        normalize_codex_responses_body(&mut request);
-        assert_eq!(request["model"], "gpt-5.5");
-        assert!(request.get("service_tier").is_none());
-    }
-}
+#[cfg(test)]
+#[path = "../../../../tests/OpenAIResponsesProviderMediaRoleTests.rs"]
+mod media_role_tests;

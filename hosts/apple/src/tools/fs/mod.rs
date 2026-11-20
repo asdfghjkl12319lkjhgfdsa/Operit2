@@ -1,7 +1,8 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use globset::GlobBuilder;
@@ -17,16 +18,41 @@ use operit_host_api::{
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-#[derive(Clone, Debug, Default)]
-pub struct AppleFileSystemHost;
+/// Platform-owned file presentation (UIKit on iOS; system open on macOS).
+pub type AppleFileOpener = Arc<dyn Fn(&str) -> HostResult<()> + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct AppleFileSystemHost {
+    opener: Option<AppleFileOpener>,
+}
+
+impl std::fmt::Debug for AppleFileSystemHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppleFileSystemHost")
+            .field("hasFileOpener", &self.opener.is_some())
+            .finish()
+    }
+}
 
 impl AppleFileSystemHost {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn fromFileOpener(opener: AppleFileOpener) -> Self {
+        Self {
+            opener: Some(opener),
+        }
     }
 }
 
 impl FileSystemHost for AppleFileSystemHost {
+    /// Keeps the descriptor open for repeated log appends.
+    fn openAppendFile(&self, path: &str) -> HostResult<Box<dyn operit_host_api::FileAppendHandle>> {
+        self.validatePath(path, "path")?;
+        operit_host_native_common::NativeFileAppendHandle::open(path)
+    }
     fn envLabel(&self) -> &str {
         applePlatformName()
     }
@@ -92,6 +118,26 @@ impl FileSystemHost for AppleFileSystemHost {
         fs::read(path).map_err(HostError::from)
     }
 
+    fn readFileBytesRange(&self, path: &str, offset: u64, length: usize) -> HostResult<Vec<u8>> {
+        self.validateReadableFile(path)?;
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buffer = vec![0u8; length];
+        let mut read = 0;
+        loop {
+            let readCount = file.read(&mut buffer[read..])?;
+            if readCount == 0 {
+                break;
+            }
+            read += readCount;
+            if read == buffer.len() {
+                break;
+            }
+        }
+        buffer.truncate(read);
+        Ok(buffer)
+    }
+
     fn writeFile(&self, path: &str, content: &str, append: bool) -> HostResult<()> {
         self.validatePath(path, "path")?;
         ensure_parent_directory(path)?;
@@ -111,6 +157,14 @@ impl FileSystemHost for AppleFileSystemHost {
         self.validatePath(path, "path")?;
         ensure_parent_directory(path)?;
         fs::write(path, content).map_err(HostError::from)
+    }
+
+    fn appendFileBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        self.validatePath(path, "path")?;
+        ensure_parent_directory(path)?;
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(content)?;
+        Ok(())
     }
 
     fn deleteFile(&self, path: &str, recursive: bool) -> HostResult<()> {
@@ -420,17 +474,27 @@ impl FileSystemHost for AppleFileSystemHost {
 
     fn openFile(&self, path: &str) -> HostResult<()> {
         self.validateReadableFile(path)?;
-        let status = Command::new("open").arg(path).status().map_err(|error| {
-            HostError::new(format!(
-                "Failed to open Apple platform file request: {error}"
-            ))
-        })?;
-        if !status.success() {
-            return Err(HostError::new(format!(
-                "Apple platform open request exited with {status}"
-            )));
+        if let Some(opener) = &self.opener {
+            return opener(path);
         }
-        Ok(())
+        #[cfg(target_os = "macos")]
+        {
+            let status = Command::new("open").arg(path).status().map_err(|error| {
+                HostError::new(format!(
+                    "Failed to open Apple platform file request: {error}"
+                ))
+            })?;
+            if !status.success() {
+                return Err(HostError::new(format!(
+                    "Apple platform open request exited with {status}"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        Err(HostError::new(
+            "Apple file opener is not registered by the application owner",
+        ))
     }
 
     fn shareFile(&self, path: &str, title: &str) -> HostResult<()> {
@@ -474,13 +538,14 @@ impl AppleFileSystemHost {
     }
 }
 
+/// Describes Apple host abilities and explicitly excludes unavailable system surfaces.
 fn appleEnvironmentDescriptor() -> HostEnvironmentDescriptor {
-    HostEnvironmentDescriptor {
+    let mut descriptor = HostEnvironmentDescriptor {
         id: applePlatformName().to_string(),
         displayName: appleDisplayName().to_string(),
         platform: appleHostPlatform(),
         privilege: HostPrivilege::Normal,
-        isolation: HostIsolation::OsAppSandbox,
+        isolation: crate::sandbox::processIsolation(),
         pathStyleDescriptionEn:
             "Use absolute Apple platform paths such as /Users/Name/Documents or an app sandbox path."
                 .to_string(),
@@ -507,11 +572,25 @@ fn appleEnvironmentDescriptor() -> HostEnvironmentDescriptor {
             "tts.synthesis".to_string(),
             "tts.playback".to_string(),
             "system.notifications.send".to_string(),
+            "system.location".to_string(),
+            "ocr.recognition".to_string(),
             "runtime.process".to_string(),
             "runtime.storage".to_string(),
             "runtime.sqlite".to_string(),
         ],
         structuredCapabilities: vec![
+            HostCapability {
+                id: "system.location".to_string(),
+                displayName: "设备定位".to_string(),
+                scope: CapabilityScope::System,
+                operations: vec![CapabilityOperation::Read],
+            },
+            HostCapability {
+                id: "ocr.recognition".to_string(),
+                displayName: "图片文字识别".to_string(),
+                scope: CapabilityScope::Media,
+                operations: vec![CapabilityOperation::Read],
+            },
             HostCapability {
                 id: "fs.read".to_string(),
                 displayName: "文件读取".to_string(),
@@ -539,14 +618,48 @@ fn appleEnvironmentDescriptor() -> HostEnvironmentDescriptor {
         ],
         onboardingRequirements: appleOnboardingRequirements(),
         workspaceRoots: Vec::new(),
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let sandboxed = descriptor.isolation == HostIsolation::OsAppSandbox;
+        descriptor.pathStyleDescriptionEn = if sandboxed {
+            "Use absolute macOS paths. Files outside the app container require user-selected folder authorization; child processes remain sandboxed."
+        } else {
+            "Use absolute macOS paths such as /Users/Name/project. This process does not use App Sandbox; the current user account and macOS privacy permissions still apply."
+        }.to_string();
+        descriptor.pathStyleDescriptionCn = if sandboxed {
+            "使用 macOS 绝对路径。应用容器外的文件需要用户选择文件夹授权，子进程仍受系统沙盒限制。"
+        } else {
+            "使用 macOS 绝对路径，例如 /Users/Name/project。当前进程未启用 App Sandbox，仍受当前账号和 macOS 隐私权限限制。"
+        }.to_string();
+        if !sandboxed {
+            descriptor.workspaceRoots = vec![operit_host_api::WorkspaceRootDescriptor {
+                id: "macos.filesystem".to_string(),
+                displayName: "macOS 文件系统".to_string(),
+                vfsRoot: "/virtual/macos".to_string(),
+                physicalRoot: "/".to_string(),
+            }];
+            descriptor.pathStyleDescriptionEn.push_str(" The full native filesystem is exposed at /virtual/macos in VFS.");
+            descriptor.pathStyleDescriptionCn.push_str(" 完整本机文件系统在 VFS 中对应 /virtual/macos。");
+        }
+        descriptor.capabilities.push("screen.capture".to_string());
+        descriptor.structuredCapabilities.push(HostCapability {
+            id: "screen.capture".to_string(),
+            displayName: "屏幕采集".to_string(),
+            scope: CapabilityScope::System,
+            operations: vec![CapabilityOperation::Read],
+        });
     }
+    descriptor
 }
 
-#[cfg(target_os = "ios")]
-/// Returns the iOS notification permission required for background application alerts.
+/// Registers notification authorization with the shared Apple host permission UI.
 fn appleOnboardingRequirements() -> Vec<HostOnboardingRequirement> {
+    if !cfg!(any(target_os = "ios", target_os = "macos")) {
+        return Vec::new();
+    }
     vec![HostOnboardingRequirement {
-        id: "ios.notifications".to_string(),
+        id: format!("{}.notifications", applePlatformName()),
         title: "通知".to_string(),
         description: "允许 Operit 在 AI 回复完成或工具等待批准时发送系统通知。".to_string(),
         capabilityIds: vec!["system.notifications.send".to_string()],
@@ -554,12 +667,6 @@ fn appleOnboardingRequirements() -> Vec<HostOnboardingRequirement> {
         status: HostRequirementStatus::Missing,
         action: HostRequirementAction::RuntimePermission,
     }]
-}
-
-#[cfg(not(target_os = "ios"))]
-/// Returns no notification onboarding requirements for the current Apple host.
-fn appleOnboardingRequirements() -> Vec<HostOnboardingRequirement> {
-    Vec::new()
 }
 
 fn appleHostPlatform() -> HostPlatform {
@@ -754,4 +861,60 @@ fn bytes_to_search_line(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .trim_end_matches(&['\r', '\n'][..])
         .to_string()
+}
+
+#[cfg(test)]
+mod file_open_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    #[test]
+    fn notificationsParticipateInUnifiedHostAuthorization() {
+        let descriptor = appleEnvironmentDescriptor();
+        let requirements = descriptor.onboardingRequirements;
+        assert_eq!(requirements.len(), 1);
+        let requirement = &requirements[0];
+        assert_eq!(requirement.id, format!("{}.notifications", descriptor.id));
+        assert_eq!(requirement.capabilityIds, vec!["system.notifications.send"]);
+        assert!(requirement.isRequired);
+        assert!(matches!(requirement.status, HostRequirementStatus::Missing));
+        assert!(matches!(
+            requirement.action,
+            HostRequirementAction::RuntimePermission
+        ));
+        assert!(descriptor
+            .capabilities
+            .contains(&"system.notifications.send".to_string()));
+    }
+
+    #[test]
+    fn opensValidatedFileThroughOwnerAndPreservesErrors() {
+        let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("中文 file & 100%.txt");
+        fs::write(&path, b"file open test").unwrap();
+        let called = Arc::new(Mutex::new(Vec::new()));
+        let calls = called.clone();
+        let host = AppleFileSystemHost::fromFileOpener(Arc::new(move |path| {
+            calls.lock().unwrap().push(path.to_string());
+            Ok(())
+        }));
+        host.openFile(path.to_str().unwrap()).unwrap();
+        assert_eq!(*called.lock().unwrap(), vec![path.to_str().unwrap()]);
+        assert!(host.openFile(directory.to_str().unwrap()).is_err());
+        assert!(host
+            .openFile(directory.join("missing").to_str().unwrap())
+            .is_err());
+        assert!(host.openFile("relative.txt").is_err());
+        assert_eq!(called.lock().unwrap().len(), 1);
+        let host =
+            AppleFileSystemHost::fromFileOpener(Arc::new(|_| Err(HostError::new("viewer denied"))));
+        assert!(host
+            .openFile(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("viewer denied"));
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

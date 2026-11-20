@@ -1,8 +1,14 @@
 {
   "@@locale": "en",
+  "chatPromoteToRoot": "Promote to main conversation",
+  "workspaceUnsavedChangesTitle": "Unsaved changes",
+  "workspaceUnsavedChangesMessage": "Save your changes before closing this file?",
+  "workspaceDiscardChanges": "Discard changes",
   "askOperitHint": "Ask Operit",
   "aiChat": "AI Chat",
   "fullscreenInput": "Fullscreen input",
+  "noticeExpand": "Expand",
+  "noticeCollapse": "Collapse",
   "expandInput": "Expand input",
   "collapseInput": "Collapse input",
   "settings": "Settings",
@@ -11,7 +17,6 @@
   "addAttachment": "Add attachment",
   "attachmentPhoto": "Photo",
   "attachmentCamera": "Camera",
-  "attachmentMemory": "Memory",
   "attachmentFile": "File",
   "attachmentScreenContent": "Screen content",
   "attachmentNotifications": "Current notifications",
@@ -25,7 +30,6 @@
   "attachmentPackageKindSkill": "Skill",
   "attachmentPackageKindMcp": "MCP",
   "attachmentCameraUnavailable": "Camera capture is not available in the Flutter client",
-  "attachmentMemoryUnavailable": "Memory folder selection is not available in the Flutter client",
   "clearSearch": "Clear search",
   "chatPendingQueueTitle": "Queued messages ({count})",
   "@chatPendingQueueTitle": {
@@ -37,6 +41,15 @@
   },
   "chatQueueAddMessage": "Queue message",
   "chatQueueAdded": "Added to queue",
+  "chatSendOptions": "Choose how to send",
+  "chatQueueAddMessageDescription": "Send after the current reply finishes (default)",
+  "chatGuideCurrentTurn": "Guide current conversation",
+  "chatGuideCurrentTurnDescription": "Apply in a later model request without interrupting this turn",
+  "chatInterruptAndSend": "Interrupt and send",
+  "chatInterruptAndSendDescription": "Stop the current reply and send this message now",
+  "chatGuidanceAccepted": "Guidance added for a later model request",
+  "chatGuidanceTextOnly": "Guidance supports text only. Remove attachments and the reply target first.",
+  "chatQueueWithdrawToEditor": "Withdraw to editor",
   "chatPleaseCreateNewChat": "Please create a chat",
   "cancel": "Cancel",
   "send": "Send",
@@ -46,18 +59,15 @@
   "connectingAiService": "Connecting to AI service...",
   "receivingAiResponse": "Receiving AI response...",
   "receivingToolResultAiResponse": "Receiving AI response after tool execution...",
-  "roleResponsePlannerPlanning": "Planning group speaking order...",
-  "roleResponsePlannerMemberReplying": "Generating a reply from \"{memberName}\"...",
-  "@roleResponsePlannerMemberReplying": {
-    "placeholders": {
-      "memberName": {
-        "type": "String"
-      }
-    }
-  },
-  "roleResponsePlannerFailed": "Group planning failed",
   "summarizingMemories": "Summarizing memories...",
   "summaryGenerating": "Generating summary...",
+  "summaryStageCore": "Summarizing the core task...",
+  "summaryStageConstraints": "Summarizing user requests and constraints...",
+  "summaryStageFiles": "Summarizing key files and code...",
+  "summaryStageErrors": "Summarizing errors and fixes...",
+  "summaryStageInteraction": "Summarizing interaction and context...",
+  "summaryStageNext": "Summarizing next steps...",
+  "summaryStageFormatting": "Formatting the summary...",
   "chatCompressingHistory": "Compressing history records...",
   "executingPlan": "Executing plan...",
   "executingTool": "Executing tool: {toolName}",
@@ -99,6 +109,13 @@
     }
   },
   "close": "Close",
+  "workspaceCloseOtherTabs": "Close Others",
+  "workspaceDockDropTarget": "Drop into workspace",
+  "workspaceOpenWith": "Open with",
+  "workspaceBuiltInPreview": "Built-in preview",
+  "workspacePluginUnsavedChanges": "Save in the editor first, or discard the unsaved changes.",
+  "workspaceCloseTabsToRight": "Close to the Right",
+  "workspaceCloseAllTabs": "Close All",
   "commonExpand": "Expand",
   "commonCollapse": "Collapse",
   "create": "Create",
@@ -112,8 +129,6 @@
   "toolApprovalDeny": "Deny",
   "toolApprovalAllowOnce": "Allow once",
   "toolApprovalAlwaysAllow": "Always allow in this session",
-  "createGroupTitle": "New group",
-  "groupNameLabel": "Group name",
   "renameConversationTitle": "Edit title",
   "newTitleLabel": "New title",
   "deleteConversationTitle": "Delete conversation?",
@@ -156,6 +171,17 @@
       }
     }
   },
+  "messageLocatorSearchMessages": "Search messages",
+  "messageLocatorViewFavorites": "View favorites",
+  "messageLocatorAll": "All",
+  "messageLocatorFavorites": "Favorites",
+  "messageLocatorNoFavorites": "No favorite messages yet",
+  "messageLocatorLoadFailed": "Could not load messages. Please try again.",
+  "messageTransformFailed": "Failed to process message display: {error}",
+  "@messageTransformFailed": { "placeholders": { "error": { "type": "String" } } },
+  "messageLocatorFavoriteFailed": "Could not update favorite. Please try again.",
+  "messageLocatorAddFavorite": "Favorite message",
+  "messageLocatorRemoveFavorite": "Remove favorite",
   "messageLocatorNoMatches": "No matching messages",
   "messageSenderUser": "User",
   "messageSenderSummary": "Summary",
@@ -194,6 +220,7 @@
   },
   "messageSenderOther": "Other",
   "hiddenUserMessage": "Hidden user message",
+  "autoTriggeredUserMessage": "AUTO",
   "workspaceSetupTitle": "Set up workspace",
   "workspaceSetupSubtitle": "Provide a dedicated file environment for your AI projects",
   "workspaceCreateTitle": "Create workspace",
@@ -207,6 +234,11 @@
   "workspaceAddFolderDescription": "Mount another folder into the current workspace",
   "workspaceProjectTypeDialogTitle": "Choose project type",
   "workspaceProjectTypeDialogDescription": "Choose the default workspace type to create",
+  "workspaceUnbindTitle": "Remove project from this chat",
+  "workspaceUnbindDescription": "Detach this chat without deleting workspace files",
+  "workspaceUnbindConfirmation": "Unbind the workspace from this chat? The workspace and its files will be kept, and other chats will not be affected. You can bind a workspace again later.",
+  "workspaceUnbindFailed": "Failed to unbind workspace. Please try again.",
+  "workspaceUnbindChanged": "The current chat or workspace has changed. Cancel and try again.",
   "workspaceBindDialogTitle": "Choose existing workspace",
   "workspacePathLabel": "Selected workspace",
   "workspaceEnvLabel": "Workspace environment",
@@ -311,6 +343,19 @@
   "disable": "Disable",
   "enable": "Enable",
   "environmentVariables": "Environment variables",
+  "packageConfigureEnvironmentVariables": "Configure Environment Variables",
+  "packageNoEnvironmentVariables": "The currently enabled tool packages have not declared any environment variables.",
+  "packageEnvironmentOptional": "Optional",
+  "packageEnvironmentInputRequired": "Input value (required)",
+  "packageEnvironmentInputOptional": "Input value (optional)",
+  "packageEnvironmentDefault": "Default: {value}",
+  "@packageEnvironmentDefault": {
+    "placeholders": {
+      "value": {
+        "type": "String"
+      }
+    }
+  },
   "required": "Required",
   "states": "States",
   "stateToolSummary": "{condition} · {toolCount} tools · excludes {excludeCount}",
@@ -360,6 +405,8 @@
   "searchHistory": "Search history",
   "noDownloadTasks": "No download tasks yet",
   "openFile": "Open file",
+  "workspaceFileOpening": "Opening file…",
+  "workspaceFileOpenTimedOut": "Opening the file timed out. Please try again.",
   "openLocation": "Open location",
   "retry": "Retry",
   "removeRecord": "Remove record",
@@ -436,14 +483,8 @@
   "settingsCategoryModelSubtitle": "Models, keys, context",
   "settingsCategoryModelDescription": "Configure model connections, choose the chat model, and manage thinking, context, and multimodal abilities.",
   "settingsCategoryLocalModelsTitle": "Local Models",
-  "settingsCategoryLocalModelsSubtitle": "Downloads, engines, STT / TTS",
+  "settingsCategoryLocalModelsSubtitle": "LLMs, downloads, STT / TTS",
   "settingsCategoryLocalModelsDescription": "Manage local models and inference engines installed on demand.",
-  "settingsCategoryCharactersTitle": "Characters",
-  "settingsCategoryCharactersSubtitle": "Cards, groups, bindings",
-  "settingsCategoryCharactersDescription": "Manage character cards, groups, active roles, and role-level model, memory, and tool bindings.",
-  "settingsCategoryMemoryTitle": "Memory",
-  "settingsCategoryMemorySubtitle": "Memory graph, shared stores, user profile",
-  "settingsCategoryMemoryDescription": "Manage character and shared memory stores, memory graph visualization, user profiles, and auto-update behavior.",
   "settingsCategoryToolsTitle": "Tools & Permissions",
   "settingsCategoryToolsSubtitle": "AI capability, system authorization, extensions",
   "settingsCategoryToolsDescription": "Set AI read-only, read-write, or full access, and review the current device system authorization status.",
@@ -452,13 +493,15 @@
   "settingsCategoryWorkspaceDescription": "Manage default workspaces, terminal sessions, browser mode, scripts, and web automation.",
   "settingsCategoryGlobalBehaviorTitle": "Global Behavior Settings",
   "settingsCategoryGlobalBehaviorSubtitle": "Input processing and interaction",
-  "settingsCategoryGlobalBehaviorDescription": "Configure input and interaction behavior that does not vary by character card.",
+  "settingsCategoryGlobalBehaviorDescription": "Configure application-wide input and interaction behavior.",
   "settingsCategoryAppearanceTitle": "Appearance & Interaction",
   "settingsCategoryAppearanceSubtitle": "Theme, bubbles, and interaction",
   "settingsCategoryAppearanceDescription": "Customize global theme, background media, message bubbles, and chat interaction.",
   "settingsCategoryDataTitle": "Data & Backup",
-  "settingsCategoryDataSubtitle": "Backup, restore, stats",
-  "settingsCategoryDataDescription": "Back up chats, characters, and model settings, restore backup content, and view data statistics.",
+  "settingsCategoryDataSubtitle": "Backup, restore, storage",
+  "settingsCategoryDataDescription": "Back up and restore chats, plugin data, and model settings, and manage storage.",
+  "settingsUsageReportTitle": "Token Usage Report",
+  "settingsUsageReportSubtitle": "Model usage, cache, and cost",
   "settingsCategoryAccessLinksTitle": "Device Space",
   "settingsCategoryAccessLinksSubtitle": "Connect, sync, collaborate",
   "settingsCategoryAccessLinksDescription": "Manage this device space, connect devices, and share data and routes.",
@@ -477,7 +520,7 @@
       }
     }
   },
-  "settingsComingSoon": "This area will continue connecting existing runtime capabilities. Models, characters, and tools are being completed first.",
+  "settingsComingSoon": "This area will continue connecting existing runtime capabilities. Model and tool settings are being completed first.",
   "settingsAdvanced": "Advanced settings",
   "settingsActive": "Active",
   "settingsActivate": "Activate",
@@ -495,8 +538,6 @@
     }
   },
   "settingsModelSetCurrentActive": "Set active",
-  "settingsChatThinkingMode": "Thinking mode",
-  "settingsChatThinkingModeDescription": "Let supported models produce steadier reasoning.",
   "settingsChatStreamOutput": "Stream output",
   "settingsChatStreamOutputDescription": "Show generated replies progressively.",
   "settingsModelProfilesSection": "Model profiles",
@@ -589,7 +630,6 @@
     }
   },
   "settingsTtsCurrentConfigCannotDelete": "The TTS configuration currently in use cannot be deleted.",
-  "settingsTtsConfigUsedByCharacter": "This TTS configuration is used by a character card and cannot be deleted.",
   "settingsModelChatAutoGlmWarning": "AutoGLM cannot be used as the main chat model. Chat and UI control use separate model assignments; choose another large model.",
   "settingsModelFunctionChat": "Chat",
   "settingsModelFunctionChatDescription": "Model used for main conversation replies.",
@@ -622,6 +662,8 @@
   "settingsModelApiEndpoint": "API endpoint",
   "settingsModelModelNames": "Model names",
   "settingsModelApiKey": "API key",
+  "settingsModelShowApiKey": "Show API key",
+  "settingsModelHideApiKey": "Hide API key",
   "settingsModelCodexLogin": "ChatGPT login",
   "settingsModelCodexLoginTitle": "Sign in to ChatGPT Codex",
   "settingsModelCodexLoginDescription": "OpenAI Codex uses a ChatGPT subscription sign-in instead of an API key.",
@@ -649,7 +691,7 @@
     }
   },
   "settingsModelApiKeyPool": "API key pool",
-  "settingsModelApiKeyPoolDescription": "Prepare multiple keys for one model profile so runtime can rotate between them.",
+  "settingsModelApiKeyPoolDescription": "Keep using a healthy key. Switch on authentication, quota, rate limit, or temporary failures; cooling keys are skipped.",
   "settingsModelApiKeyPoolCount": "{count} keys",
   "@settingsModelApiKeyPoolCount": {
     "placeholders": {
@@ -658,11 +700,20 @@
       }
     }
   },
-  "settingsModelApiKeyPoolEmpty": "No keys yet. Add keys and this profile will use the key pool.",
+  "settingsModelApiKeyPoolEmpty": "No keys yet. Add a key before enabling this pool.",
   "settingsModelAddApiKey": "Add key",
   "settingsModelEditApiKey": "Edit key",
   "settingsModelApiKeyName": "Key name",
   "settingsModelApiKeyEnabled": "Enable this key",
+  "settingsModelPoolAddSingle": "Add current single key",
+  "settingsModelPoolPaste": "Paste one key per line to add several at once.",
+  "settingsModelPoolNoEligible": "Enable at least one nonempty key that is not marked unavailable.",
+  "settingsModelPoolUntested": "Untested",
+  "settingsModelPoolAvailable": "Available",
+  "settingsModelPoolUnavailable": "Unavailable",
+  "settingsModelPoolClearMarks": "Reset key health",
+  "settingsModelPoolTest": "Test untested keys",
+  "settingsModelPoolNeedsModel": "Save the provider and add a model before testing keys.",
   "settingsModelProviderId": "Provider ID",
   "settingsModelProvidersSection": "LLM providers",
   "settingsModelProviderType": "Provider type",
@@ -697,7 +748,6 @@
   "settingsModelProviderTypeDeepseek": "DeepSeek",
   "settingsModelProviderTypeMistral": "Mistral",
   "settingsModelProviderTypeSiliconflow": "SiliconFlow",
-  "settingsModelProviderTypeIflow": "iFlow",
   "settingsModelProviderTypeOpenrouter": "OpenRouter",
   "settingsModelProviderTypeOpencode": "OpenCode",
   "settingsModelProviderTypeFourRouter": "4Router",
@@ -722,6 +772,23 @@
       "error": {}
     }
   },
+  "localModelsAddModel": "Add model",
+  "localModelsFilterDownloads": "Downloads",
+  "localModelsAllTypes": "All types",
+  "localModelsNoMatches": "No matching models",
+  "localModelsResetFilters": "Reset filters",
+  "localModelsDetails": "Model details",
+  "localModelsMoreActions": "More actions",
+  "localModelsResultCount": "Showing {count} of {total} models",
+  "@localModelsResultCount": {
+    "placeholders": {
+      "count": {"type": "int"},
+      "total": {"type": "int"}
+    }
+  },
+  "localModelsHubRepositoryTab": "Repository",
+  "localModelsDownloadFailed": "Download failed",
+  "localModelsDownloadPausedLabel": "Paused",
   "localModelsCatalog": "Model catalog",
   "localModelsCategorySpeechToText": "Speech-to-text models",
   "localModelsCategoryTextToSpeech": "Text-to-speech models",
@@ -819,6 +886,36 @@
   "settingsModelAvailableSourceFetched": "Fetched",
   "settingsModelAvailableSourceHistory": "History",
   "settingsModelAvailableEmptyFetched": "No fetched models. Choose Include history to see catalog IDs.",
+  "settingsModelUnrecognized": "Unrecognized",
+  "settingsModelCatalogUpdatedAt": "Capabilities and context from models.dev, updated {time}",
+  "@settingsModelCatalogUpdatedAt": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelCatalogUpdateFailed": "Could not download model details: {error}",
+  "@settingsModelCatalogUpdateFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelCatalogUpdateFailedUsing": "Could not update model details, using those from {time}: {error}",
+  "@settingsModelCatalogUpdateFailedUsing": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      },
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelCatalogBundled": "Using bundled model details; online updates replace them automatically",
+  "settingsModelCatalogRetry": "Update",
   "settingsModelCustomModel": "Custom model",
   "settingsModelModelId": "Model ID",
   "settingsModelDuplicateModelId": "This model has already been added to this provider.",
@@ -842,9 +939,7 @@
   "settingsModelContextLength": "Context length",
   "settingsModelMaxContextLength": "Max context length",
   "settingsModelMaxContextLengthInvalid": "Enter a max context length greater than 0",
-  "settingsModelSummaryThreshold": "Summary token threshold",
-  "settingsModelSummaryByMessageCount": "Summarize by message count",
-  "settingsModelSummaryMessageCount": "Summary message threshold",
+  "settingsModelSummaryThreshold": "Summarize at",
   "settingsModelCustomHeaders": "Custom headers",
   "settingsModelCustomParameters": "Custom parameters JSON",
   "settingsModelToolCall": "Tool calling",
@@ -857,22 +952,155 @@
   "settingsModelDirectVideoDescription": "Send video directly to models that support video input.",
   "settingsModelGoogleSearch": "Google Search",
   "settingsModelGoogleSearchDescription": "Enable provider-side search capability.",
-  "settingsModelContext": "Context window",
+  "settingsModelContext": "Context",
   "settingsModelSummary": "Auto summary",
   "settingsModelThinking": "Thinking",
-  "settingsModelThinkingOption": "Thinking option",
-  "settingsModelThinkingRules": "Thinking rules JSON",
+  "thinkingLevelLabel": "Thinking",
+  "thinkingAlwaysOn": "Always thinking",
+  "thinkingChip": "Thinking",
+  "settingsModelThinkingSourceDeclared": "Levels from your description",
+  "settingsModelThinkingSourceLocalRuntime": "Runs locally: thinking switches on or off, and the switch does nothing for a model that cannot think",
+  "settingsModelThinkingUnknown": "The catalog has no thinking details for this model",
+  "settingsModelThinkingNotAdjustable": "This API cannot change how this model thinks",
+  "settingsModelThinkingNotSupported": "This model does not think",
+  "settingsModelThinkingCarried": "Carried over from the level you set last",
+  "settingsModelThinkingDescribe": "Describe",
+  "settingsModelThinkingUseCatalog": "Use catalog",
+  "settingsModelThinkingDescribeTitle": "How this model thinks",
+  "settingsModelThinkingKindNone": "Does not think",
+  "settingsModelThinkingKindAlways": "Always thinks, no control",
+  "settingsModelThinkingKindSwitch": "On or off",
+  "settingsModelThinkingKindLevels": "Levels",
+  "settingsModelThinkingKindBudget": "Token budget",
+  "settingsModelThinkingCanTurnOff": "Can be turned off",
+  "settingsModelThinkingBudgetMin": "Minimum tokens",
+  "settingsModelThinkingBudgetMax": "Maximum tokens",
+  "settingsModelThinkingLevelsRequired": "Pick at least one level",
   "settingsModelMediaHistory": "Media history",
   "settingsModelCapabilities": "Capabilities",
   "settingsModelBuiltinTools": "Built-in tools",
   "settingsModelBuiltinToolExclusive": "Turns off external tool calling when enabled",
-  "settingsModelConnectionTestSection": "Connection test",
   "settingsModelRunConnectionTest": "Test current model",
-  "settingsModelTestModel": "Test model",
+  "settingsModelTestModel": "Test",
+  "settingsModelCapabilityToolCall": "Tools",
+  "settingsModelCapabilityImage": "Image",
+  "settingsModelCapabilityAudio": "Audio",
+  "settingsModelCapabilityVideo": "Video",
+  "settingsModelClaudeCache": "Claude 1h cache",
+  "settingsModelClaudeCacheDescription": "Sets a 1-hour TTL on explicit cache breakpoints; when off, the default TTL applies.",
+  "settingsModelSummaryThresholdDescription": "Summarize when the context fills to this share. 0 turns summaries off.",
+  "settingsModelMoreActions": "More actions",
+  "settingsModelRestoreDefaults": "Restore defaults",
+  "settingsModelDescribeThinking": "Describe thinking levels",
+  "settingsModelDeleteModel": "Delete model",
+  "settingsModelSaveFailed": "Could not save: {error}",
+  "@settingsModelSaveFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelTestAll": "Test all",
+  "settingsModelTestProgress": "Testing {done}/{total}",
+  "@settingsModelTestProgress": {
+    "placeholders": {
+      "done": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsModelTestSummary": "{passed} passed, {failed} failed",
+  "@settingsModelTestSummary": {
+    "placeholders": {
+      "passed": {
+        "type": "int"
+      },
+      "failed": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsModelTestSummaryWithRestricted": "{passed} passed, {failed} failed, {restricted} restricted",
+  "@settingsModelTestSummaryWithRestricted": {
+    "placeholders": {
+      "passed": {
+        "type": "int"
+      },
+      "failed": {
+        "type": "int"
+      },
+      "restricted": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsModelTestAllPassed": "All {count} passed",
+  "@settingsModelTestAllPassed": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsModelTestCouldNotRun": "The test could not run",
+  "settingsModelCopyError": "Copy error",
+  "settingsModelSelect": "Select",
+  "settingsModelCheckAll": "Select all",
+  "settingsModelCheckedCount": "{count} selected",
+  "@settingsModelCheckedCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsModelDeleteModelsTitle": "Delete {count} models?",
+  "@settingsModelDeleteModelsTitle": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsModelDeleteModelsMessage": "Their settings are deleted with them.",
+  "settingsModelDeleteModelsKept": "{count} in use by functions will be kept: {names}",
+  "@settingsModelDeleteModelsKept": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      },
+      "names": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelDeleteModelsBlocked": "The selected models are used by these functions. Change the function model assignments first: {functions}",
+  "@settingsModelDeleteModelsBlocked": {
+    "placeholders": {
+      "functions": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelDeletedCount": "Deleted {count} models",
+  "@settingsModelDeletedCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "settingsModelTestingConnection": "Testing current model connection…",
   "settingsModelTestedModel": "Tested model",
   "settingsModelConnectionTestPassed": "All checks passed",
   "settingsModelConnectionTestFailed": "Some checks failed",
+  "settingsModelConnectionTestRestricted": "Test restricted",
+  "settingsModelTestCreditRestricted": "Credit or output budget limit",
+  "settingsModelTestRateRestricted": "Upstream rate limit or cooldown",
   "settingsModelCapabilitiesApplied": "Model capability switches were updated from the test result.",
   "settingsModelCapabilitiesNeedChat": "Chat test did not pass, so model capability switches were not updated.",
   "settingsModelConnectionTestError": "Connection test failed: {error}",
@@ -889,172 +1117,6 @@
   "settingsModelTestItemAudio": "Audio",
   "settingsModelTestItemVideo": "Video",
   "settingsModelTestItemUnknown": "Unknown item",
-  "settingsCharactersCreateCard": "New character card",
-  "settingsCharactersEditCard": "Edit character card",
-  "settingsCharactersCardName": "Character name",
-  "settingsCharactersCreateGroup": "New group",
-  "settingsCharactersEditGroup": "Edit group",
-  "settingsCharactersGroupName": "Group name",
-  "settingsCharactersDescription": "Description",
-  "settingsCharactersCharacterSetting": "Character setting",
-  "settingsCharactersOpeningStatement": "Opening statement",
-  "settingsCharactersOtherContentChat": "Extra chat content",
-  "settingsCharactersOtherContentVoice": "Extra voice content",
-  "settingsCharactersAdvancedPrompt": "Advanced custom prompt",
-  "settingsCharactersMarks": "Notes",
-  "settingsCharactersTags": "Tags",
-  "settingsCharactersNoTags": "No tags available. Create one in tag management, then bind it to this character card.",
-  "settingsCharactersImport": "Import",
-  "settingsCharactersExport": "Export",
-  "settingsCharactersImportJson": "Import JSON",
-  "settingsCharactersExportJson": "Export JSON",
-  "settingsCharactersImportTavernJson": "Import Tavern JSON",
-  "settingsCharactersExportTavernJson": "Export Tavern JSON",
-  "settingsCharactersImportCardJson": "Import character card JSON",
-  "settingsCharactersImportCardJsonDone": "Character card imported.",
-  "settingsCharactersImportTavernJsonDone": "Tavern character card imported.",
-  "settingsCharactersImportGroupJson": "Import group JSON",
-  "settingsCharactersImportGroupJsonDone": "Group imported.",
-  "settingsCharactersImportJsonError": "JSON import failed: {error}",
-  "@settingsCharactersImportJsonError": {
-    "placeholders": {
-      "error": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersImportTavernJsonError": "Tavern JSON import failed: {error}",
-  "@settingsCharactersImportTavernJsonError": {
-    "placeholders": {
-      "error": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersExportJsonError": "JSON export failed: {error}",
-  "@settingsCharactersExportJsonError": {
-    "placeholders": {
-      "error": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersExportTavernJsonError": "Tavern JSON export failed: {error}",
-  "@settingsCharactersExportTavernJsonError": {
-    "placeholders": {
-      "error": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersTagsSection": "Tags",
-  "settingsCharactersManageTags": "Manage tags",
-  "settingsCharactersCreateTag": "New tag",
-  "settingsCharactersEditTag": "Edit tag",
-  "settingsCharactersDeleteTag": "Delete tag",
-  "settingsCharactersDeleteTagMessage": "Delete “{name}”?",
-  "@settingsCharactersDeleteTagMessage": {
-    "placeholders": {
-      "name": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersTagName": "Tag name",
-  "settingsCharactersTagDescription": "Tag description",
-  "settingsCharactersTagPromptContent": "Prompt content",
-  "settingsCharactersChatModelBindingMode": "Chat model binding mode",
-  "settingsCharactersChatModelConfigId": "Chat model config ID",
-  "settingsCharactersChatModelIndex": "Chat model index",
-  "settingsCharactersToolAccess": "Tool permission mode",
-  "settingsCharactersChatModelFollowGlobal": "Follow global model",
-  "settingsCharactersChatModelFixedConfig": "Use fixed model config",
-  "settingsCharactersChatModelConfig": "Model config",
-  "settingsCharactersToolAccessFollowGlobal": "Follow global tool permissions",
-  "settingsCharactersToolAccessCustom": "Custom character tool permissions",
-  "settingsCharactersToolAccessEmpty": "Enabled with no selected tools",
-  "settingsCharactersToolAccessSummaryCounts": "Built-in {builtinCount} · packages {packageCount} · skills {skillCount} · MCP {mcpCount}",
-  "@settingsCharactersToolAccessSummaryCounts": {
-    "placeholders": {
-      "builtinCount": {
-        "type": "int"
-      },
-      "packageCount": {
-        "type": "int"
-      },
-      "skillCount": {
-        "type": "int"
-      },
-      "mcpCount": {
-        "type": "int"
-      }
-    }
-  },
-  "settingsCharactersToolAccessConfigure": "Configure tool allowlist",
-  "settingsCharactersToolAccessTitle": "Custom Allowed Tools",
-  "settingsCharactersToolAccessTabBuiltin": "Built-ins",
-  "settingsCharactersToolAccessTabPackage": "Packages",
-  "settingsCharactersToolAccessTabSkill": "Skill",
-  "settingsCharactersToolAccessTabMcp": "MCP",
-  "settingsCharactersToolAccessSearchPlaceholder": "Search name, description, or ID",
-  "settingsCharactersToolAccessEmptySearch": "No matching tools found",
-  "settingsCharactersToolAccessRequiresUsePackage": "Selecting packages, skills, or MCP also requires allowing the built-in use_package tool.",
-  "settingsCharactersToolAccessEmptyBuiltin": "No built-in tools are available for configuration",
-  "settingsCharactersToolAccessEmptyPackages": "No globally available packages right now",
-  "settingsCharactersToolAccessEmptySkills": "No AI-visible skills are available right now",
-  "settingsCharactersToolAccessEmptyMcp": "No enabled MCP servers are available right now",
-  "settingsCharactersBuiltinTools": "Allowed built-in tools",
-  "settingsCharactersAllowedPackages": "Allowed packages",
-  "settingsCharactersAllowedSkills": "Allowed skills",
-  "settingsCharactersAllowedMcpServers": "Allowed MCP servers",
-  "settingsCharactersGroupMembersTitle": "Group characters",
-    "settingsCharactersOpenMemoryGraph": "View memory graph",
-    "settingsCharactersMemoryGraphTitle": "{profileName}'s memory graph",
-    "@settingsCharactersMemoryGraphTitle": {
-      "placeholders": {
-        "profileName": {
-          "type": "String"
-        }
-      }
-    },
-    "settingsCharactersMemoryGraphEmpty": "No memory nodes yet",
-    "settingsCharactersMemoryGraphStats": "{nodes} nodes · {edges} links",
-    "@settingsCharactersMemoryGraphStats": {
-      "placeholders": {
-        "nodes": {
-          "type": "int"
-        },
-        "edges": {
-          "type": "int"
-        }
-      }
-    },
-    "settingsCharactersMemoryGraphLink": "Memory link",
-    "settingsCharactersEditUserMarkdown": "Edit user profile",
-  "settingsCharactersUserMarkdownTitle": "{profileName}'s user profile",
-  "@settingsCharactersUserMarkdownTitle": {
-    "placeholders": {
-      "profileName": {
-        "type": "String"
-      }
-    }
-  },
-  "settingsCharactersUserMarkdownSaved": "User profile saved",
-  "settingsCharactersUserMarkdownContent": "User profile content",
-  "settingsCharactersMemoryAutoUpdate": "Auto-update memory stores",
-  "settingsCharactersMemoryAutoUpdateDescription": "Allow AI to organize conversation info into memory stores.",
-  "settingsCharactersPreferenceDescription": "Provide user profile to model",
-  "settingsCharactersPreferenceDescriptionSubtitle": "Include the current user profile in chat prompts.",
-  "settingsCharactersCardsSection": "Character cards",
-  "settingsCharactersGroupsSection": "Groups",
-  "settingsCharactersGroupMembers": "{count} members",
-  "@settingsCharactersGroupMembers": {
-    "placeholders": {
-      "count": {
-        "type": "int"
-      }
-    }
-  },
   "settingsToolsPermissionMode": "AI capability mode",
   "settingsToolsAsk": "Ask",
   "settingsToolsExtensions": "Extension management",
@@ -1229,6 +1291,8 @@
   "settingsRuntimeCurrentSpace": "Current device space",
   "settingsRuntimeOverviewDescription": "Devices in the same space can connect and share data and routes.",
   "settingsRuntimeRenameSpace": "Rename device space",
+  "settingsRuntimeResetTransactions": "Reset transactions",
+  "settingsRuntimeResetTransactionsDone": "Sync transactions rebuilt from this device’s current content",
   "settingsRuntimeLeaveSpace": "Leave device space",
   "settingsRuntimeLeaveSpaceTitle": "Leave the current device space?",
   "settingsRuntimeLeaveSpaceDescription": "This device will create a new single-device space. Business data and paired devices are preserved.",
@@ -1286,16 +1350,17 @@
   "settingsRuntimeRemoteDescription": "Directly paired devices. Pairing establishes a connection; joining a device space enables shared data and routing.",
   "settingsRuntimePairRemote": "Connect another device",
   "settingsRuntimeDiscoveredEdges": "ESP32 devices",
-  "settingsRuntimeEdgeEndpointTokenRequired": "Edge endpoint and token are required",
   "settingsRuntimeEdgeEndpointRequired": "Edge endpoint is required",
   "settingsRuntimePairingCodeRequired": "Pairing code is required",
   "settingsRuntimeNoPairedRemote": "No connected devices yet.",
   "settingsRuntimeConnectionInitiatedByOtherDevice": "Connection initiated by the other device",
-  "settingsRuntimePairToken": "Connection token",
   "settingsRuntimePairCode": "Pairing code",
   "settingsRuntimeStartPairing": "Start connection",
   "settingsRuntimeFinishPairing": "Finish connection",
   "settingsRuntimeBaseUrl": "Device address",
+  "settingsRuntimeTcpAddressHint": "host:port, for example 192.168.1.10:37195",
+  "settingsRuntimeTransportAuto": "Auto (recommended)",
+  "settingsRuntimeTransportAutoHint": "Enter host:port; the carrier (HTTP/WebSocket/TCP) is detected automatically",
   "settingsRuntimeConnectionFailed": "Device connection failed: {error}",
   "@settingsRuntimeConnectionFailed": {
     "placeholders": {
@@ -1331,7 +1396,7 @@
   "settingsRuntimeDeviceInCurrentSpace": "In the current device space",
   "settingsRuntimeDiscoverSpaces": "Discover device spaces",
   "settingsRuntimeDiscoverSpacesDescription": "Nearby devices are grouped by device space. Expand a device space to connect directly to one of its devices.",
-  "settingsRuntimeWebPairDescription": "Enter another device's address and pairing token to connect this browser as an active pairing client.",
+  "settingsRuntimeWebPairDescription": "Enter another device's address and confirm the pairing code to connect this browser as an active pairing client.",
   "settingsRuntimeDiscoveredSpaceSummary": "{memberCount} devices total · {nearbyCount} nearby",
   "@settingsRuntimeDiscoveredSpaceSummary": {
     "placeholders": {
@@ -1433,20 +1498,6 @@
   },
   "settingsAppearanceThemeSection": "Theme",
   "settingsAppearanceThemeMode": "Current mode",
-  "settingsAppearanceThemeTarget": "Theme save target",
-  "settingsAppearanceThemeTargetGlobal": "Global",
-  "settingsAppearanceThemeTargetCharacter": "Current character: {name}",
-  "@settingsAppearanceThemeTargetCharacter": {
-    "placeholders": {
-      "name": {}
-    }
-  },
-  "settingsAppearanceThemeTargetGroup": "Current group: {name}",
-  "@settingsAppearanceThemeTargetGroup": {
-    "placeholders": {
-      "name": {}
-    }
-  },
   "settingsAppearanceThemeSystem": "System",
   "settingsAppearanceThemeLight": "Light",
   "settingsAppearanceThemeDark": "Dark",
@@ -1490,6 +1541,7 @@
   "settingsAppearanceClearCustomFont": "Clear custom font",
   "settingsAppearanceFontSerif": "Serif",
   "settingsAppearanceFontMonospace": "Mono",
+  "settingsAppearanceInterfaceScale": "Interface scale",
   "settingsAppearanceFontScale": "Font size",
   "settingsAppearanceAvatarSection": "Avatars",
   "settingsAppearanceUserAvatar": "User avatar",
@@ -1503,7 +1555,8 @@
   "settingsAppearanceClearUserAvatar": "Clear user avatar",
   "settingsAppearanceClearAiAvatar": "Clear AI avatar",
   "settingsAppearanceChatDisplaySection": "Chat display",
-  "settingsAppearanceMessageStyle": "Message style",
+  "settingsAppearanceUserMessageStyle": "User message style",
+  "settingsAppearanceAiMessageStyle": "AI message style",
   "settingsAppearanceMessageStyleClean": "Command",
   "settingsAppearanceMessageStyleCard": "Bubble",
   "settingsAppearanceMessageColors": "Message colors",
@@ -1537,8 +1590,21 @@
   "settingsAppearanceBubbleImageNinePatch": "Stretch 9-patch",
   "settingsAppearanceBubbleImageAdjustUser": "Adjust user bubble image",
   "settingsAppearanceBubbleImageAdjustAi": "Adjust AI bubble image",
-  "settingsAppearanceBubbleImagePreview": "Preview",
-  "settingsAppearanceBubbleImagePreviewText": "Bubble preview with 9-slice guides",
+  "settingsAppearanceBubbleImagePreview": "Live preview",
+  "settingsAppearanceBubbleImagePreviewText": "This is a bubble preview message.\nCheck the corners, edges, and center at their rendered size.",
+  "settingsAppearanceBubbleImageSource": "Original",
+  "settingsAppearanceBubbleImageSourceHint": "Original · White: crop boundary. Blue: nine-slice grid. Pinch to zoom and drag to inspect.",
+  "settingsAppearanceBubbleImageFitSource": "Fit original image",
+  "settingsAppearanceBubbleImageGrid": "9-slice",
+  "settingsAppearanceBubbleImageGridHint": "Two horizontal and two vertical cuts form nine regions. Corners stay fixed; edges tile along one axis and the center tiles along both. Stretch mode stretches those regions instead. Boundaries are relative to the cropped image.",
+  "settingsAppearanceBubbleImageImportFailed": "Bubble image was not applied: {error}",
+  "@settingsAppearanceBubbleImageImportFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "settingsAppearanceBubbleImageCrop": "Crop",
   "settingsAppearanceBubbleImageRepeat": "Repeat region",
   "settingsAppearanceBubbleImageScale": "Image scale",
@@ -1558,7 +1624,7 @@
   "settingsAppearanceShowAvatars": "Show message avatars",
   "settingsAppearanceMessageDisplaySection": "Message display",
   "settingsAppearanceShowThinkingProcess": "Show thinking process",
-  "settingsAppearanceShowRoleName": "Show role name",
+  "settingsAppearanceShowRoleName": "Show custom responder names",
   "settingsAppearanceShowUserName": "Show user name",
   "settingsAppearanceShowModelName": "Show model name",
   "settingsAppearanceShowModelProvider": "Show model provider",
@@ -1582,6 +1648,34 @@
   "settingsAppearanceLivePreviewUserSample": "Help me organize today's work plan.",
   "settingsAppearanceLivePreviewAiSample": "Sure! I've organized your core task list and we're ready to start.",
   "settingsAppearanceLivePreviewThinkingSample": "Analyzing context and schedule priorities...",
+  "settingsDataLogsSection": "Diagnostic logs",
+  "settingsDataLogsDescription": "Export the selected Core and this client’s logs as one time-ordered .log file, marked [CORE] / [CLIENT]. Logs may contain sensitive data; review before sharing.",
+  "settingsDataExportLogs": "Export diagnostic logs",
+  "settingsDataLogsExporting": "Exporting logs…",
+  "settingsDataLogsExportError": "Log export failed: {error}",
+  "@settingsDataLogsExportError": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsDataLogsExportPartial": "Saved to {path}. One log source could not be read; see the warnings in the file.",
+  "@settingsDataLogsExportPartial": {
+    "placeholders": {
+      "path": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsDataOverviewLoadError": "The data overview could not be loaded: {error}. You can still export diagnostic logs.",
+  "@settingsDataOverviewLoadError": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "settingsDataRuntimeSection": "Data overview",
   "settingsDataCoreVersion": "Current version",
   "settingsDataStorageSection": "Storage location",
@@ -1591,6 +1685,16 @@
   "settingsDataChooseStorageRoots": "Edit locations",
   "settingsDataEditStorageRootsTitle": "Edit storage locations",
   "settingsDataStorageRootsRequired": "Runtime root and workspace root are required.",
+  "storageDirectoryTermuxUnsupported": "Termux's document provider is not supported for local storage paths. Choose a directory in shared storage (such as Download or Documents) instead of Termux's private directory.",
+  "storageDirectoryProviderUnsupported": "The selected directory cannot be resolved to a supported local storage path. Choose a directory in shared storage (such as Download or Documents), or enter a local path that this app can access.",
+  "storageDirectorySelectionFailed": "Could not select a directory: {error}",
+  "@storageDirectorySelectionFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "settingsDataStorageConfirmTitle": "Change storage location",
   "settingsDataStorageConfirmMessage": "Runtime and workspace data will be copied into the selected directories, and the app will use them after restart.",
   "settingsDataStorageConfirmAction": "Change location",
@@ -1603,14 +1707,10 @@
       }
     }
   },
-  "settingsDataTokenSection": "Usage statistics",
   "settingsDataInputTokens": "Input",
   "settingsDataOutputTokens": "Output",
-  "settingsDataOpenDetailedStats": "View detailed statistics",
-  "settingsDataOpenDetailedStatsDescription": "Open daily trends, input/output token changes, heatmap intensity, and usage breakdown by provider, model, and function model.",
-  "settingsDataRefreshTokenStats": "Refresh statistics",
   "settingsDataResetTokenStats": "Reset statistics",
-  "settingsDataDetailedStatsTitle": "Detailed statistics",
+  "settingsUsageReportResetConfirmation": "This permanently deletes all saved model usage records. Your conversations are kept.",
   "settingsDataDetailedStatsDescription": "Statistics are calculated from dedicated model request records.",
   "settingsDataDetailedStatsEmpty": "No detailed usage records yet",
   "settingsDataDetailedStatsDateRange": "{start} to {end}",
@@ -1641,7 +1741,6 @@
   "settingsDataDetailedStatsSourceToolResult": "Tool-result response",
   "settingsDataDetailedStatsSourceSummary": "Summary generation",
   "settingsDataDetailedStatsSourceTitleGeneration": "Title generation",
-  "settingsDataDetailedStatsSourceMemory": "Memory analysis",
   "settingsDataDetailedStatsTotalRequests": "Total requests",
   "settingsDataDetailedStatsCachedInput": "Cached input",
   "settingsDataDetailedStatsActiveDays": "Active days",
@@ -1724,10 +1823,6 @@
   "settingsDataBackupSection": "Backup & restore",
   "settingsDataChatHistoriesBackup": "Chat data",
   "settingsDataChatHistoriesBackupDescription": "Back up all chats and messages. Restore updates or creates chats by chat ID.",
-  "settingsDataCharacterCardsBackup": "Character card data",
-  "settingsDataCharacterCardsBackupDescription": "Back up all character cards and referenced tags. Restore updates or creates items by original ID.",
-  "settingsDataCharacterGroupsBackup": "Group data",
-  "settingsDataCharacterGroupsBackupDescription": "Back up all groups. Restore keeps member references and ordering.",
   "settingsDataModelConfigsBackup": "Model settings",
   "settingsDataModelConfigsBackupDescription": "Back up all model settings, including model parameters and API key pools.",
   "settingsDataBackupCount": "{count} items",
@@ -1771,9 +1866,32 @@
     }
   },
   "settingsDataSnapshotBackupTitle": "Full snapshot",
-  "settingsDataExportRawSnapshot": "Export snapshot",
-  "settingsDataImportRawSnapshot": "Restore snapshot",
-  "settingsDataExportRawSnapshotDescription": "Pack chats, characters, model settings, and local files into one backup file. Restoring replaces current data with the backup.",
+  "settingsDataExportRawSnapshot": "Export full snapshot",
+  "settingsDataImportRawSnapshot": "Restore a full snapshot",
+  "settingsDataExportRawSnapshotDescription": "Package chats, plugin data, model settings, and local files as an .opsnapshot file.",
+  "settingsDataDatabaseBackup": "Database backup",
+  "settingsDataDatabaseBackupDescription": "Save a copy of the database daily and keep the 10 most recent automatic backups. Attachments and workspace files are stored separately.",
+  "settingsDataBackupScheduled": "Daily backup is on",
+  "settingsDataBackupUnavailable": "Choose an accessible folder to turn on daily backups",
+  "settingsDataBackupNow": "Back up now",
+  "settingsDataBackupSaved": "Database backup saved.",
+  "settingsDataRecoverySection": "Restore data",
+  "settingsDataRestoreDatabaseDescription": "Choose a dated database backup. The restored data becomes the source of truth for sync with other devices.",
+  "settingsDataRestoreArchiveDescription": "Replace current runtime data with an Operit2 full snapshot and restart the app.",
+  "settingsDataImportSection": "Import data",
+  "settingsDataImportOperit1Description": "Preview an Operit1 snapshot before migrating chats, model settings, and files.",
+  "settingsDataImportChatJson": "Import chat JSON",
+  "settingsDataImportChatJsonDescription": "Add chats and update existing chats with matching IDs.",
+  "settingsDataImportModelJson": "Import model settings JSON",
+  "settingsDataImportModelJsonDescription": "Add model provider settings and update existing providers with matching IDs.",
+  "settingsDataImportAction": "Import",
+  "settingsDataReadingSnapshot": "Reading snapshot",
+  "settingsDataPreparingPreview": "Preparing preview",
+  "settingsDataOperit1ImportResult": "Imported {chatCount} chats and {messageCount} messages.",
+  "@settingsDataOperit1ImportResult": {"placeholders": {"chatCount": {"type": "int"}, "messageCount": {"type": "int"}}},
+  "settingsDataExportSection": "Export files",
+  "settingsDataExportChatJson": "Export chat JSON",
+  "settingsDataExportModelJson": "Export model settings JSON",
   "settingsDataSnapshotBytes": "Snapshot size: {bytes} bytes",
   "@settingsDataSnapshotBytes": {
     "placeholders": {
@@ -1858,38 +1976,65 @@
   "settingsDataAdvancedBackupOptions": "Advanced options",
   "settingsDataAdvancedBackupOptionsDescription": "Single-item JSON export and restore",
   "settingsRuntimeNetworkControl": "Network control",
-  "settingsRuntimeNetworkControlDescription": "Roles, identities, device authority, and audit",
+  "settingsRuntimeNetworkControlDescription": "Manage device identities and permissions, and review activity",
+  "settingsRuntimeIdentitiesAndPermissions": "Identities & permissions",
   "settingsRuntimeControlInitialize": "Initialize control",
   "settingsRuntimeControlRoles": "Roles",
   "settingsRuntimeControlIdentities": "Identities",
-  "settingsRuntimeControlAudit": "Audit",
-  "settingsRuntimeControlAddRole": "Add role",
+  "settingsRuntimeControlAuditAccepted": "Applied",
+  "settingsRuntimeControlAuditRejected": "Rejected",
+  "settingsRuntimeControlAuditIssuer": "Requested by",
+  "settingsRuntimeControlAuditDetails": "Technical details",
+  "settingsRuntimeControlAuditBootstrap": "Initialize space permissions",
+  "settingsRuntimeControlAuditAdmit": "Admit device",
+  "settingsRuntimeControlAuditMerge": "Merge device spaces",
+  "settingsRuntimeControlAuditPolicy": "Update permission policy",
+  "settingsRuntimeControlAudit": "Activity",
+  "settingsRuntimeControlAddRole": "New identity",
   "settingsRuntimeControlGrantRole": "Grant role",
   "settingsRuntimeControlAddIdentity": "Add identity",
   "settingsRuntimeControlBindDevice": "Bind device",
-  "settingsRuntimeControlRoleName": "Role name",
-  "settingsRuntimeControlCapabilities": "What can this role do?",
+  "settingsRuntimeControlRoleName": "Identity name",
+  "settingsRuntimeControlCapabilities": "Actions this identity can perform",
   "settingsRuntimeControlManagedDevices": "Devices this role can manage (empty = all)",
   "settingsRuntimeControlIdentityName": "Identity name",
-  "settingsRuntimeControlDevice": "Device",
   "settingsRuntimeControlDeviceId": "Device ID",
-  "settingsRuntimeControlNoAudit": "No control commands recorded",
+  "settingsRuntimeControlNoAudit": "No activity yet. Identity and device changes will appear here.",
+  "settingsRuntimeControlAuditCount": "{count} records",
+  "@settingsRuntimeControlAuditCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "settingsRuntimeControlNoBindings": "No device bindings",
   "settingsRuntimeControlGranted": "Granted",
   "settingsRuntimeControlRevoked": "Revoked",
   "settingsRuntimeControlRemoveDevice": "Remove device",
-  "settingsRuntimeControlDisconnectDevice": "Disconnect device",
+  "settingsRuntimeControlDisconnectDevice": "Isolate device",
   "settingsRuntimeControlRemoved": "Removed",
-  "settingsRuntimeControlDisconnected": "Disconnected",
-  "settingsRuntimeControlAdmitDevice": "Readmit device",
+  "settingsRuntimeControlDisconnected": "Isolated",
+  "settingsRuntimeControlAdmitDevice": "Lift isolation",
   "settingsRuntimeControlAllDevices": "All devices",
   "settingsRuntimeControlManages": "Manages",
+  "settingsRuntimeControlLocalIdentity": "This device",
   "settingsRuntimeControlCurrentIdentity": "Current identity",
-  "settingsRuntimeControlCurrentCapabilities": "Current capabilities",
+  "settingsRuntimeControlCurrentCapabilities": "Permissions",
   "settingsRuntimeControlManageIdentities": "Manage identities",
   "settingsRuntimeControlAssignIdentity": "Set device identity",
-  "settingsRuntimeControlClearIdentity": "Clear device identity",
-  "settingsRuntimeControlIdentityDefinitions": "Identity definitions",
+  "settingsRuntimeControlClearIdentity": "Reset to default identity",
+  "settingsRuntimeControlDeviceAdmitted": "Isolation lifted; waiting for the device to reconnect",
+  "settingsRuntimeControlIdentityResetDone": "Identity reset to the default user",
+  "settingsRuntimeControlIdentityDefinitions": "Identity permissions",
+  "settingsRuntimeControlIdentityCount": "{count} identities",
+  "@settingsRuntimeControlIdentityCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "settingsRuntimeControlIdentityAssignment": "Identity assignment",
   "settingsRuntimeControlNoIdentity": "No identity assigned",
   "settingsRuntimeControlOnline": "Online",
@@ -1897,10 +2042,8 @@
   "settingsRuntimeControlCapabilityAll": "Everything",
   "settingsRuntimeControlCapabilityAuditRead": "View audit history",
   "settingsRuntimeControlCapabilityNetworkRelay": "Relay network traffic",
-  "settingsRuntimeControlCapabilityStorageProvide": "Provide storage",
-  "settingsRuntimeControlCapabilityRuntimeExecute": "Run tasks",
-  "settingsRuntimeControlCapabilityNetworkUser": "Use the network",
-  "settingsRuntimeControlCapabilityChatRead": "Read chat history",
+  "settingsRuntimeControlCapabilityStorageProvide": "Store shared data replicas",
+  "settingsRuntimeControlCapabilityRuntimeExecute": "Host Core execution",
   "settingsRuntimeControlCapabilityViewDevices": "View devices and current identities",
   "settingsRuntimeControlCapabilityApproval": "Approve authorizations",
   "chatRoutePermissionDenied": "Permission denied: target device {targetNodeId} lacks the {capability} capability.",
@@ -1911,10 +2054,8 @@
     }
   },
   "settingsRuntimeControlRoleAdministrator": "Administrator",
-  "settingsRuntimeControlRoleAuditor": "Auditor",
   "settingsRuntimeControlRoleRelay": "Relay node",
-  "settingsRuntimeControlRoleStorage": "Storage node",
-  "settingsRuntimeControlRoleRunner": "Task runner",
+  "settingsRuntimeControlRoleEdge": "Edge node",
   "settingsRuntimeControlRoleUser": "User",
   "pluginLoadingTitle": "Loading",
   "pluginLoadingSkip": "Skip",
@@ -1942,6 +2083,7 @@
   "pluginLoadingFailed": "Failed",
   "pluginLoadingWaiting": "Waiting",
   "pluginLoadingKindPackage": "Package",
+  "pluginLoadingKindPlugin": "Plugin",
   "pluginLoadingKindMcp": "MCP",
   "pluginLoadingCompleteSuccess": "All packages and plugins loaded",
   "pluginLoadingCompleteWithFailures": "Some packages or plugins failed to load",
@@ -1951,6 +2093,9 @@
   "chatRouteRemoteOffline": "Remote {platform} offline",
   "chatRouteLoading": "Loading execution device",
   "chatRouteUnknown": "Execution device status unknown",
+  "chatRouteClaimHostPrompt": "The device host for this chat was not found. Switch it to this device?",
+  "chatRouteClaimHostYes": "Yes",
+  "chatRouteClaimHostNo": "No",
   "@chatRouteRemote": {
     "placeholders": {
       "platform": {
@@ -2047,7 +2192,7 @@
       }
     }
   },
-  "chatMessageRole": "Role: {roleName}",
+  "chatMessageRole": "Responder: {roleName}",
   "@chatMessageRole": {
     "placeholders": {
       "roleName": {
@@ -2134,5 +2279,519 @@
         "type": "String"
       }
     }
-  }
+  },
+  "settingsPeerPortModeHelp": "By default, the system assigns an available port and LAN discovery advertises it. Fixed mode uses the entered listen address and port and reports an error if the port is busy.",
+  "settingsPeerPortMode": "Port allocation",
+  "settingsPeerPortModeFixed": "Fixed listen address and port",
+  "settingsPeerPortModeAutomatic": "Automatic port",
+  "settingsPeerNetworkDiscoveryHelp": "For discovery across routed networks, configure a shared directory and group key. To host the directory, leave the address empty and set a group key.",
+  "settingsPeerDiscoveryDirectory": "Discovery directory (optional)",
+  "settingsPeerDiscoveryGroup": "Discovery group key",
+  "settingsPeerDiscoveryGenerateKey": "Generate new group key",
+  "settingsPeerDiscoveryCopyKey": "Copy group key",
+  "settingsPeerDiscoveryPort": "Directory listener port",
+  "settingsPeerDiscoveryPortHelp": "Only used on the directory host. Other devices use the port in the directory URL.",
+  "settingsPeerNetworkDiscoveryInvalid": "Check the discovery settings: use an HTTP(S) origin without a path, a shared key of 16–128 bytes, and a nonzero port when hosting the directory.",
+  "settingsPeerAdvanced": "Advanced options",
+  "settingsPeerDiscoveryUnavailable": "This Host cannot advertise listeners on the local network. Direct connections remain available for supported transports.",
+  "settingsPeerTransportUnavailable": "{transport} listening is not supported by this Host.",
+  "@settingsPeerTransportUnavailable": {
+    "placeholders": {
+      "transport": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsPeerTransportHelp": "Listener transports (multiple selections). HTTP, WebSocket and TCP share one listening port and can be combined freely. Bluetooth requires platform support. Clear all selections and disable discovery to stop listening. Changing settings interrupts existing connections. Disabling discovery alone does not stop direct connections.",
+  "settingsPeerBindAddress": "Listen IP address",
+  "settingsPeerBindAddressHelp": "Example: 0.0.0.0 for LAN access; IPv6 addresses are also supported.",
+  "settingsPeerBindPort": "Listen port",
+  "settingsPeerBindPortHelp": "The port used by fixed listener mode.",
+  "settingsPeerBindPortAutomaticHelp": "The system assigns an available port. The actual port appears after startup.",
+  "settingsPeerDiscoveryNeedsTransport": "Select at least one transport before enabling discovery.",
+  "settingsPeerAddressRequired": "Enter a listen IP address.",
+  "settingsPeerPortRequired": "Enter a port from 1 to 65535.",
+  "settingsPeerApplied": "Listener settings applied.",
+  "settingsPeerRestoreFailed": "Failed to restore previous listeners: {error}",
+  "@settingsPeerRestoreFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsPeerCodeInstructions": "Enter this code on the other device to finish pairing. It expires in five minutes. Do not share it with strangers.",
+  "settingsPeerSixDigitCode": "Enter the six-digit pairing code shown on the receiving device.",
+  "spaceJoinRequests": "Space join requests",
+  "spaceJoinReviewer": "Reviewer: {name}",
+  "@spaceJoinReviewer": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "spaceJoinWaitingReviewer": "Waiting for an authorized reviewer to come online",
+  "spaceJoinPending": "Waiting for approval",
+  "spaceJoinApproving": "Decision is being processed",
+  "spaceJoinApproved": "Approved · completing join",
+  "spaceJoinJoined": "Joined",
+  "spaceJoinRejected": "Rejected",
+  "spaceJoinCancelled": "Cancelled",
+  "spaceJoinExpired": "Expired",
+  "spaceJoinSubmit": "Submit request",
+  "spaceJoinApprovalTitle": "Space join request",
+  "spaceJoinApprovalDescription": "{name} wants to join “{space}”. No Space data is shared before approval.",
+  "@spaceJoinApprovalDescription": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "space": {
+        "type": "String"
+      }
+    }
+  },
+  "spaceJoinApprove": "Approve",
+  "spaceJoinReject": "Reject",
+  "spaceJoinRetry": "Submit again",
+  "spaceJoinKeepWaiting": "Keep waiting in background",
+  "spaceJoinCancel": "Cancel request",
+  "spaceJoinCancelFailed": "Could not confirm cancellation. Check the connection or try again later.",
+  "spaceJoinRefreshingFailed": "Cannot reach the device right now. The request is saved and will retry.",
+  "spaceJoinAssignmentChanged": "This request has been transferred or already processed.",
+  "spaceJoinProgressTitle": "Space join request",
+  "spaceJoinSending": "Submitting request…",
+  "spaceJoinSubmitFailed": "Could not submit the request. Check the connection and try again.",
+  "spaceJoinNoDataYet": "Your current Space remains unchanged until approval. You can close this window and keep waiting in the background.",
+  "deviceSpaceAddDevice": "Add device",
+  "deviceSpaceDevices": "Devices",
+  "deviceSpaceMemberNotPaired": "Space member · not paired",
+  "deviceSpaceMemberPaired": "Space member · paired",
+  "deviceSpacePairedOnly": "Paired",
+  "deviceSpaceDirectLink": "Direct",
+  "deviceSpaceRelayHops": "Relayed · {hops} hops",
+  "@deviceSpaceRelayHops": {
+    "placeholders": {
+      "hops": {
+        "type": "int"
+      }
+    }
+  },
+  "deviceSpaceRelayPath": "Path",
+  "deviceSpaceLocalDevice": "This device",
+  "deviceSpaceManageDevice": "Manage device",
+  "deviceSpaceConnectDirect": "Connect directly",
+  "deviceSpaceConnectDirectHint": "This device is already a Space member. Pairing it adds a direct link without joining again; pairing shows a six-digit code on the other device for you to enter.",
+  "deviceSpaceUpdateEndpoint": "Update direct address",
+  "deviceSpaceUpdateEndpointLabel": "Direct address",
+  "deviceSpaceUpdateEndpointHint": "e.g. ws://host:port/link or host:port — use the peer's current listen port",
+  "deviceSpaceUpdateEndpointSaved": "Direct address updated",
+  "deviceSpaceDirectLinkEstablished": "Direct link established: {device}",
+  "@deviceSpaceDirectLinkEstablished": {
+    "placeholders": {
+      "device": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceUnpair": "Unpair device",
+  "deviceSpaceMore": "More device actions",
+  "deviceSpaceConnectionSettings": "Connection settings",
+  "deviceSpaceViewRequest": "View request",
+  "devicePickerNearby": "Nearby devices",
+  "devicePickerDiscoveryFailed": "Nearby device discovery failed: {error}",
+  "@devicePickerDiscoveryFailed": {"placeholders": {"error": {"type": "String"}}},
+  "devicePickerEmpty": "No nearby devices found",
+  "devicePickerHint": "Connect both devices to the same network and enable discovery on the other device.",
+  "devicePickerManual": "Connect using an address",
+  "deviceSpaceMyRequests": "My requests",
+  "deviceSpaceMyReviews": "Awaiting my review",
+  "deviceSpaceNoRequests": "No requests",
+  "workspaceUndo": "Undo",
+  "workspaceRedo": "Redo",
+  "workspaceInsertSymbol": "Insert {symbol}",
+  "@workspaceInsertSymbol": {
+    "placeholders": {
+      "symbol": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceThemeConfig": "Theme configuration",
+  "settingsAppearanceThemeConfigCustom": "Unbound appearance",
+  "settingsAppearanceThemeConfigCreate": "New theme configuration",
+  "settingsAppearanceThemeConfigRename": "Rename theme configuration",
+  "settingsAppearanceThemeConfigDelete": "Delete an inactive theme configuration",
+  "settingsAppearanceThemeConfigName": "Theme name",
+  "settingsAppearanceThemeConfigNameRequired": "Enter a theme name",
+  "settingsAppearanceThemeConfigCustomHint": "Create a theme to save your appearance. Tap a card to switch; choose Edit to customize.",
+  "settingsAppearanceThemeConfigEditingHint": "Tap a card to switch themes. Mode shortcuts change only the current theme. Edits save automatically.",
+  "settingsAppearanceThemeConfigFailed": "Theme operation failed: {detail}",
+  "@settingsAppearanceThemeConfigFailed": {
+    "placeholders": {
+      "detail": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsRuntimeControlEditRole": "Edit role",
+  "settingsRuntimeControlDeleteRole": "Delete role",
+  "settingsRuntimeControlDeleteRoleTitle": "Delete role {roleName}?",
+  "@settingsRuntimeControlDeleteRoleTitle": {
+    "placeholders": {
+      "roleName": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsRuntimeControlDeleteRoleMessage": "Devices holding this role fall back to the default user identity.",
+  "settingsAppearanceThemeConfigSource": "Create from",
+  "settingsAppearanceThemeConfigFromDefaults": "Default appearance",
+  "settingsAppearanceThemeConfigFromCurrent": "Current appearance",
+  "settingsAppearanceThemeConfigInherit": "Inherit: {name}",
+  "@settingsAppearanceThemeConfigInherit": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceThemeConfigFromTemplate": "Template: {name}",
+  "@settingsAppearanceThemeConfigFromTemplate": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceThemeConfigDefaultsHint": "Start with the app defaults",
+  "settingsAppearanceThemeConfigCurrentHint": "Copy your current appearance",
+  "settingsAppearanceThemeConfigSavedSources": "Inherit a saved configuration",
+  "settingsAppearanceThemeConfigPluginSources": "Use a plugin template",
+  "settingsAppearanceThemeConfigSourceHint": "Templates come from installed plugins. New configurations can be edited independently and use existing appearance sync.",
+  "settingsAppearanceLoadFailed": "Unable to load appearance",
+  "settingsAppearanceRepairHint": "Your saved appearance has not been replaced. Retry after repairing its resources, or reset appearance explicitly. Reset keeps your avatar and saved configurations and selects custom appearance.",
+  "settingsAppearanceAssetBackgroundFailed": "The background image could not be loaded. Using the default background ({reference}).",
+  "@settingsAppearanceAssetBackgroundFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetVideoFailed": "The background video could not be played. Using the default background ({reference}).",
+  "@settingsAppearanceAssetVideoFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetBubbleFailed": "The bubble image could not be loaded. Using the default bubble color ({reference}).",
+  "@settingsAppearanceAssetBubbleFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetPreviousRetained": "This theme resource could not be loaded. Keeping the previous image or media ({reference}); your other theme settings still apply.",
+  "@settingsAppearanceAssetPreviousRetained": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetRetry": "Retry",
+  "settingsAppearanceAssetReimportHint": "If retrying does not help, choose and import a readable image or playable video again.",
+  "settingsAppearanceAssetImportFailed": "The background resource was not applied: {reason}. Please choose a readable image or playable video.",
+  "@settingsAppearanceAssetImportFailed": {
+    "placeholders": {
+      "reason": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceRetry": "Retry",
+  "settingsAppearanceResetAfterError": "Reset appearance",
+  "backgroundWorkIdle": "No work is running",
+  "backgroundWorkRunningCount": "work items running",
+  "backgroundWorkWaiting": "Waiting for your confirmation",
+  "backgroundWorkWaitingCount": "awaiting confirmation",
+  "backgroundWorkCompleted": "Completed",
+  "backgroundWorkFailed": "Failed — open to view details",
+  "backgroundWorkCancelled": "Stopped",
+  "backgroundWorkProcessing": "Preparing",
+  "backgroundWorkConnecting": "Connecting",
+  "backgroundWorkReceiving": "Writing a response",
+  "backgroundWorkTool": "Running a tool",
+  "backgroundWorkToolResult": "Processing tool results",
+  "backgroundWorkSummarizing": "Organizing context",
+  "backgroundWorkPlan": "Executing a plan",
+  "backgroundWorkOpen": "View conversation",
+  "backgroundWorkReview": "Review",
+  "backgroundWorkStop": "Stop",
+  "localModelsDeviceOnly": "Stored on this device",
+  "localModelsDeviceOnlyDescription": "Weights, download progress and installation records stay on this device and are excluded from Space sync. Chats can route inference to the device with the model.",
+  "localModelsRunChat": "Run and configure",
+  "localModelsUseForChat": "Use for chat",
+  "localModelsChatActivated": "Selected as the chat model",
+  "localModelsPrompt": "Enter a prompt",
+  "localModelsGenerate": "Generate",
+  "localModelsGenerating": "Generating…",
+  "localModelsThreads": "CPU threads",
+  "localModelsContextSize": "Context size (tokens)",
+  "localModelsBatchSize": "Batch size",
+  "localModelsUnload": "Unload model",
+  "localModelsCpuBackend": "On-device CPU inference",
+  "localModelsLlmDescription": "Download a GGUF model for llama.cpp or an MNN model bundle. After installation, try it here or select it for chat.",
+  "localModelsInvalidSettings": "Check the thread count, context size and batch size.",
+  "localModelsFilterAll": "All models",
+  "localModelsFilterInstalled": "Installed only",
+  "localModelsSearchCatalog": "Search models, tags or engines",
+  "deviceSpaceSyncPeer": "a space device",
+  "deviceSpaceSyncActive": "Syncing with {device}",
+  "@deviceSpaceSyncActive": {
+    "placeholders": {
+      "device": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceSyncCompleted": "Synced with {device}",
+  "@deviceSpaceSyncCompleted": {
+    "placeholders": {
+      "device": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceSyncChecking": "Checking for changes",
+  "deviceSpaceSyncRecords": "Exchanging records",
+  "deviceSpaceSyncRecordProgress": "{completed} / {total} records · {percent}%",
+  "@deviceSpaceSyncRecordProgress": {"placeholders": {"completed": {"type": "int"}, "total": {"type": "int"}, "percent": {"type": "int"}}},
+  "deviceSpaceSyncPendingCount": "{count} records pending application",
+  "@deviceSpaceSyncPendingCount": {"placeholders": {"count": {"type": "int"}}},
+  "deviceSpaceSyncCounting": "Counting total · {count} records processed",
+  "@deviceSpaceSyncCounting": {"placeholders": {"count": {"type": "int"}}},
+  "deviceSpaceSyncFiles": "Transferring and verifying files",
+  "deviceSpaceSyncRetrying": "Sync interrupted. Retrying automatically.",
+  "deviceSpaceSyncPending": "Some data is still pending.",
+  "deviceSpaceSyncCurrentFile": "Current file: {done} / {total}",
+  "@deviceSpaceSyncCurrentFile": {
+    "placeholders": {
+      "done": {
+        "type": "String"
+      },
+      "total": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceSyncTransferred": "{count} records exchanged · {bytes} transferred",
+  "@deviceSpaceSyncTransferred": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      },
+      "bytes": {
+        "type": "String"
+      }
+    }
+  },
+  "deviceSpaceSyncBackground": "You can keep using the app while syncing continues.",
+  "runtimeActivityTitle": "Background tasks",
+  "runtimeActivitySyncing": "Syncing",
+  "runtimeActivitySyncCompleted": "Sync complete",
+  "runtimeActivityWaiting": "Waiting to retry",
+  "runtimeActivityExpand": "Show background tasks",
+  "runtimeActivityLoadingPackages": "Loading extensions",
+  "peerQrTitle": "QR connection",
+  "peerQrScan": "Scan code",
+  "peerQrShow": "My code",
+  "peerQrShowHint": "Scan this code on another device to connect to this device.",
+  "peerQrScanHint": "Scan the Operit connection code on the other device.",
+  "peerQrTrustHint": "This QR code is valid for 5 minutes. Share it only with trusted devices. Confirming joins directly; this device automatically approves when it has administrator approval permissions.",
+  "peerQrConfirmJoin": "Confirm join",
+  "peerQrConfirmJoinHint": "Join this device’s space? Confirm to connect and submit the join request without entering a pairing code.",
+  "peerQrListenerRequired": "Enable receiving connections in connection settings and connect to a network first.",
+  "peerQrCopy": "Copy connection info",
+  "peerQrCopied": "Copied",
+  "peerQrImport": "Import QR image",
+  "peerQrPaste": "Or paste connection info",
+  "peerQrRead": "Read connection info",
+  "peerQrWrongDevice": "This code belongs to a different device. Scan the code for the selected device.",
+  "peerPairTimeoutHint": "Connection timed out: could not reach the other device. A common cause is the other device’s firewall blocking incoming connections. Try initiating the connection from the other device, or allow Operit through the other device’s firewall (especially on public networks).",
+  "peerQrImageInvalid": "No QR code could be read. Choose a clear QR image smaller than 16 MB.",
+  "peerQrCameraUnavailable": "Camera scanning is unavailable. Import a QR image or paste connection info instead.",
+  "peerQrCameraPermission": "Camera access is required. Allow it in system settings, or import a QR image.",
+  "peerQrDevice": "Connect device",
+  "peerQrScanAgain": "Scan another code",
+  "peerQrMethodsHint": "Can’t find the device? Connect with a QR code.",
+  "toolParametersLabel": "Parameters",
+  "toolResultLabel": "Result",
+  "toolGroupThinkingCount": "{count} thinking",
+  "toolGroupCallCount": "{count, plural, one{{count} call} other{{count} calls}}",
+  "toolGroupSearchCount": "{count} search",
+  "toolEditedFileCount": "{count, plural, one{Edited {count} file} other{Edited {count} files}}",
+  "toolViewChanges": "View changes",
+  "toolViewFileDiff": "View diff for {fileName}",
+  "@toolEditedFileCount": {"placeholders": {"count": {"type": "int"}}},
+  "@toolViewFileDiff": {"placeholders": {"fileName": {"type": "String"}}},
+  "toolGroupCompleted": "Completed",
+  "toolGroupExecuting": "Executing",
+  "@toolGroupThinkingCount": {"placeholders": {"count": {"type": "int"}}},
+  "@toolGroupCallCount": {"placeholders": {"count": {"type": "int"}}},
+  "@toolGroupSearchCount": {"placeholders": {"count": {"type": "int"}}},
+  "settingsDataTimelineTitle": "Model usage over time",
+  "settingsDataTimelineHint": "One line per model. Pinch or scroll to zoom, drag to move, and tap to inspect a time bucket.",
+  "settingsDataTimelineHours": "{hours}h",
+  "@settingsDataTimelineHours": {
+    "placeholders": {
+      "hours": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataTimelineBucket": "{minutes} min buckets",
+  "@settingsDataTimelineBucket": {
+    "placeholders": {
+      "minutes": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataTimelineSecondsBucket": "{seconds} sec buckets",
+  "@settingsDataTimelineSecondsBucket": {
+    "placeholders": {
+      "seconds": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataTimelineEarlier": "Earlier",
+  "settingsDataTimelineLater": "Later",
+  "settingsDataTimelineRecent": "Recent 3h",
+  "settingsDataTimelineRange": "Visible time range",
+  "settingsDataTimelineSelectModel": "Select a model below to display its usage",
+  "settingsDataTimelineSpend": "Spending (estimated)",
+  "settingsDataTimelineCacheRate": "Cache hit rate",
+  "settingsDataTimelineSpendHint": "Estimated using current model prices. Shares the time range above.",
+  "settingsDataTimelineCacheRateHint": "Cached input / total input per time bucket. Idle periods have no rate.",
+  "settingsDataTimelineNoPrices": "No matching model prices",
+  "settingsDataTimelinePricesFailed": "Could not load model prices. Refresh to retry.",
+  "settingsDataTimelineUnpriced": "{count} requests have unknown cost",
+  "@settingsDataTimelineUnpriced": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataTimelineKnownSpend": "Known spending (estimated)",
+  "settingsDataDetailedStatsRangeLastDay": "Last 24 hours",
+  "settingsDataTimelineAverageInput": "Average input per request",
+  "settingsDataTimelineAverageInputHint": "Input tokens / requests per bucket, to spot growing context sizes. Idle periods are gaps.",
+  "settingsDataTimelineCacheSavings": "Cache savings (estimated)",
+  "settingsDataTimelineCacheSavingsHint": "At current prices, cached input cost compared with regular input. Per-request billing saves 0; negative values mean a cache surcharge.",
+  "settingsDataTimelineTokensPerRequest": "{tokens} tokens / request",
+  "@settingsDataTimelineTokensPerRequest": {
+    "placeholders": {
+      "tokens": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsDataTimelineUnknownSavings": "Savings unknown for {count} requests",
+  "@settingsDataTimelineUnknownSavings": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "contextStatsSummaryLoadFailed": "Unable to load context statistics",
+  "contextStatsDevicesLoadFailed": "Unable to load device information",
+  "settingsAppearanceThemeLibrary": "Your themes",
+  "settingsAppearanceThemeLibraryHint": "Choose a look. Make it yours.",
+  "settingsAppearanceThemeActive": "In use",
+  "settingsAppearanceThemeApply": "Use this theme",
+  "settingsAppearanceThemeMore": "More theme actions",
+  "settingsAppearanceThemeDuplicate": "Create a copy",
+  "settingsAppearanceThemeUnboundHint": "Keep the current look and edit without binding a saved theme.",
+  "settingsAppearanceThemeDeleteTitle": "Delete theme",
+  "settingsAppearanceThemeDeleteConfirm": "Delete “{name}”? This cannot be undone.",
+  "settingsAppearancePreviewCollapse": "Collapse",
+  "settingsAppearancePreviewExpand": "Expand",
+  "@settingsAppearanceThemeDeleteConfirm": {"placeholders": {"name": {"type": "String"}}},
+  "settingsAppearanceThemeNew": "New theme",
+  "settingsAppearanceDeviceFonts": "Device fonts",
+  "settingsAppearanceChooseDeviceFont": "Choose device font",
+  "settingsAppearanceNoDeviceFonts": "No matching device fonts",
+  "settingsAppearanceDeviceFontPreview": "The quick brown fox · 0123456789\n字体预览：你好，世界",
+  "workspaceFileRename": "Rename",
+  "workspaceFileCopy": "Copy",
+  "workspaceFileCut": "Cut",
+  "workspaceFilePaste": "Paste",
+  "workspaceFileName": "Name",
+  "workspaceFileInvalidName": "Enter a valid name without path separators.",
+  "workspaceDeleteFolderTitle": "Delete folder?",
+  "workspaceDeleteFolderMessage": "Delete “{name}” and all its contents? This cannot be undone.",
+  "@workspaceDeleteFolderMessage": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileOperationFailed": "File operation failed: {error}",
+  "@workspaceFileOperationFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileCopyName": "{name} (copy {index})",
+  "@workspaceFileCopyName": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "index": {
+        "type": "int"
+      }
+    }
+  },
+  "workspaceFileSaving": "This file is being saved. Please try again when saving finishes.",
+  "chatBackupChooseTitle": "Choose your backup directory",
+  "chatBackupTitle": "Daily chat backup",
+  "chatBackupDescription": "Copy the complete SQLite database file daily while the app is running and keep the latest 10 automatic backups. Includes all data stored in this database. External attachments, workspaces and separate configuration files are not copied.",
+  "chatRestoreTitle": "Restore from a database backup",
+  "chatRestoreDescription": "Open the folder containing your backups and choose the date you want to restore from.",
+  "chatRestoreChooseFolder": "Choose backup source",
+  "chatRestoreRefresh": "Refresh list",
+  "chatRestoreSelected": "Restore selected backup",
+  "chatRestoreAction": "Restore",
+  "chatRestoreCancel": "Cancel",
+  "chatRestoreEmpty": "This folder contains no database backups.",
+  "chatRestoreConfirmTitle": "Restore this database backup?",
+  "chatRestoreConfirmDescription": "Replace the current database file with {name}. This replaces all data stored in this database. Stop running conversations first. Restoring establishes a new synchronization baseline that replaces older data on other devices.",
+  "@chatRestoreConfirmDescription": {"placeholders": {"name": {"type": "String"}}},
+  "chatRestoreSuccess": "Database restored. The next sync will use this copy as the source of truth.",
+  "chatRestoreOnboardingTitle": "Restore from a previous backup",
+  "chatRestoreOnboardingDescription": "Recover chats saved in an external folder before reinstalling or uninstalling",
+  "chatBackupExternalDescription": "Choose a folder outside the app so backups remain after uninstall. On iPhone and iPad, choose iCloud Drive or another external file provider.",
+  "chatBackupChoose": "Choose backup directory",
+  "chatBackupLater": "Set up later",
+  "chatBackupChange": "Change backup directory",
+  "chatBackupMissing": "The backup directory is not configured, no longer exists or cannot be accessed. Select a directory to enable daily chat backups.",
+  "chatBackupDirectoryUnavailable": "The selected folder cannot be used. Create a new directory inside an accessible folder, such as Documents or Downloads, and select that directory.",
+  "chatBackupReady": "The backup directory is ready. Daily backups are checked at startup, on resume and while the app is running.",
+  "chatBackupNow": "Back up chats now",
+  "chatBackupNever": "No successful backup yet",
+  "chatBackupLastSuccess": "Last successful backup: {time}",
+  "@chatBackupLastSuccess": {"placeholders": {"time": {"type": "String"}}}
 }

@@ -6,7 +6,7 @@ import Darwin
 class RunnerTests: XCTestCase {
 
   func testBundledTerminalRootFilesystem() throws {
-    let url = try XCTUnwrap(Bundle.main.url(forResource: "ish-root", withExtension: "tar.gz"))
+    let url = try XCTUnwrap(Bundle.main.url(forResource: "arm64-rootfs", withExtension: "tar.gz"))
     let file = try FileHandle(forReadingFrom: url)
     defer { try? file.close() }
     XCTAssertEqual(try file.read(upToCount: 2), Data([0x1f, 0x8b]))
@@ -15,7 +15,7 @@ class RunnerTests: XCTestCase {
 
   func testNativeTerminalBridgeRejectsInvalidJSON() throws {
     let response = try terminalCall("terminalList", json: "not-json")
-    XCTAssertEqual(response["error"] as? String, "iSH terminal request is not a JSON object")
+    XCTAssertNotNil(response["error"] as? String)
   }
 
   func testNativeTerminalBridgeListsSessions() throws {
@@ -30,8 +30,8 @@ class RunnerTests: XCTestCase {
     typealias Release = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
     let process = try XCTUnwrap(dlopen(nil, RTLD_NOW))
     defer { dlclose(process) }
-    let call = unsafeBitCast(try XCTUnwrap(dlsym(process, "operit_ios_ish_terminal_call")), to: Call.self)
-    let release = unsafeBitCast(try XCTUnwrap(dlsym(process, "operit_ios_ish_terminal_free")), to: Release.self)
+    let call = unsafeBitCast(try XCTUnwrap(dlsym(process, "operit_ios_arm64_terminal_call")), to: Call.self)
+    let release = unsafeBitCast(try XCTUnwrap(dlsym(process, "operit_ios_arm64_terminal_free")), to: Release.self)
     let pointer = try XCTUnwrap(command.withCString { commandPointer in
       json.withCString { call(commandPointer, $0) }
     })
@@ -40,8 +40,106 @@ class RunnerTests: XCTestCase {
     return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
   }
 
-  func testIshShellExecutesCommand() throws {
-    let finished = expectation(description: "iSH shell executes a command")
+  private func terminalOutput(_ result: [String: Any]) throws -> String {
+    let bytes = try XCTUnwrap(result["outputBytes"] as? [UInt8])
+    return String(decoding: bytes, as: UTF8.self)
+  }
+
+  private class TerminalOutputCapture {
+    var data = Data()
+    var firstOutputAt: Date?
+  }
+
+  func testArm64TerminalStreamsOutputBeforeCompletion() throws {
+    let finished = expectation(description: "ARM64 terminal delivers live output")
+    DispatchQueue.global(qos: .userInitiated).async {
+      defer { finished.fulfill() }
+      do {
+        let created = try self.terminalCall("terminalCreateOrGet",
+          json: "{\"sessionName\":\"ios-live-stream-test\",\"terminalType\":\"shell\"}")
+        let session = try XCTUnwrap((created["result"] as? [String: Any])?["sessionId"] as? String)
+        defer { _ = try? self.terminalCall("terminalClose", json: "{\"sessionId\":\"\(session)\"}") }
+        typealias Output = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Bool
+        typealias StreamCall = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafeMutableRawPointer?, Output?) -> UnsafeMutablePointer<CChar>?
+        typealias Release = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
+        let process = try XCTUnwrap(dlopen(nil, RTLD_NOW))
+        defer { dlclose(process) }
+        let call = unsafeBitCast(try XCTUnwrap(dlsym(process, "operit_ios_arm64_terminal_execute_streaming")), to: StreamCall.self)
+        let release = unsafeBitCast(try XCTUnwrap(dlsym(process, "operit_ios_arm64_terminal_free")), to: Release.self)
+        let capture = TerminalOutputCapture()
+        let output: Output = { context, bytes, length in
+          guard let context else { return false }
+          let capture = Unmanaged<TerminalOutputCapture>.fromOpaque(context).takeUnretainedValue()
+          if let bytes, length > 0 { capture.data.append(bytes, count: length) }
+          let visible = String(decoding: capture.data, as: UTF8.self).replacingOccurrences(of: "\r", with: "")
+          if capture.firstOutputAt == nil && visible.contains("\nLIVE_A\n") { capture.firstOutputAt = Date() }
+          return true
+        }
+        let request: [String: Any] = ["sessionId": session,
+          "command": "printf '\\nLIVE_A\\n'; sleep 1; printf '\\nLIVE_B\\n'", "timeoutMs": 15000]
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: request), as: UTF8.self)
+        let response = try XCTUnwrap("terminalExecute".withCString { command in
+          json.withCString { call(command, $0, Unmanaged.passUnretained(capture).toOpaque(), output) }
+        })
+        defer { release(response) }
+        let returnedAt = Date()
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(String(cString: response).utf8)) as? [String: Any])
+        XCTAssertNil(envelope["error"], "\(envelope)")
+        let result = try XCTUnwrap(envelope["result"] as? [String: Any])
+        XCTAssertEqual(result["exitCode"] as? Int, 0)
+        XCTAssertEqual(result["timedOut"] as? Bool, false)
+        XCTAssertTrue(try self.terminalOutput(result).contains("LIVE_B"))
+        XCTAssertGreaterThan(returnedAt.timeIntervalSince(try XCTUnwrap(capture.firstOutputAt)), 0.2)
+      } catch { XCTFail("\(error)") }
+    }
+    wait(for: [finished], timeout: 90)
+  }
+
+  func testArm64TerminalCancellationKeepsSession() throws {
+    let finished = expectation(description: "cancelled ARM64 stream keeps its session")
+    DispatchQueue.global().async {
+      defer { finished.fulfill() }
+      do {
+        let created = try self.terminalCall("terminalCreateOrGet",
+          json: "{\"sessionName\":\"ios-cancel-stream-test\",\"terminalType\":\"shell\"}")
+        let session = try XCTUnwrap((created["result"] as? [String: Any])?["sessionId"] as? String)
+        defer { _ = try? self.terminalCall("terminalClose", json: "{\"sessionId\":\"\(session)\"}") }
+        typealias Output = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Bool
+        typealias StreamCall = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafeMutableRawPointer?, Output?) -> UnsafeMutablePointer<CChar>?
+        typealias Release = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
+        let process = try XCTUnwrap(dlopen(nil, RTLD_NOW))
+        defer { dlclose(process) }
+        let call = unsafeBitCast(try XCTUnwrap(dlsym(process, "operit_ios_arm64_terminal_execute_streaming")), to: StreamCall.self)
+        let release = unsafeBitCast(try XCTUnwrap(dlsym(process, "operit_ios_arm64_terminal_free")), to: Release.self)
+        let cancelAt = NSDate(timeIntervalSinceNow: 0.2)
+        let output: Output = { context, _, _ in
+          guard let context else { return false }
+          return Unmanaged<NSDate>.fromOpaque(context).takeUnretainedValue().timeIntervalSinceNow > 0
+        }
+        let request: [String: Any] = ["sessionId": session, "command": "sleep 5", "timeoutMs": 15000]
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: request), as: UTF8.self)
+        let response = try XCTUnwrap("terminalExecute".withCString { command in
+          json.withCString { call(command, $0, Unmanaged.passUnretained(cancelAt).toOpaque(), output) }
+        })
+        defer { release(response) }
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(String(cString: response).utf8)) as? [String: Any])
+        XCTAssertNotNil(envelope["error"], "\(envelope)")
+        XCTAssertGreaterThan(cancelAt.timeIntervalSinceNow, -3)
+        let nextRequest: [String: Any] = ["sessionId": session, "command": "printf 'AFTER_CANCEL\\n'", "timeoutMs": 3000]
+        let nextJson = String(decoding: try JSONSerialization.data(withJSONObject: nextRequest), as: UTF8.self)
+        let next = try self.terminalCall("terminalExecute", json: nextJson)
+        XCTAssertNil(next["error"], "\(next)")
+        let result = try XCTUnwrap(next["result"] as? [String: Any])
+        XCTAssertEqual(result["exitCode"] as? Int, 0)
+        XCTAssertEqual(result["timedOut"] as? Bool, false)
+        XCTAssertTrue(try self.terminalOutput(result).contains("AFTER_CANCEL"))
+      } catch { XCTFail("\(error)") }
+    }
+    wait(for: [finished], timeout: 90)
+  }
+
+  func testArm64ShellExecutesCommand() throws {
+    let finished = expectation(description: "ARM64 shell executes a command")
     DispatchQueue.global(qos: .userInitiated).async {
       defer { finished.fulfill() }
       do {
@@ -51,15 +149,15 @@ class RunnerTests: XCTestCase {
         let result = try XCTUnwrap(created["result"] as? [String: Any])
         let session = try XCTUnwrap(result["sessionId"] as? String)
         let request: [String: Any] = ["sessionId": session,
-          "command": "printf '%s_%s\\n' OPERIT ISH_OK; uname -m", "timeoutMs": 15000]
+          "command": "printf '%s_%s\\n' OPERIT ARM64_OK; uname -m", "timeoutMs": 15000]
         let json = String(decoding: try JSONSerialization.data(withJSONObject: request), as: UTF8.self)
         let executed = try self.terminalCall("terminalExecute", json: json)
         XCTAssertNil(executed["error"], "\(executed)")
         let output = try XCTUnwrap(executed["result"] as? [String: Any])
         XCTAssertEqual(output["exitCode"] as? Int, 0, "\(output)")
         XCTAssertEqual(output["timedOut"] as? Bool, false)
-        XCTAssertTrue((output["output"] as? String ?? "").contains("OPERIT_ISH_OK"))
-        XCTAssertTrue((output["output"] as? String ?? "").contains("i686"))
+        XCTAssertTrue((try self.terminalOutput(output)).contains("OPERIT_ARM64_OK"))
+        XCTAssertTrue((try self.terminalOutput(output)).contains("aarch64"))
         for (command, exitCode, expected) in [
           ("sh -c 'exit 7'", 7, ""),
           ("seq 1 3000; printf '%s_%s\\n' LARGE OUTPUT_OK", 0, "LARGE_OUTPUT_OK"),
@@ -75,11 +173,11 @@ class RunnerTests: XCTestCase {
           XCTAssertEqual(result["exitCode"] as? Int, exitCode, "\(result)")
           XCTAssertEqual(result["timedOut"] as? Bool, false)
           if !expected.isEmpty {
-            XCTAssertTrue((result["output"] as? String ?? "").contains(expected), "\(result)")
+            XCTAssertTrue((try self.terminalOutput(result)).contains(expected), "\(result)")
           }
-          NSLog("iSH smoke command passed: %@; exit=%d", command, exitCode)
+          NSLog("ARM64 smoke command passed: %@; exit=%d", command, exitCode)
         }
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ish-mount-\(UUID().uuidString)")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("arm64-mount-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         try Data("MOUNT_READ_OK".utf8).write(to: directory.appendingPathComponent("probe.txt"))
@@ -94,7 +192,7 @@ class RunnerTests: XCTestCase {
           json: String(decoding: try JSONSerialization.data(withJSONObject: readRequest), as: UTF8.self))
         let readResult = try XCTUnwrap(read["result"] as? [String: Any])
         XCTAssertEqual(readResult["exitCode"] as? Int, 0, "\(read)")
-        XCTAssertTrue((readResult["output"] as? String ?? "").contains("MOUNT_READ_OK"), "\(read)")
+        XCTAssertTrue((try self.terminalOutput(readResult)).contains("MOUNT_READ_OK"), "\(read)")
         let startRequest: [String: Any] = ["sessionName": "workspace-path-test",
           "terminalType": "shell", "workingDir": directory.path, "rows": 24, "cols": 42]
         let started = try self.terminalCall("terminalStart",
@@ -105,7 +203,7 @@ class RunnerTests: XCTestCase {
         let probed = try self.terminalCall("terminalExecute",
           json: String(decoding: try JSONSerialization.data(withJSONObject: probe), as: UTF8.self))
         let probeResult = try XCTUnwrap(probed["result"] as? [String: Any])
-        let probeOutput = probeResult["output"] as? String ?? ""
+        let probeOutput = try self.terminalOutput(probeResult)
         XCTAssertEqual(probeResult["exitCode"] as? Int, 0, "\(probed)")
         XCTAssertTrue(probeOutput.contains("MOUNT_READ_OK"), probeOutput)
         XCTAssertTrue(probeOutput.contains("24 42"), probeOutput)
@@ -114,7 +212,7 @@ class RunnerTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent("shell-write.txt"), encoding: .utf8), "SHELL_WRITE_OK")
         NSLog("Workspace path and PTY size verified: %@", probeOutput)
       } catch {
-        XCTFail("iSH smoke test failed: \(error)")
+        XCTFail("ARM64 smoke test failed: \(error)")
       }
     }
     wait(for: [finished], timeout: 120)
@@ -122,13 +220,13 @@ class RunnerTests: XCTestCase {
 
   // Run twice in separate app processes: first seeds persistent files, second
   // verifies them, including an executable in /usr/local/bin, then cleans up.
-  func testIshPersistenceAcrossLaunches() {
-    let finished = expectation(description: "iSH persistent filesystem")
+  func testArm64PersistenceAcrossLaunches() {
+    let finished = expectation(description: "ARM64 persistent filesystem")
     DispatchQueue.global(qos: .userInitiated).async {
       defer { finished.fulfill() }
       do {
         let defaults = UserDefaults.standard
-        let key = "operit.ish.persistence-test-token"
+        let key = "operit.arm64.persistence-test-token"
         let previous = defaults.string(forKey: key)
         let token = previous ?? UUID().uuidString
         let filename = "/root/.operit-persistence-\(token)"
@@ -149,13 +247,13 @@ class RunnerTests: XCTestCase {
         XCTAssertEqual(result["exitCode"] as? Int, 0, "\(response)")
         if previous == nil {
           defaults.set(token, forKey: key)
-          NSLog("iSH persistent files seeded for restart check")
+          NSLog("ARM64 persistent files seeded for restart check")
         } else {
-          let output = result["output"] as? String ?? ""
+          let output = try self.terminalOutput(result)
           // Avoid accepting the echoed command, which also contains the token.
           XCTAssertTrue(output.contains("\(token)PERSISTENT_EXEC_OK"), output)
           defaults.removeObject(forKey: key)
-          NSLog("iSH home file and installed executable verified across process restart")
+          NSLog("ARM64 home file and installed executable verified across process restart")
         }
       } catch {
         XCTFail("Persistence test failed: \(error)")

@@ -2,19 +2,47 @@
 
 #![allow(non_snake_case)]
 pub use crate::js_sdk::{JsNullable, JsOptional};
+use super::catalog::CatalogToolSource;
+use super::network::NetWebSocketEvent;
+use super::chat::ChatSendEvent;
+use super::core::JsonObject;
+use super::models::ModelsSummary;
+use super::storage::{
+    StorageKeyValueEntry, StorageResponse, StorageSqlExecutionResult,
+    StorageSqlRow, StorageValueEntry,
+};
+use super::theme::ThemeConfig;
+use super::tts::TtsConfig;
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+
+/// Preserves an arbitrary JSON result without interpreting strings or discarding null values.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct JsonResultData { pub value: serde_json::Value }
 
 /// Contains every concrete payload returned by the built-in tool runtime.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "__type")]
 pub enum ToolResultData {
+    UIPageResultData(UIPageResultData),
+    UIActionResultData(UIActionResultData),
+    JsonResultData(JsonResultData),
+    EdgePortResultData(EdgePortResultData),
     BooleanResultData(BooleanResultData),
     StringResultData(StringResultData),
     SleepResultData(SleepResultData),
     EnvironmentVariableReadResultData(EnvironmentVariableReadResultData),
     EnvironmentVariableWriteResultData(EnvironmentVariableWriteResultData),
+    ModelsListSummariesResultData(ModelsListSummariesResultData),
+    TtsSynthesizeResultData(TtsSynthesizeResultData),
+    TtsSpeakResultData(TtsSpeakResultData),
+    SttTranscribeResultData(SttTranscribeResultData),
+    TtsListConfigsResultData(TtsListConfigsResultData),
+    TtsGetCurrentConfigIdResultData(TtsGetCurrentConfigIdResultData),
+    TtsSetCurrentConfigIdResultData(TtsSetCurrentConfigIdResultData),
+    ThemeListConfigsResultData(ThemeListConfigsResultData),
+    ThemeApplyConfigResultData(ThemeApplyConfigResultData),
     IntResultData(IntResultData),
     BinaryResultData(BinaryResultData),
     FilePartContentData(FilePartContentData),
@@ -25,6 +53,8 @@ pub enum ToolResultData {
     FileInfoData(FileInfoData),
     FileOperationData(FileOperationData),
     FileApplyResultData(FileApplyResultData),
+    StorageRequestResultData(StorageRequestResultData),
+    WebSocketResultData(WebSocketResultData),
     HttpResponseData(HttpResponseData),
     HttpStreamEventData(HttpStreamEventData),
     SystemSettingData(SystemSettingData),
@@ -34,7 +64,6 @@ pub enum ToolResultData {
     NotificationData(NotificationData),
     LocationData(LocationData),
     DeviceInfoResultData(DeviceInfoResultData),
-    MemoryQueryResultData(MemoryQueryResultData),
     ChatServiceStartResultData(ChatServiceStartResultData),
     ChatCreationResultData(ChatCreationResultData),
     ChatListResultData(ChatListResultData),
@@ -44,13 +73,23 @@ pub enum ToolResultData {
     ChatTitleUpdateResultData(ChatTitleUpdateResultData),
     ChatDeleteResultData(ChatDeleteResultData),
     MessageSendResultData(MessageSendResultData),
+    ChatSendMessageResultData(ChatSendMessageResultData),
+    ChatObservationResultData(ChatObservationResultData),
+    ChatPreparedDeliveryResultData(ChatPreparedDeliveryResultData),
+    ChatScheduledMessagesResultData(ChatScheduledMessagesResultData),
+    ChatScheduleMessageResultData(ChatScheduleMessageResultData),
+    ChatCancelScheduledMessageResultData(ChatCancelScheduledMessageResultData),
+    ChatCancelResultData(ChatCancelResultData),
+    ChatReadExtensionResultData(ChatReadExtensionResultData),
+    ChatWriteExtensionResultData(ChatWriteExtensionResultData),
+    ChatDeleteExtensionResultData(ChatDeleteExtensionResultData),
     ChatCallResultData(ChatCallResultData),
     ChatMessagesResultData(ChatMessagesResultData),
-    CharacterCardListResultData(CharacterCardListResultData),
     VisitWebResultData(VisitWebResultData),
     TerminalInfoResultData(TerminalInfoResultData),
     TerminalCommandResultData(TerminalCommandResultData),
     TerminalStreamEventData(TerminalStreamEventData),
+    TerminalObservationResultData(TerminalObservationResultData),
     HiddenTerminalCommandResultData(HiddenTerminalCommandResultData),
     TerminalSessionCreationResultData(TerminalSessionCreationResultData),
     TerminalSessionCloseResultData(TerminalSessionCloseResultData),
@@ -64,10 +103,10 @@ pub enum ToolResultData {
     BluetoothReadData(BluetoothReadData),
     BluetoothBleServicesData(BluetoothBleServicesData),
     BluetoothBleNotificationData(BluetoothBleNotificationData),
+    CatalogReadToolSourcesResultData(CatalogReadToolSourcesResultData),
+    MediaRegistrationResultData(MediaRegistrationResultData),
     FindFilesResultData(FindFilesResultData),
     GrepResultData(GrepResultData),
-    MemoryLinkResultData(MemoryLinkResultData),
-    MemoryLinkQueryResultData(MemoryLinkQueryResultData),
 }
 
 impl ToolResultData {
@@ -81,11 +120,24 @@ impl ToolResultData {
     #[allow(non_snake_case)]
     pub fn toString(&self) -> String {
         match self {
+            Self::UIPageResultData(data) => data.toString(),
+            Self::UIActionResultData(data) => data.toString(),
+            Self::JsonResultData(data) => serde_json::to_string(&data.value).expect("Structured result serialization must succeed"),
+            Self::EdgePortResultData(data) => serde_json::to_string(data).expect("Edge port result serialization failed"),
             Self::BooleanResultData(data) => data.value.to_string(),
             Self::StringResultData(data) => data.value.clone(),
             Self::SleepResultData(data) => data.toString(),
             Self::EnvironmentVariableReadResultData(data) => data.toString(),
             Self::EnvironmentVariableWriteResultData(data) => data.toString(),
+            Self::ModelsListSummariesResultData(data) => data.toString(),
+            Self::TtsSynthesizeResultData(data) => data.toString(),
+            Self::TtsSpeakResultData(data) => data.toString(),
+            Self::SttTranscribeResultData(data) => data.toString(),
+            Self::TtsListConfigsResultData(data) => data.toString(),
+            Self::TtsGetCurrentConfigIdResultData(data) => data.toString(),
+            Self::TtsSetCurrentConfigIdResultData(data) => data.toString(),
+            Self::ThemeListConfigsResultData(data) => data.toString(),
+            Self::ThemeApplyConfigResultData(data) => data.toString(),
             Self::IntResultData(data) => data.value.to_string(),
             Self::BinaryResultData(data) => format!("Binary data ({} bytes)", data.value.len()),
             Self::FilePartContentData(data) => data.toString(),
@@ -96,6 +148,8 @@ impl ToolResultData {
             Self::FileInfoData(data) => data.toString(),
             Self::FileOperationData(data) => data.toString(),
             Self::FileApplyResultData(data) => data.toString(),
+            Self::StorageRequestResultData(data) => data.toString(),
+            Self::WebSocketResultData(data) => data.toString(),
             Self::HttpResponseData(data) => data.toString(),
             Self::HttpStreamEventData(data) => data.toString(),
             Self::SystemSettingData(data) => data.toString(),
@@ -105,7 +159,6 @@ impl ToolResultData {
             Self::NotificationData(data) => data.toString(),
             Self::LocationData(data) => data.toString(),
             Self::DeviceInfoResultData(data) => data.toString(),
-            Self::MemoryQueryResultData(data) => data.toString(),
             Self::ChatServiceStartResultData(data) => {
                 if data.isConnected {
                     "Chat service started and connected successfully".to_string()
@@ -125,6 +178,16 @@ impl ToolResultData {
             }
             Self::ChatDeleteResultData(data) => format!("Deleted chat: {}", data.chatId),
             Self::MessageSendResultData(data) => data.toString(),
+            Self::ChatSendMessageResultData(data) => data.toString(),
+            Self::ChatObservationResultData(data) => data.toString(),
+            Self::ChatPreparedDeliveryResultData(data) => data.toString(),
+            Self::ChatScheduledMessagesResultData(data) => data.toString(),
+            Self::ChatScheduleMessageResultData(data) => data.toString(),
+            Self::ChatCancelScheduledMessageResultData(data) => data.toString(),
+            Self::ChatCancelResultData(data) => data.toString(),
+            Self::ChatReadExtensionResultData(data) => data.toString(),
+            Self::ChatWriteExtensionResultData(data) => data.toString(),
+            Self::ChatDeleteExtensionResultData(data) => data.toString(),
             Self::ChatCallResultData(data) => data.toString(),
             Self::ChatMessagesResultData(data) => {
                 let rangeInfo = match (data.start, data.end) {
@@ -140,11 +203,11 @@ impl ToolResultData {
                     data.messages.len()
                 )
             }
-            Self::CharacterCardListResultData(data) => data.toString(),
             Self::VisitWebResultData(data) => data.toString(),
             Self::TerminalInfoResultData(data) => data.toString(),
             Self::TerminalCommandResultData(data) => data.toString(),
             Self::TerminalStreamEventData(data) => data.toString(),
+            Self::TerminalObservationResultData(data) => serde_json::to_string(data).expect("Terminal observation serialization failed"),
             Self::HiddenTerminalCommandResultData(data) => data.toString(),
             Self::TerminalSessionCreationResultData(data) => data.toString(),
             Self::TerminalSessionCloseResultData(data) => data.message.clone(),
@@ -158,10 +221,10 @@ impl ToolResultData {
             Self::BluetoothReadData(data) => data.toString(),
             Self::BluetoothBleServicesData(data) => data.toString(),
             Self::BluetoothBleNotificationData(data) => data.toString(),
+            Self::CatalogReadToolSourcesResultData(data) => data.toString(),
+            Self::MediaRegistrationResultData(data) => data.toString(),
             Self::FindFilesResultData(data) => data.toString(),
             Self::GrepResultData(data) => data.toString(),
-            Self::MemoryLinkResultData(data) => data.toString(),
-            Self::MemoryLinkQueryResultData(data) => data.toString(),
         }
     }
 }
@@ -243,6 +306,9 @@ pub struct SimplifiedUINode {
     pub bounds: Option<String>,
     #[serde(rename = "isClickable")]
     pub is_clickable: bool,
+    /// Preserves platform accessibility roles, states and supported actions.
+    #[serde(default)]
+    pub properties: BTreeMap<String, serde_json::Value>,
     #[serde(rename = "children")]
     pub children: Vec<SimplifiedUINode>,
 }
@@ -255,13 +321,11 @@ impl SimplifiedUINode {
     /// Formats this node and its descendants as an indented tree.
     #[allow(non_snake_case)]
     pub fn toTreeString(&self, indent: Option<String>) -> String {
-        let indent = indent.unwrap_or_default();
-        let mut output = format!("{indent}{}", self.toString());
-        let child_indent = format!("{indent}  ");
-        for child in &self.children {
-            output.push('\n');
-            output.push_str(&child.toTreeString(Some(child_indent.clone())));
-        }
+        let mut output = String::new();
+        let mut counts = [0usize; 4];
+        append_ui_summary(self, &indent.unwrap_or_default(), 0, &mut output, &mut counts);
+        let omitted = counts[1] - counts[2];
+        output.push_str(&format!("\n[UI summary: {} native nodes; {} shown; {} useful nodes omitted; {} empty nodes collapsed]", counts[0], counts[2], omitted, counts[0] - counts[1]));
         output
     }
     /// Reports whether the node contains information relevant to UI automation.
@@ -280,9 +344,128 @@ impl SimplifiedUINode {
             || !self.children.is_empty()
     }
 }
+
+/// Quotes one compact accessibility field without allowing a document to consume the summary budget.
+fn ui_summary_text(text: &str, limit: usize) -> String {
+    let mut value: String = text.split_whitespace()
+        .flat_map(|word| std::iter::once(' ').chain(word.chars())).skip(1).take(limit + 1).collect();
+    if value.chars().count() > limit { value.pop(); value.push('…'); }
+    serde_json::to_string(&value).expect("summary text serializes")
+}
+
+/// Writes useful nodes under a fixed model-context budget while keeping the complete native tree intact.
+fn append_ui_summary(node: &SimplifiedUINode, prefix: &str, depth: usize, output: &mut String, counts: &mut [usize; 4]) {
+    counts[0] += 1;
+    let useful = node.is_clickable
+        || [&node.text, &node.content_desc, &node.resource_id].iter().any(|value| value.as_ref().is_some_and(|text| !text.trim().is_empty()))
+        || ["isEditable", "isFocused"].iter().any(|key| node.properties.get(*key).and_then(serde_json::Value::as_bool) == Some(true));
+    let mut child_depth = depth;
+    if useful {
+        counts[1] += 1;
+        let mut fields = Vec::new();
+        if let Some(class) = &node.class_name {
+            fields.push(class.rsplit('.').next().expect("split has at least one component").to_string());
+        }
+        if let Some(role) = node.properties.get("role").and_then(serde_json::Value::as_str) {
+            let short_role = role.rsplit('.').next().expect("split has at least one component");
+            if !fields.first().is_some_and(|class| class == short_role) {
+                fields.push(format!("role={short_role}"));
+            }
+        }
+        if let Some(text) = node.text.as_deref().filter(|text| !text.trim().is_empty()) {
+            fields.push(ui_summary_text(text, 512));
+        }
+        if let Some(description) = node.content_desc.as_deref().filter(|text| !text.trim().is_empty()) {
+            if node.text.as_deref() != Some(description) { fields.push(format!("desc={}", ui_summary_text(description, 160))); }
+        }
+        if let Some(id) = node.resource_id.as_deref().filter(|text| !text.is_empty()) {
+            fields.push(format!("id={}", serde_json::to_string(id).expect("resource ID serializes")));
+        }
+        if let Some(bounds) = &node.bounds { fields.push(bounds.clone()); }
+        if node.is_clickable { fields.push("clickable".into()); }
+        for key in ["isFocused", "isEditable", "isSelected", "isChecked", "isScrollable", "isOffscreen"] {
+            if node.properties.get(key).and_then(serde_json::Value::as_bool) == Some(true) {
+                fields.push(key.trim_start_matches("is").to_ascii_lowercase());
+            }
+        }
+        if node.properties.get("isEnabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            fields.push("disabled".into());
+        }
+        if node.properties.get("isCheckable").and_then(serde_json::Value::as_bool) == Some(true)
+            && node.properties.get("isChecked").and_then(serde_json::Value::as_bool) == Some(false) {
+            fields.push("unchecked".into());
+        }
+        let line = format!("{prefix}{}{}\n", "  ".repeat(depth.min(12)), fields.join(" "));
+        // Reserve room for counts and the omission marker inside the 16k-character summary budget.
+        let line_chars = line.chars().count();
+        if counts[3] + line_chars <= 15_800 {
+            output.push_str(&line);
+            counts[2] += 1;
+            counts[3] += line_chars;
+        }
+        child_depth += 1;
+    }
+    for child in &node.children { append_ui_summary(child, prefix, child_depth, output, counts); }
+}
+
+#[cfg(test)]
+mod ui_summary_tests {
+    use super::*;
+
+    /// Creates an accessible input with native properties that must stay outside model text.
+    fn button(text: &str) -> SimplifiedUINode {
+        SimplifiedUINode {
+            class_name: Some("android.widget.Button".into()), text: Some(text.into()),
+            content_desc: None, resource_id: Some("save".into()), bounds: Some("[0,0][10,10]".into()),
+            is_clickable: true, properties: BTreeMap::from([
+                ("isFocused".into(), serde_json::json!(true)),
+                ("runtimeId".into(), serde_json::json!("native-private-metadata")),
+            ]), children: vec![],
+        }
+    }
+
+    /// Large native trees stay complete while their model presentation has a strict text budget.
+    #[test]
+    fn large_tree_keeps_raw_nodes_and_bounds_the_text_summary() {
+        let mut root = button("Window");
+        root.children = (0..4501).map(|index| button(&format!("button-{index}"))).collect();
+        let summary = root.toTreeString(None);
+        assert!(summary.chars().count() <= 16_000);
+        assert!(summary.contains("4502 native nodes"));
+        assert!(!summary.contains("; 0 useful nodes omitted;"));
+        assert!(!summary.contains("native-private-metadata"));
+        assert!(summary.contains("id=\"save\" [0,0][10,10] clickable focused"));
+        assert_eq!(root.children[4500].text.as_deref(), Some("button-4500"));
+    }
+
+    /// Empty containers disappear from text and long document values cannot flood model context.
+    #[test]
+    fn summary_flattens_empty_containers_and_shortens_document_text() {
+        let mut root = button("");
+        root.is_clickable = false;
+        root.resource_id = None;
+        root.properties.clear();
+        root.children.push(button(&"very long document ".repeat(2000)));
+        let summary = root.toTreeString(None);
+        assert!(summary.starts_with("Button "));
+        assert_eq!(summary.lines().filter(|line| line.starts_with("Button ")).count(), 1);
+        assert!(summary.contains('…'));
+        assert!(summary.len() < 1500);
+        assert!(root.children[0].text.as_ref().unwrap().len() > 30_000);
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
-/// Captures the active Android package, activity, and simplified UI hierarchy.
+/// Captures the active surface and its platform-neutral accessibility hierarchy.
 pub struct UIPageResultData {
+    /// Identifies the native window that owns this snapshot.
+    #[serde(rename = "windowId")]
+    pub window_id: String,
+    /// Contains a bounded, compact text view for model context; uiElements retains the full tree.
+    pub summary: String,
+    /// Reports the visibility granted by the owning platform.
+    pub scope: String,
+    /// Reports whether the provider reached its traversal budget.
+    pub truncated: bool,
     #[serde(rename = "packageName")]
     pub package_name: String,
     #[serde(rename = "activityName")]
@@ -295,10 +478,13 @@ impl UIPageResultData {
     #[allow(non_snake_case)]
     pub fn toString(&self) -> String {
         format!(
-            "Package: {}\nActivity: {}\n{}",
+            "Window: {}\nScope: {}\nTruncated: {}\nPackage: {}\nActivity: {}\n{}",
+            self.window_id,
+            self.scope,
+            self.truncated,
             self.package_name,
             self.activity_name,
-            self.ui_elements.toTreeString(None)
+            self.summary
         )
     }
 }
@@ -328,6 +514,8 @@ pub enum TerminalType {
     Powershell,
     #[serde(rename = "bash")]
     Bash,
+    #[serde(rename = "zsh")]
+    Zsh,
     #[serde(rename = "shell")]
     Shell,
 }
@@ -337,6 +525,7 @@ impl TerminalType {
         match self {
             Self::Powershell => "powershell",
             Self::Bash => "bash",
+            Self::Zsh => "zsh",
             Self::Shell => "shell",
         }
     }
@@ -354,6 +543,7 @@ impl TryFrom<&str> for TerminalType {
         match value {
             "powershell" => Ok(Self::Powershell),
             "bash" => Ok(Self::Bash),
+            "zsh" => Ok(Self::Zsh),
             "shell" => Ok(Self::Shell),
             _ => Err(format!("invalid terminal type: {value}")),
         }
@@ -372,8 +562,8 @@ pub enum TerminalImplementation {
     Adb,
     #[serde(rename = "shell")]
     Shell,
-    #[serde(rename = "ish")]
-    Ish,
+    #[serde(rename = "arm64")]
+    Arm64,
     #[serde(rename = "qemu-vroot")]
     QemuVroot,
     #[serde(rename = "v86")]
@@ -388,7 +578,7 @@ impl TerminalImplementation {
             Self::AndroidSystem => "android-system",
             Self::Adb => "adb",
             Self::Shell => "shell",
-            Self::Ish => "ish",
+            Self::Arm64 => "arm64",
             Self::QemuVroot => "qemu-vroot",
             Self::V86 => "v86",
         }
@@ -410,7 +600,7 @@ impl TryFrom<&str> for TerminalImplementation {
             "android-system" => Ok(Self::AndroidSystem),
             "adb" => Ok(Self::Adb),
             "shell" => Ok(Self::Shell),
-            "ish" => Ok(Self::Ish),
+            "arm64" => Ok(Self::Arm64),
             "qemu-vroot" => Ok(Self::QemuVroot),
             "v86" => Ok(Self::V86),
             _ => Err(format!("invalid terminal implementation: {value}")),
@@ -498,6 +688,160 @@ pub struct EnvironmentVariableWriteResultData {
     #[serde(rename = "cleared")]
     pub cleared: bool,
 }
+/// Returns the complete configured model summaries.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsListSummariesResultData {
+    pub models: Vec<ModelsSummary>,
+}
+impl ModelsListSummariesResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("ModelsListSummariesResultData serialization failed")
+    }
+}
+
+/// One encoded audio segment, in synthesis order.
+#[derive(Clone, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(deny_unknown_fields)]
+pub struct TtsAudioSegment {
+    #[serde(with = "serde_bytes")]
+    pub audio: Vec<u8>,
+    pub contentType: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TtsSynthesizeResultData { pub segments: Vec<TtsAudioSegment> }
+impl TtsSynthesizeResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("TTS result serialization failed") }
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SttTranscribeResultData { pub text: String }
+impl SttTranscribeResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("STT result serialization failed") }
+}
+
+/// Reports the actual host speech start and the resolved utterance parameters.
+#[derive(Clone, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(deny_unknown_fields)]
+pub struct TtsSpeakResultData {
+    pub providerType: String,
+    pub started: bool,
+    pub interrupt: bool,
+    pub speed: f64,
+    pub pitch: f64,
+}
+impl TtsSpeakResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("TtsSpeakResultData serialization failed")
+    }
+}
+
+/// Returns the complete configured speech records.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TtsListConfigsResultData {
+    pub configs: Vec<TtsConfig>,
+}
+impl TtsListConfigsResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("TtsListConfigsResultData serialization failed")
+    }
+}
+
+/// Returns the current application speech configuration identity.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TtsGetCurrentConfigIdResultData {
+    pub configId: String,
+}
+impl TtsGetCurrentConfigIdResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("TtsGetCurrentConfigIdResultData serialization failed")
+    }
+}
+
+/// Returns the committed application speech configuration identity.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TtsSetCurrentConfigIdResultData {
+    pub configId: String,
+}
+impl TtsSetCurrentConfigIdResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("TtsSetCurrentConfigIdResultData serialization failed")
+    }
+}
+
+/// Returns the pool identity and canonical link for one registered media item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaRegistrationResultData {
+    pub id: String,
+    pub mimeType: String,
+    pub link: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<i32>,
+}
+
+impl MediaRegistrationResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("MediaRegistrationResultData serialization failed")
+    }
+}
+
+/// Returns the complete named appearance configurations.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeListConfigsResultData {
+    pub configs: Vec<ThemeConfig>,
+}
+impl ThemeListConfigsResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("ThemeListConfigsResultData serialization failed")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+/// Returns the actual named appearance record committed by the tool.
+pub struct ThemeApplyConfigResultData {
+    pub id: String,
+    pub name: String,
+    pub snapshot: BTreeMap<String, serde_json::Value>,
+    pub createdAt: i64,
+    pub updatedAt: i64,
+}
+
+impl From<ThemeConfig> for ThemeApplyConfigResultData {
+    fn from(config: ThemeConfig) -> Self {
+        Self {
+            id: config.id,
+            name: config.name,
+            snapshot: config.snapshot,
+            createdAt: config.createdAt,
+            updatedAt: config.updatedAt,
+        }
+    }
+}
+
+impl ThemeApplyConfigResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("ThemeApplyConfigResultData serialization failed")
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 /// Wraps an integer value returned by a built-in tool.
 pub struct IntResultData {
@@ -627,6 +971,101 @@ pub struct FileApplyResultData {
     pub diffContent: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+/// Returns the concrete result fields of the selected Storage tool operation.
+pub enum StorageRequestResultData {
+    #[serde(rename = "open")]
+    Open {
+        handle: String,
+        path: String,
+    },
+    #[serde(rename = "preferences_data")]
+    PreferencesData { snapshot: super::storage::StoragePreferencesSnapshot },
+    #[serde(rename = "preferences_begin_edit")]
+    PreferencesBeginEdit { edit: super::storage::StoragePreferencesEdit },
+    #[serde(rename = "preferences_finish_edit")]
+    PreferencesFinishEdit { snapshot: super::storage::StoragePreferencesSnapshot },
+    #[serde(rename = "preferences_cancel_edit")]
+    PreferencesCancelEdit,
+    #[serde(rename = "close")]
+    Close,
+    #[serde(rename = "query")]
+    Query {
+        rows: Vec<StorageSqlRow>,
+    },
+    #[serde(rename = "execute")]
+    Execute {
+        results: Vec<StorageSqlExecutionResult>,
+    },
+    #[serde(rename = "transaction")]
+    Transaction {
+        results: Vec<StorageSqlExecutionResult>,
+    },
+    #[serde(rename = "define_table")]
+    DefineTable {
+        changed: bool,
+    },
+    #[serde(rename = "get")]
+    Get {
+        entry: JsNullable<StorageValueEntry>,
+    },
+    #[serde(rename = "get_many")]
+    GetMany {
+        entries: Vec<JsNullable<StorageValueEntry>>,
+    },
+    #[serde(rename = "list")]
+    List {
+        entries: Vec<StorageKeyValueEntry>,
+    },
+    #[serde(rename = "changes")]
+    Changes { page: operit_host_api::PluginStorage::StorageChangePage },
+    #[serde(rename = "commit")]
+    Commit {
+        version: String,
+    },
+}
+
+impl From<StorageResponse> for StorageRequestResultData {
+    fn from(response: StorageResponse) -> Self {
+        match response {
+            StorageResponse::Open(opened) => Self::Open {
+                handle: opened.handle,
+                path: opened.path,
+            },
+            StorageResponse::PreferencesData(snapshot) => Self::PreferencesData { snapshot },
+            StorageResponse::PreferencesBeginEdit(edit) => Self::PreferencesBeginEdit { edit },
+            StorageResponse::PreferencesFinishEdit(snapshot) => Self::PreferencesFinishEdit { snapshot },
+            StorageResponse::PreferencesCancelEdit => Self::PreferencesCancelEdit,
+            StorageResponse::Close => Self::Close,
+            StorageResponse::Query(rows) => Self::Query { rows },
+            StorageResponse::Execute(results) => Self::Execute { results },
+            StorageResponse::Transaction(results) => Self::Transaction { results },
+            StorageResponse::DefineTable(result) => Self::DefineTable {
+                changed: result.changed,
+            },
+            StorageResponse::Get(entry) => Self::Get {
+                entry: JsNullable::from_option(entry),
+            },
+            StorageResponse::GetMany(entries) => Self::GetMany {
+                entries: entries.into_iter().map(JsNullable::from_option).collect(),
+            },
+            StorageResponse::List(entries) => Self::List { entries },
+            StorageResponse::Changes(page) => Self::Changes { page },
+            StorageResponse::Commit(result) => Self::Commit {
+                version: result.version,
+            },
+        }
+    }
+}
+
+impl StorageRequestResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("StorageRequestResultData serialization failed")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 /// Contains an HTTP response status, headers, cookies, media type, and decoded or Base64 body.
 pub struct HttpResponseData {
     #[serde(rename = "url")]
@@ -672,6 +1111,9 @@ pub struct SystemSettingData {
 #[derive(Clone, Serialize, Deserialize)]
 /// Reports the outcome of installing, uninstalling, starting, or stopping an application package.
 pub struct AppOperationData {
+    /// permission_required, installer_opened, restart_required, or completed.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "installState")]
+    pub installState: Option<String>,
     #[serde(rename = "operationType")]
     pub operationType: String,
     #[serde(rename = "packageName")]
@@ -809,37 +1251,6 @@ pub struct DeviceInfoResultData {
     pub additionalInfo: BTreeMap<String, String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
-/// Describes one stored memory together with ownership, provenance, tags, and chunk metadata.
-pub struct MemoryInfo {
-    pub ownerKey: String,
-    pub title: String,
-    pub content: String,
-    pub source: String,
-    pub tags: Vec<String>,
-    pub createdAt: String,
-    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
-    pub chunkInfo: JsOptional<String>,
-    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
-    pub chunkIndices: JsOptional<Vec<i32>>,
-}
-#[derive(Clone, Serialize, Deserialize)]
-/// Contains matched memories and snapshot metadata used to suppress previously returned matches.
-pub struct MemoryQueryResultData {
-    ///Queried memories
-    #[serde(rename = "memories")]
-    pub memories: Vec<MemoryInfo>,
-    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
-    ///Snapshot id for de-duplicated follow-up or parallel queries; may be auto-generated or caller-specified
-    #[serde(rename = "snapshotId")]
-    pub snapshotId: JsOptional<String>,
-    ///Whether this call created a new snapshot, including when a caller-specified id was created on first use
-    #[serde(rename = "snapshotCreated")]
-    pub snapshotCreated: Option<bool>,
-    ///Number of matched memories excluded because they were already seen in the snapshot
-    #[serde(rename = "excludedBySnapshotCount")]
-    pub excludedBySnapshotCount: Option<i32>,
-}
-#[derive(Clone, Serialize, Deserialize)]
 /// Reports whether the chat service connected and when the connection was established.
 pub struct ChatServiceStartResultData {
     ///Whether the service is connected
@@ -860,7 +1271,7 @@ pub struct ChatCreationResultData {
     pub createdAt: i64,
 }
 #[derive(Clone, Serialize, Deserialize)]
-/// Summarizes a chat, its activity, token use, current status, and bound character card.
+/// Summarizes a workspace conversation's activity, token use, and current status.
 pub struct ChatInfo {
     ///Chat ID
     #[serde(rename = "id")]
@@ -886,10 +1297,6 @@ pub struct ChatInfo {
     ///Total output tokens used
     #[serde(rename = "outputTokens")]
     pub outputTokens: i64,
-    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
-    ///Bound character card name (if any)
-    #[serde(rename = "characterCardName")]
-    pub characterCardName: JsOptional<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 /// Contains the available chats and identifies the currently active chat.
@@ -970,8 +1377,66 @@ pub struct ChatDeleteResultData {
     #[serde(rename = "deletedAt")]
     pub deletedAt: i64,
 }
-#[derive(Clone, Serialize, Deserialize)]
-/// Records a sent chat message and its optional final AI reply.
+/// Identifies the terminal state of the actual originating generation rather than a hook decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageSendStatus {
+    /// Indicates that generation completed and required persistence succeeded.
+    #[serde(rename = "completed")]
+    Completed,
+    /// Indicates that the originating generation was cancelled.
+    #[serde(rename = "cancelled")]
+    Cancelled,
+}
+
+/// Locates one exact assistant revision committed by the originating generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(deny_unknown_fields)]
+pub struct ChatCommittedMessage {
+    /// Identifies the real persisted message record, never a wall-clock receipt timestamp.
+    pub messageTimestamp: i64,
+    /// Identifies the exact persisted revision; zero is the base message.
+    pub variantIndex: i32,
+}
+
+/// Distinguishes real persistence, nonpersistent output and input ownership decisions without inventing locators.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MessageSendOutcome {
+    /// Carries actual committed identities captured on this turn's persistence path.
+    #[serde(rename = "committed")]
+    Committed {
+        /// Describes completion or cancellation of this generation.
+        status: MessageSendStatus,
+        /// Identifies the original committed user message, including a continuation's existing row.
+        userMessageTimestamp: Option<i64>,
+        /// Locates the actual committed assistant revision or explicitly contains null.
+        assistant: Option<ChatCommittedMessage>,
+    },
+    /// Carries output that deliberately did not persist a turn and therefore has no record locator.
+    #[serde(rename = "not_persisted")]
+    NotPersisted {
+        /// Describes completion or cancellation of the nonpersistent generation.
+        status: MessageSendStatus,
+    },
+    /// Indicates that an input hook prevented submission and no generation was completed.
+    #[serde(rename = "blocked")]
+    Blocked {
+        /// Preserves the hook's explicit explanation.
+        message: Option<String>,
+    },
+    /// Indicates that a plugin took ownership of input, not that its planned turns have completed.
+    #[serde(rename = "consumed")]
+    Consumed {
+        /// Preserves the plugin's explicit input-ownership metadata.
+        metadata: BTreeMap<String, serde_json::Value>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Records only the originating send's terminal result and exact commit receipts.
 pub struct MessageSendResultData {
     ///The ID of the chat the message was sent to
     #[serde(rename = "chatId")]
@@ -990,7 +1455,174 @@ pub struct MessageSendResultData {
     ///Sent timestamp
     #[serde(rename = "sentAt")]
     pub sentAt: i64,
+    /// Reports actual persistence or input ownership without looking up unrelated recent messages.
+    pub outcome: MessageSendOutcome,
+
 }
+#[derive(Clone, Serialize, Deserialize)]
+/// Records the authenticated Chat tool's actual originating send and committed outcome.
+pub struct ChatSendMessageResultData {
+    ///The ID of the chat the message was sent to
+    #[serde(rename = "chatId")]
+    pub chatId: String,
+    ///The message content that was sent
+    #[serde(rename = "message")]
+    pub message: String,
+    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
+    ///Final AI response content when available
+    #[serde(rename = "aiResponse")]
+    pub aiResponse: JsOptional<String>,
+    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
+    ///Reply receive timestamp when available
+    #[serde(rename = "receivedAt")]
+    pub receivedAt: JsOptional<i64>,
+    ///Sent timestamp
+    #[serde(rename = "sentAt")]
+    pub sentAt: i64,
+    /// Reports actual persistence or input ownership without looking up unrelated recent messages.
+    pub outcome: MessageSendOutcome,
+}
+impl From<MessageSendResultData> for ChatSendMessageResultData {
+    fn from(receipt: MessageSendResultData) -> Self {
+        Self {
+            chatId: receipt.chatId,
+            message: receipt.message,
+            aiResponse: receipt.aiResponse,
+            receivedAt: receipt.receivedAt,
+            sentAt: receipt.sentAt,
+            outcome: receipt.outcome,
+        }
+    }
+}
+
+impl ChatSendMessageResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("ChatSendMessageResultData serialization failed")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+/// Describes the concrete resource result for an observation operation.
+pub enum ChatObservationResultData {
+    #[serde(rename = "open")]
+    Open {
+        handle: String,
+    },
+    #[serde(rename = "next")]
+    Next {
+        event: JsNullable<ChatSendEvent>,
+    },
+    #[serde(rename = "close")]
+    Close,
+}
+
+impl ChatObservationResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("ChatObservationResultData serialization failed")
+    }
+}
+
+/// Reports cancellation of the calling owner's active Chat execution.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatCancelResultData {
+    pub chatId: String,
+    pub cancelRequested: bool,
+}
+impl ChatCancelResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("ChatCancelResultData serialization failed")
+    }
+}
+
+/// Reports durable immediate assistant message delivery and optional notification failure.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatPreparedDeliveryResultData {
+    pub chatId: String,
+    pub timestamp: i64,
+    pub duplicate: bool,
+    pub notificationError: JsNullable<String>,
+}
+impl ChatPreparedDeliveryResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("prepared delivery receipt") }
+}
+
+/// Contains the platform-independent outcome of one plugin-owned scheduled message.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatScheduledMessage {
+    pub id: String,
+    pub chatId: String,
+    pub timestamp: i64,
+    /// preparing, scheduled, delivered, cancelled, invalidated, skipped, or failed.
+    pub status: String,
+    pub error: JsNullable<String>,
+    /// Contains the accepted prepared body, including host-generated replies.
+    pub text: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatScheduleMessageResultData { pub message: ChatScheduledMessage }
+impl ChatScheduleMessageResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("scheduled message receipt") }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatScheduledMessagesResultData { pub messages: Vec<ChatScheduledMessage> }
+impl ChatScheduledMessagesResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("scheduled messages") }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatCancelScheduledMessageResultData { pub id: String, pub cancelled: bool }
+impl ChatCancelScheduledMessageResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("scheduled message cancellation") }
+}
+
+/// Returns an owner-scoped Chat extension or its explicit absence.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatReadExtensionResultData {
+    pub extension: JsNullable<JsonObject>,
+}
+impl ChatReadExtensionResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("ChatReadExtensionResultData serialization failed")
+    }
+}
+
+/// Returns the exact owner-scoped Chat extension that was persisted.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatWriteExtensionResultData {
+    pub extension: JsonObject,
+}
+impl ChatWriteExtensionResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("ChatWriteExtensionResultData serialization failed")
+    }
+}
+
+/// Reports whether an owner-scoped Chat extension was removed.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatDeleteExtensionResultData {
+    pub deleted: bool,
+}
+impl ChatDeleteExtensionResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("ChatDeleteExtensionResultData serialization failed")
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 /// Contains the output of one non-persistent functional model call.
 pub struct ChatCallResultData {
@@ -1033,7 +1665,7 @@ impl ChatCallResultData {
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
-/// Describes one chat message together with its role, provider, model, and timestamp.
+/// Describes one chat message's protocol sender, content, provider, model, and timestamp.
 pub struct ChatMessageInfo {
     #[serde(rename = "sender")]
     pub sender: String,
@@ -1041,8 +1673,10 @@ pub struct ChatMessageInfo {
     pub content: String,
     #[serde(rename = "timestamp")]
     pub timestamp: i64,
-    #[serde(rename = "roleName")]
-    pub roleName: String,
+    /// Identifies the exact selected persisted revision; zero selects the base message.
+    pub variantIndex: i32,
+    /// Reports the genuine number of persisted message revisions.
+    pub variantCount: i32,
     #[serde(rename = "provider")]
     pub provider: String,
     #[serde(rename = "modelName")]
@@ -1065,30 +1699,6 @@ pub struct ChatMessagesResultData {
     /// Contains the inclusive last message index for a range query.
     #[serde(rename = "end", skip_serializing_if = "Option::is_none")]
     pub end: Option<i32>,
-}
-#[derive(Clone, Serialize, Deserialize)]
-/// Describes a character card, including its default status and lifecycle timestamps.
-pub struct CharacterCardInfo {
-    #[serde(rename = "id")]
-    pub id: String,
-    #[serde(rename = "name")]
-    pub name: String,
-    #[serde(rename = "description")]
-    pub description: String,
-    #[serde(rename = "isDefault")]
-    pub isDefault: bool,
-    #[serde(rename = "createdAt")]
-    pub createdAt: i64,
-    #[serde(rename = "updatedAt")]
-    pub updatedAt: i64,
-}
-#[derive(Clone, Serialize, Deserialize)]
-/// Contains the character cards available to the chat service.
-pub struct CharacterCardListResultData {
-    #[serde(rename = "totalCount")]
-    pub totalCount: usize,
-    #[serde(rename = "cards")]
-    pub cards: Vec<CharacterCardInfo>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 /// Reports the primary terminal identity and available terminal implementations.
@@ -1146,7 +1756,7 @@ pub struct TerminalCommandResultData {
     ///Actual terminal type used for execution
     #[serde(rename = "terminalType")]
     pub terminalType: TerminalType,
-    ///Whether this execution ended due to timeout. On timeout, the current command is cancelled and the terminal session is kept.
+    ///Whether foreground waiting expired while the original command continues in its session.
     #[serde(rename = "timedOut")]
     pub timedOut: bool,
 }
@@ -1473,6 +2083,22 @@ pub struct LinkData {
     pub url: String,
     pub text: String,
 }
+/// Returns the actual registered built-in, package, skill and MCP tool sources.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogReadToolSourcesResultData {
+    pub builtinTools: Vec<CatalogToolSource>,
+    pub packages: Vec<CatalogToolSource>,
+    pub skills: Vec<CatalogToolSource>,
+    pub mcpServers: Vec<CatalogToolSource>,
+}
+impl CatalogReadToolSourcesResultData {
+    /// Formats the concrete tool fields for the common text result path.
+    pub fn toString(&self) -> String {
+        serde_json::to_string(self).expect("CatalogReadToolSourcesResultData serialization failed")
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 /// Contains file paths matching a pattern beneath a requested search path.
 pub struct FindFilesResultData {
@@ -1514,45 +2140,6 @@ pub struct GrepResultData {
     pub totalMatches: i32,
     #[serde(rename = "filesSearched")]
     pub filesSearched: i32,
-}
-#[derive(Clone, Serialize, Deserialize)]
-/// Describes a newly created weighted relationship between two memories.
-pub struct MemoryLinkResultData {
-    ///The title of the source memory
-    #[serde(rename = "sourceTitle")]
-    pub sourceTitle: String,
-    ///The title of the target memory
-    #[serde(rename = "targetTitle")]
-    pub targetTitle: String,
-    ///The type of link (e.g., "related", "causes", "explains", "part_of")
-    #[serde(rename = "linkType")]
-    pub linkType: String,
-    ///The strength of the link (0.0-1.0)
-    #[serde(rename = "weight")]
-    pub weight: f32,
-    ///Optional description of the link
-    #[serde(rename = "description")]
-    pub description: String,
-}
-#[derive(Clone, Serialize, Deserialize)]
-/// Describes a weighted relationship between two stored memories.
-pub struct LinkInfo {
-    pub linkId: i64,
-    pub sourceTitle: String,
-    pub targetTitle: String,
-    pub linkType: String,
-    pub weight: f32,
-    pub description: String,
-}
-#[derive(Clone, Serialize, Deserialize)]
-/// Contains the weighted memory relationships returned by a link query.
-pub struct MemoryLinkQueryResultData {
-    ///Number of links returned
-    #[serde(rename = "totalCount")]
-    pub totalCount: i32,
-    ///Queried links
-    #[serde(rename = "links")]
-    pub links: Vec<LinkInfo>,
 }
 impl SleepResultData {
     /// Formats the actual sleep duration in milliseconds.
@@ -1729,6 +2316,8 @@ impl FileApplyResultData {
             .map(String::as_str)
             .chain(std::iter::once(self.aiDiffInstructions.as_str()))
         {
+            let mut additions = 0;
+            let mut deletions = 0;
             for line in candidate.lines() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("Changes: +")
@@ -1736,6 +2325,14 @@ impl FileApplyResultData {
                 {
                     return Some(trimmed.to_string());
                 }
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    additions += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    deletions += 1;
+                }
+            }
+            if additions > 0 || deletions > 0 {
+                return Some(format!("Changes: +{additions} -{deletions} lines"));
             }
         }
         None
@@ -1817,25 +2414,25 @@ impl AppOperationData {
         match self.operationType.as_str() {
             "install" => {
                 format!(
-                    "Successfully installed app: {} {}",
+                    "App installation request: {} {}",
                     self.packageName, self.details
                 )
             }
             "uninstall" => {
                 format!(
-                    "Successfully uninstalled app: {} {}",
+                    "App uninstall request: {} {}",
                     self.packageName, self.details
                 )
             }
             "start" => {
                 format!(
-                    "Successfully started app: {} {}",
+                    "App launch request: {} {}",
                     self.packageName, self.details
                 )
             }
             "stop" => {
                 format!(
-                    "Successfully stopped app: {} {}",
+                    "App stop request: {} {}",
                     self.packageName, self.details
                 )
             }
@@ -1965,58 +2562,9 @@ impl DeviceInfoResultData {
         sb
     }
 }
-impl MemoryQueryResultData {
-    #[allow(non_snake_case)]
-    /// Formats snapshot de-duplication metadata followed by the matched memory records.
-    pub fn toString(&self) -> String {
-        let mut snapshotSummary = Vec::new();
-        if let Some(snapshotId) = self
-            .snapshotId
-            .as_value()
-            .filter(|value| !value.trim().is_empty())
-        {
-            snapshotSummary.push(format!("Snapshot ID: {snapshotId}"));
-        }
-        if self.snapshotCreated.is_some_and(|created| created) {
-            snapshotSummary.push("Snapshot created: true".to_string());
-        }
-        if let Some(excluded_count) = self.excludedBySnapshotCount.filter(|count| *count > 0) {
-            snapshotSummary.push(format!("Excluded by snapshot: {excluded_count}"));
-        }
-        let snapshotSummary = snapshotSummary.join("\n");
-        if self.memories.is_empty() {
-            return if snapshotSummary.trim().is_empty() {
-                "No relevant memories found.".to_string()
-            } else {
-                format!("{snapshotSummary}\nNo relevant memories found.")
-            };
-        }
-        let memoryText = self
-            .memories
-            .iter()
-            .map(|memory| {
-                format!(
-                    "Owner: {}\nTitle: {}\nContent: {}\nSource: {}\nTags: {}\nCreated: {}",
-                    memory.ownerKey,
-                    memory.title,
-                    memory.content,
-                    memory.source,
-                    memory.tags.join(", "),
-                    memory.createdAt
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n---\n");
-        if snapshotSummary.trim().is_empty() {
-            memoryText
-        } else {
-            format!("{snapshotSummary}\n---\n{memoryText}")
-        }
-    }
-}
 impl ChatListResultData {
     #[allow(non_snake_case)]
-    /// Formats chat summaries, marks the current chat, and includes token and card metadata.
+    /// Formats workspace conversation summaries, current status, and token statistics.
     pub fn toString(&self) -> String {
         let mut sb = String::new();
         sb.push_str(&format!("Chat List ({} total):\n", self.totalCount));
@@ -2032,11 +2580,6 @@ impl ChatListResultData {
                 sb.push_str(&format!("ID: {}{}\n", chat.id, currentMarker));
                 sb.push_str(&format!("Title: {}\n", chat.title));
                 sb.push_str(&format!("Message Count: {}\n", chat.messageCount));
-                if let Some(characterCardName) = chat.characterCardName.as_value() {
-                    if !characterCardName.trim().is_empty() {
-                        sb.push_str(&format!("Character Card: {characterCardName}\n"));
-                    }
-                }
                 sb.push_str(&format!(
                     "Token Statistics: Input {} / Output {}\n",
                     chat.inputTokens, chat.outputTokens
@@ -2118,30 +2661,6 @@ impl MessageSendResultData {
         }
     }
 }
-impl CharacterCardListResultData {
-    /// Formats character card metadata and marks the default card.
-    #[allow(non_snake_case)]
-    pub fn toString(&self) -> String {
-        let mut sb = String::new();
-        sb.push_str(&format!("Character Cards ({} total):\n", self.totalCount));
-        if self.cards.is_empty() {
-            sb.push_str("No cards\n");
-        } else {
-            for card in &self.cards {
-                let defaultMarker = if card.isDefault { " [Default]" } else { "" };
-                sb.push_str(&format!("ID: {}{}\n", card.id, defaultMarker));
-                sb.push_str(&format!("Name: {}\n", card.name));
-                if !card.description.trim().is_empty() {
-                    sb.push_str(&format!("Description: {}\n", card.description));
-                }
-                sb.push_str(&format!("Created: {}\n", card.createdAt));
-                sb.push_str(&format!("Updated: {}\n", card.updatedAt));
-                sb.push_str("---\n");
-            }
-        }
-        sb.trim().to_string()
-    }
-}
 impl TerminalInfoResultData {
     #[allow(non_snake_case)]
     /// Formats the primary terminal identity and availability of each known terminal implementation.
@@ -2179,7 +2698,7 @@ impl TerminalCommandResultData {
         sb.push_str(&format!("Terminal Type: {}\n", self.terminalType));
         sb.push_str(&format!("Exit Code: {}\n", self.exitCode));
         if self.timedOut {
-            sb.push_str("Timed Out: true\n");
+            sb.push_str("Background: true\nCommand is still running and was not canceled. The next command uses a new available session. Use Tools.System.terminal.wait(sessionId, 20000), Tools.System.terminal.screen(sessionId), Tools.System.terminal.input(sessionId, options), or Tools.System.terminal.close(sessionId) to manage this session.\n");
         }
         sb.push_str("\nOutput:\n");
         sb.push_str(&self.output);
@@ -2583,37 +3102,6 @@ impl GrepResultData {
         sb
     }
 }
-impl MemoryLinkResultData {
-    #[allow(non_snake_case)]
-    /// Formats the source, target, relationship type, and strength of the created memory link.
-    pub fn toString(&self) -> String {
-        format!(
-            "Successfully linked memory: '{}' -> '{}' (Type: {}, Strength: {})",
-            self.sourceTitle, self.targetTitle, self.linkType, self.weight
-        )
-    }
-}
-impl MemoryLinkQueryResultData {
-    #[allow(non_snake_case)]
-    /// Formats each queried memory link with identifiers, relationship metadata, and description.
-    pub fn toString(&self) -> String {
-        if self.links.is_empty() {
-            return "No memory links found.".to_string();
-        }
-        let mut sb = String::new();
-        sb.push_str(&format!("Memory Links ({}):\n", self.totalCount));
-        for link in &self.links {
-            sb.push_str(&format!(
-                "- #{}: '{}' -> '{}' (Type: {}, Weight: {})\n",
-                link.linkId, link.sourceTitle, link.targetTitle, link.linkType, link.weight
-            ));
-            if !link.description.trim().is_empty() {
-                sb.push_str(&format!("  Description: {}\n", link.description));
-            }
-        }
-        sb.trim().to_string()
-    }
-}
 impl VisitWebResultData {
     /// Formats bounded link and image previews, persisted-content metadata, and page content.
     #[allow(non_snake_case)]
@@ -2735,4 +3223,74 @@ fn formatTimestamp(timestamp: i64) -> String {
         .expect("valid timestamp millis")
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
+}
+
+/// Bounded hardware reply. Transport/authentication failures reject the plugin promise.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EdgePortResultData {
+    /// Exact node selected by the caller; never a guessed default or local fallback.
+    pub nodeId: String,
+    /// Native Edge action/port result; no JavaScript source or local serial handle.
+    pub data: crate::js_sdk::JsAny,
+}
+
+/// Exchanges one scoped terminal execution observation through the common tool transport.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TerminalObservationResultData {
+    Run { result: TerminalCommandResultData },
+    Open { handle: String },
+    Next { event: JsNullable<super::system::TerminalExecEvent> },
+    Close {},
+}
+
+/// Reports exactly the requested WebSocket operation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum WebSocketResultData {
+    #[serde(rename = "open")]
+    Open { handle: String },
+    #[serde(rename = "read")]
+    Read { events: Vec<NetWebSocketEvent> },
+    #[serde(rename = "send")]
+    Send,
+    #[serde(rename = "close")]
+    Close,
+}
+
+impl WebSocketResultData {
+    /// Formats the concrete operation without hiding serialization errors.
+    #[allow(non_snake_case)]
+    pub fn toString(&self) -> String {
+        match self {
+            Self::Open { handle } => format!("WebSocket opened: {handle}"),
+            Self::Read { events } => format!("WebSocket events: {}", events.len()),
+            Self::Send => "WebSocket message sent".into(),
+            Self::Close => "WebSocket closed".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_type_tests {
+    use super::TerminalType;
+
+    #[test]
+    fn terminal_type_literals_round_trip() {
+        for literal in ["powershell", "bash", "zsh", "shell"] {
+            let terminal_type = TerminalType::try_from(literal).unwrap();
+            assert_eq!(terminal_type.as_str(), literal);
+            assert_eq!(terminal_type.to_string(), literal);
+            let json = serde_json::to_string(&terminal_type).unwrap();
+            assert_eq!(json, format!("\"{literal}\""));
+            let decoded: TerminalType = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.as_str(), literal);
+        }
+    }
+
+    #[test]
+    fn unknown_terminal_type_is_rejected() {
+        assert!(TerminalType::try_from("unknown-shell").is_err());
+        assert!(serde_json::from_str::<TerminalType>("\"unknown-shell\"").is_err());
+    }
 }

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use operit_host_api::{HttpHost, HttpRequestData, HttpResponseData, TimeUtils::currentTimeMillis};
 use operit_util::AppLogger::AppLogger;
@@ -307,7 +307,8 @@ pub struct MarketPublisherEntrySummary {
     pub r#type: String,
     #[serde(default)]
     pub relation: String,
-    #[serde(rename = "stateCode", default)]
+    /// The market leaves the state out while an entry still waits for review.
+    #[serde(rename = "stateCode", default = "pending_state_code")]
     pub state_code: String,
     #[serde(rename = "listingState")]
     pub listing_state: Option<String>,
@@ -503,24 +504,35 @@ pub struct GitHubUser {
 
 // ---- Service ----
 
+/// Supplies the access token of the signed-in GitHub account.
+///
+/// GitHub login state belongs to the parent runtime, which installs the source
+/// once at startup. Clients read it for every request, so signing in or out
+/// applies to clients that already exist.
+pub trait GitHubTokenSource: Send + Sync {
+    /// Returns the current access token, or `None` when no account is signed in.
+    fn current_access_token(&self) -> Result<Option<String>, String>;
+}
+
+static GITHUB_TOKEN_SOURCE: OnceLock<Arc<dyn GitHubTokenSource>> = OnceLock::new();
+
+/// Installs the process-wide GitHub token source shared by every marketplace client.
+#[allow(non_snake_case)]
+pub fn setDefaultGitHubTokenSource(source: Arc<dyn GitHubTokenSource>) {
+    let _ = GITHUB_TOKEN_SOURCE.set(source);
+}
+
 #[derive(Clone)]
 /// Client for static marketplace metadata and authenticated marketplace APIs.
 pub struct MarketStatsApiService {
     http_host: Arc<dyn HttpHost>,
-    github_token: Option<String>,
 }
 
 impl MarketStatsApiService {
-    /// Creates a marketplace API client without a GitHub token.
+    /// Creates a marketplace API client that signs requests with the installed GitHub login.
     pub fn new() -> Self {
-        Self::new_with_github_token(None)
-    }
-
-    /// Creates a marketplace API client with an optional GitHub token.
-    pub fn new_with_github_token(github_token: Option<String>) -> Self {
         Self {
             http_host: operit_host_api::HostManager::defaultHttpHost(),
-            github_token,
         }
     }
 
@@ -669,6 +681,28 @@ impl MarketStatsApiService {
 
     /// Creates a comment on a marketplace entry.
     pub fn create_entry_comment(&self, entry_id: &str, body: &str) -> Result<String, String> {
+        self.create_comment(entry_id, body, None)
+    }
+
+    /// Replies to an existing marketplace comment, preserving its parent relation.
+    pub fn reply_entry_comment(
+        &self,
+        entry_id: &str,
+        body: &str,
+        parent_id: &str,
+    ) -> Result<String, String> {
+        if parent_id.trim().is_empty() {
+            return Err("A reply requires a parent comment".to_string());
+        }
+        self.create_comment(entry_id, body, Some(parent_id))
+    }
+
+    fn create_comment(
+        &self,
+        entry_id: &str,
+        body: &str,
+        parent_id: Option<&str>,
+    ) -> Result<String, String> {
         #[derive(Deserialize)]
         struct Response {
             #[serde(rename = "commentId")]
@@ -678,7 +712,7 @@ impl MarketStatsApiService {
             "POST",
             &["entries", entry_id, "comments"],
             vec![("Content-Type".to_string(), "application/json".to_string())],
-            serde_json::to_vec(&serde_json::json!({"body": body})).map_err(|e| e.to_string())?,
+            serde_json::to_vec(&market_comment_body(body, parent_id)).map_err(|e| e.to_string())?,
             true,
         )?;
         Ok(resp.comment_id)
@@ -748,14 +782,20 @@ impl MarketStatsApiService {
 
     /// Loads entries owned by the authenticated user.
     pub fn get_my_entries(&self) -> Result<MarketMyEntriesResponse, String> {
-        self.decode_v2("GET", &["my", "entries"], Vec::new(), Vec::new(), true)
+        let url = self.v2_url(&["my", "entries"])?;
+        self.decode_my_entries(url.as_str())
     }
 
     /// Loads authenticated user entries filtered by type.
     pub fn get_my_entries_by_type(&self, r#type: &str) -> Result<MarketMyEntriesResponse, String> {
         let mut url = self.v2_url(&["my", "entries"])?;
         url.query_pairs_mut().append_pair("type", r#type);
-        self.decode_url("GET", url.as_str(), Vec::new(), Vec::new(), true)
+        self.decode_my_entries(url.as_str())
+    }
+
+    fn decode_my_entries(&self, url: &str) -> Result<MarketMyEntriesResponse, String> {
+        let body = self.send_url("GET", url, Vec::new(), Vec::new(), true)?;
+        parse_my_entries(&body)
     }
 
     /// Loads full data for one entry submitted by the authenticated publisher.
@@ -912,6 +952,17 @@ impl MarketStatsApiService {
         )
     }
 
+    /// Withdraws an entry owned by the authenticated user from the public marketplace.
+    pub fn withdraw_entry(&self, entry_id: &str) -> Result<(), String> {
+        let entry_id = entry_id.trim();
+        if entry_id.is_empty() {
+            return Err("entry id is empty".to_string());
+        }
+        let url = self.v2_url(&["entries", entry_id])?;
+        self.send_url("DELETE", url.as_str(), Vec::new(), Vec::new(), true)?;
+        Ok(())
+    }
+
     /// Publishes a new artifact version for an existing marketplace entry.
     pub fn publish_artifact_version(
         &self,
@@ -1039,6 +1090,34 @@ impl MarketStatsApiService {
         }
     }
 
+    /// Streams a marketplace asset to a caller-owned file without buffering it in the UI.
+    pub fn download_asset_to_file(
+        &self,
+        asset_id: &str,
+        target_path: &str,
+        file_system: &operit_vfs::VisualFileSystem::VisualFileSystem,
+    ) -> Result<u64, String> {
+        let asset_id = asset_id.trim();
+        if asset_id.is_empty() {
+            return Err("asset id is empty".to_string());
+        }
+        let url = self.v2_url(&["assets", asset_id, "download"])?;
+        file_system.downloadFile(self.http_host.as_ref(), HttpRequestData {
+            url: url.to_string(),
+            method: "GET".to_string(),
+            headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
+            body: Vec::new(),
+            formFields: Vec::new(),
+            fileParts: Vec::new(),
+            connectTimeoutSeconds: TIMEOUT_SECONDS,
+            readTimeoutSeconds: TIMEOUT_SECONDS,
+            followRedirects: true,
+            ignoreSsl: false,
+            proxyHost: String::new(),
+            proxyPort: 0,
+        }, target_path)
+    }
+
     // ── Internal: HTTP helpers ─────────────────────────────
 
     fn request_v2_json<T: for<'de> Deserialize<'de>>(
@@ -1114,6 +1193,16 @@ impl MarketStatsApiService {
         serde_json::from_str::<T>(&body).map_err(|e| e.to_string())
     }
 
+    /// Reads the signed-in GitHub account's access token from the installed source.
+    fn github_token(&self) -> Result<Option<String>, String> {
+        let source = GITHUB_TOKEN_SOURCE
+            .get()
+            .ok_or_else(|| "GitHub token source is not installed".to_string())?;
+        Ok(source
+            .current_access_token()?
+            .filter(|token| !token.trim().is_empty()))
+    }
+
     fn send_github(
         &self,
         method: &str,
@@ -1121,24 +1210,21 @@ impl MarketStatsApiService {
         mut headers: Vec<(String, String)>,
         body: Vec<u8>,
     ) -> Result<HttpResponseData, String> {
-        if let Some(token) = self
-            .github_token
-            .as_deref()
-            .filter(|t| !t.trim().is_empty())
-        {
+        if let Some(token) = self.github_token()? {
             headers.push(("Authorization".to_string(), format!("Bearer {token}")));
         }
         self.request(method, url, headers, body, true)
     }
 
-    fn decode_url<T: for<'de> Deserialize<'de>>(
+    /// Sends one marketplace request and returns the response body of a successful status.
+    fn send_url(
         &self,
         method: &str,
         url: &str,
         mut headers: Vec<(String, String)>,
         body: Vec<u8>,
         use_session: bool,
-    ) -> Result<T, String> {
+    ) -> Result<String, String> {
         if use_session {
             let auth = self.exchange_github_token_for_market_session()?;
             headers.push((
@@ -1146,13 +1232,10 @@ impl MarketStatsApiService {
                 format!("Bearer {}", auth.session),
             ));
         } else if url.ends_with("/auth/github") {
-            if let Some(token) = self
-                .github_token
-                .as_deref()
-                .filter(|t| !t.trim().is_empty())
-            {
-                headers.push(("Authorization".to_string(), format!("Bearer {token}")));
-            }
+            let token = self
+                .github_token()?
+                .ok_or_else(|| "GitHub login required".to_string())?;
+            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
         }
         let resp = self.request(method, url, headers, body, true)?;
         let body = body_text(&resp.body);
@@ -1163,6 +1246,18 @@ impl MarketStatsApiService {
                 summarize_body(&body)
             ));
         }
+        Ok(body)
+    }
+
+    fn decode_url<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        use_session: bool,
+    ) -> Result<T, String> {
+        let body = self.send_url(method, url, headers, body, use_session)?;
         serde_json::from_str::<T>(&body).map_err(|e| e.to_string())
     }
 
@@ -1178,7 +1273,7 @@ impl MarketStatsApiService {
             url.starts_with(MARKET_V2_BASE_URL) || url.starts_with(MARKET_V2_STATIC_URL);
         let requestStartedAtMillis = currentTimeMillis();
         if is_market_request {
-            AppLogger::d(
+            AppLogger::v_with_level(
                 MARKET_API_LOG_TAG,
                 &format!(
                     "HTTP {} url={} bodyBytes={} followRedirects={}",
@@ -1187,6 +1282,7 @@ impl MarketStatsApiService {
                     body.len(),
                     follow_redirects
                 ),
+                operit_util::AppLogger::VERBOSE_LEVEL_3,
             );
         }
         headers.push(("User-Agent".to_string(), USER_AGENT.to_string()));
@@ -1207,7 +1303,7 @@ impl MarketStatsApiService {
         match response {
             Ok(response) => {
                 if is_market_request {
-                    AppLogger::d(
+                    AppLogger::v_with_level(
                         MARKET_API_LOG_TAG,
                         &format!(
                             "HTTP RESP {} status={} elapsedMs={} url={} responseBytes={}",
@@ -1217,6 +1313,7 @@ impl MarketStatsApiService {
                             url,
                             response.body.len()
                         ),
+                        operit_util::AppLogger::VERBOSE_LEVEL_3,
                     );
                 }
                 Ok(response)
@@ -1244,6 +1341,36 @@ impl MarketStatsApiService {
 
 // ── Helpers ────────────────────────────────────────────────
 
+/// State of a publisher entry the market sent without one: it is waiting for review.
+fn pending_state_code() -> String {
+    "pending".to_string()
+}
+
+/// Reads the body of `/my/entries`, where the market wraps the entry list in a
+/// publisher listing, and hands out the entries directly.
+fn parse_my_entries(body: &str) -> Result<MarketMyEntriesResponse, String> {
+    #[derive(Deserialize)]
+    struct Wire {
+        #[serde(default)]
+        ok: bool,
+        #[serde(default)]
+        entries: Listing,
+    }
+    #[derive(Default, Deserialize)]
+    struct Listing {
+        #[serde(rename = "generatedAt", default)]
+        generated_at: Option<String>,
+        #[serde(default)]
+        entries: Vec<MarketPublisherEntrySummary>,
+    }
+    let wire: Wire = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    Ok(MarketMyEntriesResponse {
+        ok: wire.ok,
+        entries: wire.entries.entries,
+        generated_at: wire.entries.generated_at,
+    })
+}
+
 fn entry_shard(id: &str) -> String {
     let mut hash = 2166136261u32;
     for byte in id.bytes() {
@@ -1265,25 +1392,29 @@ fn now_iso() -> String {
         .to_string()
 }
 
+/// Client version recorded as the minimum for all marketplace publications.
+pub const MARKET_MIN_APP_VERSION: &str = "2.0.0";
+/// Client version recorded as the maximum for all marketplace publications.
+pub const MARKET_MAX_APP_VERSION: &str = "2.99.99";
+
 fn entry_downloads(entry: &MarketEntrySummary) -> i32 {
     entry.download_count.max(entry.downloads)
 }
 
+/// Builds published marketplace version metadata with the fixed client range.
 fn market_base_version_json(
     version: &str,
     format_ver: &str,
-    min_app_ver: &str,
-    max_app_ver: Option<String>,
+    _min_app_ver: &str,
+    _max_app_ver: Option<String>,
     changelog: Option<String>,
 ) -> serde_json::Value {
     let mut json = serde_json::json!({
         "version": version,
         "formatVer": format_ver,
-        "minAppVer": min_app_ver,
+        "minAppVer": MARKET_MIN_APP_VERSION,
+        "maxAppVer": MARKET_MAX_APP_VERSION,
     });
-    if let Some(max) = max_app_ver.filter(|value| !value.trim().is_empty()) {
-        json["maxAppVer"] = serde_json::Value::String(max);
-    }
     if let Some(text) = changelog.filter(|value| !value.trim().is_empty()) {
         json["changelog"] = serde_json::Value::String(text);
     }
@@ -1338,6 +1469,14 @@ fn market_entry_patch_json(
         );
     }
     serde_json::Value::Object(map)
+}
+
+fn market_comment_body(body: &str, parent_id: Option<&str>) -> serde_json::Value {
+    let mut payload = serde_json::json!({"body": body});
+    if let Some(parent_id) = parent_id {
+        payload["parentId"] = serde_json::Value::String(parent_id.to_string());
+    }
+    payload
 }
 
 fn market_new_version_body(
@@ -1396,7 +1535,7 @@ pub use MarketStatsApiService as MarketStatsApiServiceModule;
 
 #[cfg(test)]
 mod tests {
-    use super::MarketStatsApiService;
+    use super::{market_comment_body, parse_my_entries, MarketStatsApiService};
     use operit_host_api::HostManager::setDefaultHttpHost;
     use operit_host_api::{
         HostError, HostResult, HttpHost, HttpRequestData, HttpResponseData,
@@ -1404,6 +1543,15 @@ mod tests {
         HttpStreamOpenedCallback,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn comment_payload_preserves_reply_parent_without_changing_top_level_comments() {
+        assert_eq!(market_comment_body("Hello", None), serde_json::json!({"body": "Hello"}));
+        assert_eq!(
+            market_comment_body("Reply", Some("parent-42")),
+            serde_json::json!({"body": "Reply", "parentId": "parent-42"}),
+        );
+    }
 
     struct ReqwestTestHttpHost;
 
@@ -1431,6 +1579,11 @@ mod tests {
     }
 
     impl HttpHost for ReqwestTestHttpHost {
+        /// Declares the image delivery supported by this HTTP host.
+        fn imageDelivery(&self) -> operit_host_api::HttpImageDelivery {
+            operit_host_api::HttpImageDelivery::Bytes
+        }
+
         /// Executes one test HTTP request through reqwest.
         fn executeHttpRequest(&self, request: HttpRequestData) -> HostResult<HttpResponseData> {
             let method = reqwest::Method::from_bytes(request.method.as_bytes())
@@ -1493,6 +1646,23 @@ mod tests {
                 "market test HTTP downloads are not configured",
             ))
         }
+    }
+
+    /// The market nests the entry list inside a publisher listing and may omit
+    /// the state of an entry that still waits for review.
+    #[test]
+    fn my_entries_are_read_from_the_publisher_listing_the_market_wraps_them_in() {
+        let body = r#"{"ok":true,"entries":{"ok":true,"generatedAt":"2026-11-03T00:00:00Z","shard":"ab","entries":[
+            {"id":"e1","title":"One","type":"package","relation":"owner","stateCode":"approved","listingState":"listed","categoryId":"tools","updatedAt":"2026-11-02T08:00:00Z","reasonCodes":["policy-violation"]},
+            {"id":"e2","title":"Two","type":"skill","relation":"contributor"}]}}"#;
+        let parsed = parse_my_entries(body).expect("nested publisher listing should parse");
+        assert!(parsed.ok);
+        assert_eq!(parsed.generated_at.as_deref(), Some("2026-11-03T00:00:00Z"));
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].state_code, "approved");
+        assert_eq!(parsed.entries[0].reason_codes, vec!["policy-violation"]);
+        assert_eq!(parsed.entries[1].state_code, "pending");
+        assert_eq!(parsed.entries[1].listing_state, None);
     }
 
     #[test]

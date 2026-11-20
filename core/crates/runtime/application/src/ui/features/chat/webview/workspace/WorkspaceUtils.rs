@@ -3,7 +3,7 @@ use operit_util::RuntimeStorageLayout::WORKSPACE_DIR_PATH;
 use serde_json::{json, Value};
 
 use crate::ui::features::chat::webview::workspace::WorkspaceTemplateAssets::WORKSPACE_TEMPLATE_ASSETS;
-use operit_tools::files::PathMapper::PathMapper;
+use operit_vfs::VfsPath;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectType {
@@ -24,6 +24,16 @@ pub fn createAndGetDefaultWorkspace(
     chatId: String,
     projectType: Option<String>,
 ) -> Result<String, String> {
+    workspaceSyncStore().track(|| createDefaultWorkspace(chatId, projectType))
+}
+
+fn workspaceSyncStore() -> operit_store::WorkspaceFileSyncStore::WorkspaceFileSyncStore {
+    operit_store::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(
+        defaultRuntimeStorageHost(), operit_util::RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH,
+    )
+}
+
+fn createDefaultWorkspace(chatId: String, projectType: Option<String>) -> Result<String, String> {
     let projectType = resolveProjectType(projectType)?;
     let workspaceRelativePath = getWorkspaceRelativePath(&chatId);
 
@@ -31,18 +41,86 @@ pub fn createAndGetDefaultWorkspace(
         copyTemplateFiles(&workspaceRelativePath, templateName)?;
     }
     createProjectConfigIfNeeded(&workspaceRelativePath, projectType)?;
+    operit_store::FileSyncPolicy::FileSyncPolicy::ensure(defaultRuntimeStorageHost().as_ref(), &workspaceRelativePath)?;
 
-    PathMapper::workspacePath(&chatId)
+    VfsPath::workspacePath(&chatId)
 }
 
 #[allow(non_snake_case)]
 pub fn createAndResetWorkspaceDirectory(chatId: String) -> Result<String, String> {
     let workspaceRelativePath = getWorkspaceRelativePath(&chatId);
     let storage = defaultRuntimeStorageHost();
-    storage
+    workspaceSyncStore().track(|| storage
         .delete(&workspaceRelativePath, true)
-        .map_err(|error| error.to_string())?;
-    PathMapper::workspacePath(&chatId)
+        .map_err(|error| error.to_string()))?;
+    VfsPath::workspacePath(&chatId)
+}
+
+/// Deletes app-owned folders and releases mounts unused by surviving workspaces.
+/// Mounted host directories are never passed to the filesystem delete operation.
+#[allow(non_snake_case)]
+pub(crate) fn deleteWorkspaceFiles(
+    workspace: &operit_model::Workspace::Workspace,
+    others: &[operit_model::Workspace::Workspace],
+) -> Result<(), String> {
+    let storage = defaultRuntimeStorageHost();
+    let registry = operit_vfs::MountRegistry::MountRegistry::withStorage(storage.clone());
+    let mounts = registry.list()?;
+    let nodeId = operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::localNodeId();
+    let localPath = |folder: &operit_model::Workspace::WorkspaceFolder| {
+        match operit_util::FileUtils::FileUtils::splitQualifiedVfsPath(&folder.path) {
+            Some((owner, path)) if Some(owner) == nodeId.as_deref() => Some(path.to_owned()),
+            Some(_) => None,
+            None => Some(folder.path.clone()),
+        }
+    };
+    let otherPaths = others
+        .iter()
+        .flat_map(|other| other.folders.iter().filter_map(&localPath))
+        .collect::<Vec<_>>();
+    let overlaps = |left: &str, right: &str| {
+        left == right
+            || left.starts_with(&format!("{right}/"))
+            || right.starts_with(&format!("{left}/"))
+    };
+    let mut ownedPaths = std::collections::BTreeSet::new();
+    for folderPath in workspace.folders.iter().filter_map(&localPath) {
+        let Some(relative) =
+            VfsPath::relativePath(VfsPath::workspaceCollectionPath(), &folderPath)?
+        else {
+            continue;
+        };
+        // Only a workspace root directly under the app collection is owned here.
+        if relative.is_empty() || relative.contains('/') {
+            continue;
+        }
+        VfsPath::workspacePath(&relative)?;
+        if !otherPaths.iter().any(|other| overlaps(&folderPath, other)) {
+            ownedPaths.insert(format!("{WORKSPACE_DIR_PATH}/{relative}"));
+        }
+    }
+    for path in ownedPaths {
+        if storage.exists(&path).map_err(|error| error.to_string())? {
+            workspaceSyncStore().track(|| {
+                storage
+                    .delete(&path, true)
+                    .map_err(|error| error.to_string())
+            })?;
+        }
+    }
+    for mount in mounts {
+        let path = mount.vfsPath();
+        if workspace
+            .folders
+            .iter()
+            .filter_map(&localPath)
+            .any(|folderPath| overlaps(&folderPath, &path))
+            && !otherPaths.iter().any(|other| overlaps(other, &path))
+        {
+            registry.remove(&path)?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(non_snake_case)]

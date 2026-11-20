@@ -92,6 +92,19 @@ pub const SUMMARY_PROMPT_EN: &str = r#"You are an AI assistant responsible for g
 5. Goal: the summary must be self-contained so that even if the AI forgets the original conversation, it can fully reconstruct context, current status, progress, and next actions.
 6. Recency: focus first on the most recent part of the conversation (about the last 30% of input), then review earlier content. If new messages conflict with old content, use the latest messages and explain the differences."#;
 
+/// Wrapper text prepended to a persisted compact-boundary message when it is
+/// replayed into the active context as the opening user turn.
+pub const BOUNDARY_WRAPPER_CN: &str = "本会话延续自一段超出上下文限制的先前对话。以下检查点覆盖了先前对话中已被压缩的部分。";
+pub const BOUNDARY_WRAPPER_EN: &str = "This session is being continued from a previous conversation that ran out of context. The checkpoint below covers the earlier portion of the conversation.";
+
+/// Statement appended when preserved recent messages follow the boundary.
+pub const BOUNDARY_PRESERVED_NOTE_CN: &str = "检查点之后的消息是压缩前保留的最近原文，检查点撰写时未看到它们；检查点中所述「尚未发生」的事可能已在其后发生。";
+pub const BOUNDARY_PRESERVED_NOTE_EN: &str = "The messages after this checkpoint are the most recent messages from before compaction, kept verbatim. The checkpoint was written without seeing them, so something it says has not happened yet may already have happened in them.";
+
+/// Continuation instruction appended for auto/handoff-triggered compaction.
+pub const BOUNDARY_CONTINUE_CN: &str = "从上次中断处继续对话，不要向用户追问。直接续接——不要确认收到检查点、不要复述发生了什么、不要以「我继续」之类的话开场，就当这次中断没有发生过。";
+pub const BOUNDARY_CONTINUE_EN: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the checkpoint, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.";
+
 pub const FILE_BINDING_MERGE_PROMPT: &str = r#"You are an expert programmer. Your task is to create the final, complete content of a file by merging the 'Original File Content' with the 'Intended Changes'.
 
 The 'Intended Changes' block uses a special placeholder, `// ... existing code ...`, which you MUST replace with the complete and verbatim 'Original File Content'.
@@ -118,17 +131,6 @@ pub const FILE_BINDING_MERGE_PROMPT_CN: &str = r#"你是一位资深程序员。
 “预期修改”为：`// ... existing code ...\nnew line 3`
 那么你的最终输出必须是：`line 1\nline 2\nnew line 3`"#;
 
-pub const SUMMARY_MARKER_CN: &str = "==========对话摘要==========";
-pub const SUMMARY_MARKER_EN: &str = "==========Conversation Summary==========";
-pub const SUMMARY_SECTION_CORE_TASK_CN: &str = "【核心任务状态】";
-pub const SUMMARY_SECTION_INTERACTION_CN: &str = "【互动情节与设定】";
-pub const SUMMARY_SECTION_PROGRESS_CN: &str = "【对话历程与概要】";
-pub const SUMMARY_SECTION_KEY_INFO_CN: &str = "【关键信息与上下文】";
-pub const SUMMARY_SECTION_CORE_TASK_EN: &str = "[Core Task Status]";
-pub const SUMMARY_SECTION_INTERACTION_EN: &str = "[Interaction & Scenario]";
-pub const SUMMARY_SECTION_PROGRESS_EN: &str = "[Conversation Progress & Overview]";
-pub const SUMMARY_SECTION_KEY_INFO_EN: &str = "[Key Information & Context]";
-
 pub const UI_CONTROLLER_PROMPT: &str = r#"You are a UI controller. Analyze the current UI state and decide the next action. Output only the action required by the controller schema."#;
 pub const UI_CONTROLLER_PROMPT_CN: &str =
     r#"你是 UI 控制器。请分析当前界面状态并决定下一步动作。只输出控制器格式要求的动作。"#;
@@ -142,34 +144,6 @@ Rules:
 
 pub const UI_AUTOMATION_AGENT_PROMPT_EN: &str = UI_AUTOMATION_AGENT_PROMPT;
 
-pub const GROUP_ROLE_RESPONSE_PLANNER_PROMPT: &str = r#"You are a role response planner. Return ONLY valid JSON.
-Task: plan the response order for this turn. You may plan multiple rounds of conversation.
-Output schema:
-{"rounds":[[{"id":"<memberId>","speak":true}],[{"id":"<memberId2>","speak":true}]]}
-Rules:
-- Each round is an array of members who should speak in that round.
-- You can plan multiple rounds to allow members to discuss with each other.
-- For simple responses, use a single round with one or more members.
-- For discussions, use multiple rounds (e.g., member A speaks, then member B responds, then member A replies).
-- You may omit members to skip them, or set speak=false.
-- If no one should respond, return {"rounds":[[]]}.
-- Use ONLY the provided member ids.
-- Maximum 5 rounds to avoid excessive back-and-forth."#;
-
-pub const GROUP_ROLE_RESPONSE_PLANNER_PROMPT_CN: &str = r#"你是群聊角色发言规划器。只返回有效的 JSON。
-任务：规划本轮的发言顺序。你可以规划多轮对话。
-输出格式：
-{"rounds":[[{"id":"<成员ID>","speak":true}],[{"id":"<成员ID2>","speak":true}]]}
-规则：
-- 每一轮（round）是一个数组，包含该轮应该发言的成员。
-- 你可以规划多轮对话，让成员之间相互讨论。
-- 对于简单回应，使用单轮，包含一个或多个成员。
-- 对于讨论场景，使用多轮（例如：成员A发言，然后成员B回应，然后成员A再回复）。
-- 你可以省略成员来跳过他们，或设置 speak=false。
-- 如果没有人应该回应，返回 {"rounds":[[]]}。
-- 只使用提供的成员 ID。
-- 最多 5 轮，避免过度来回。"#;
-
 impl FunctionalPrompts {
     #[allow(non_snake_case)]
     pub fn summaryPrompt(use_english: bool) -> &'static str {
@@ -180,25 +154,57 @@ impl FunctionalPrompts {
         }
     }
 
+    /// Builds the summary prompt and includes the previous summary, matching the Kotlin implementation.
     #[allow(non_snake_case)]
-    pub fn buildSummarySystemPrompt(previous_summary: Option<&str>, use_english: bool) -> String {
+    pub fn buildSummarySystemPrompt(
+        previous_summary: Option<&str>,
+        use_english: bool,
+    ) -> String {
         let mut prompt = Self::summaryPrompt(use_english).trim().to_string();
-        if let Some(previous_summary) = previous_summary {
-            if !previous_summary.trim().is_empty() {
-                if use_english {
-                    prompt.push_str(&format!(
-                        "\n\nPrevious Summary (to inherit context):\n{}\nPlease merge the key information from the previous summary with the new conversation and generate a brand-new, more complete summary.",
-                        previous_summary.trim()
-                    ));
-                } else {
-                    prompt.push_str(&format!(
-                        "\n\n上一次的摘要（用于继承上下文）：\n{}\n请将以上摘要中的关键信息，与本次新的对话内容相融合，生成一份全新的、更完整的摘要。",
-                        previous_summary.trim()
-                    ));
-                }
+        if let Some(previous) = previous_summary.map(str::trim).filter(|summary| !summary.is_empty()) {
+            prompt.push_str("\n\n");
+            if use_english {
+                prompt.push_str("Previous Summary (to inherit context):\n");
+                prompt.push_str(previous);
+                prompt.push_str("\nPlease merge the key information from the previous summary with the new conversation and generate a brand-new, more complete summary.");
+            } else {
+                prompt.push_str("上一次的摘要（用于继承上下文）：\n");
+                prompt.push_str(previous);
+                prompt.push_str("\n请将以上摘要中的关键信息，与本次新的对话内容相融合，生成一份全新的、更完整的摘要。");
             }
         }
         prompt
+    }
+
+    /// Wrapper text that frames a persisted boundary message as historical
+    /// context when it is replayed into the active conversation.
+    #[allow(non_snake_case)]
+    pub fn boundaryWrapper(use_english: bool) -> &'static str {
+        if use_english {
+            BOUNDARY_WRAPPER_EN
+        } else {
+            BOUNDARY_WRAPPER_CN
+        }
+    }
+
+    /// Statement marking preserved recent messages that follow a boundary.
+    #[allow(non_snake_case)]
+    pub fn boundaryPreservedNote(use_english: bool) -> &'static str {
+        if use_english {
+            BOUNDARY_PRESERVED_NOTE_EN
+        } else {
+            BOUNDARY_PRESERVED_NOTE_CN
+        }
+    }
+
+    /// Continuation instruction for auto/handoff-triggered boundaries.
+    #[allow(non_snake_case)]
+    pub fn boundaryContinue(use_english: bool) -> &'static str {
+        if use_english {
+            BOUNDARY_CONTINUE_EN
+        } else {
+            BOUNDARY_CONTINUE_CN
+        }
     }
 
     #[allow(non_snake_case)]
@@ -207,87 +213,6 @@ impl FunctionalPrompts {
             FILE_BINDING_MERGE_PROMPT
         } else {
             FILE_BINDING_MERGE_PROMPT_CN
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn memoryAutoCategorizeUserMessage(use_english: bool) -> &'static str {
-        if use_english {
-            "Please categorize the memories above."
-        } else {
-            "请为以上记忆分类"
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn knowledgeGraphExistingMemoriesPrefix(use_english: bool) -> &'static str {
-        if use_english {
-            "To avoid duplicates, please refer to these potentially relevant existing memories. If an extracted entity is semantically the same as an existing memory, use the `alias_for` field:\n"
-        } else {
-            "为避免重复，请参考以下记忆库中可能相关的已有记忆。在提取实体时，如果发现与下列记忆语义相同的实体，请使用`alias_for`字段进行标注：\n"
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn knowledgeGraphNoExistingMemoriesMessage(use_english: bool) -> &'static str {
-        if use_english {
-            "The memory library is empty or no relevant memories were found. You may extract entities freely."
-        } else {
-            "记忆库目前为空或没有找到相关记忆，请自由提取实体。"
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn knowledgeGraphExistingFoldersPrompt(
-        existing_folders: &[String],
-        use_english: bool,
-    ) -> String {
-        if existing_folders.is_empty() {
-            return if use_english {
-                "No folder categories exist yet. Please create a suitable category based on the content.".to_string()
-            } else {
-                "当前还没有文件夹分类，请根据内容创建一个合适的分类。".to_string()
-            };
-        }
-        let joined = existing_folders.join(", ");
-        if use_english {
-            format!("Existing folder categories (prefer reusing them):\n{joined}")
-        } else {
-            format!(
-                "当前已存在的文件夹分类如下，请优先使用或参考它们来决定新知识的分类：\n{joined}"
-            )
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn knowledgeGraphDuplicateTitleInstruction(
-        title: &str,
-        count: usize,
-        use_english: bool,
-    ) -> String {
-        if use_english {
-            format!("Found {count} memories with the exact same title: \"{title}\". You should strongly prefer `merge` in this analysis and avoid creating another parallel `new` memory for the same fact.")
-        } else {
-            format!("发现 {count} 个标题完全相同的记忆: \"{title}\"。本次分析应强烈优先使用 `merge`，不要再为同一事实创建平行 `new` 记忆。")
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn knowledgeGraphSimilarTitleInstruction(titles: &[String], use_english: bool) -> String {
-        let preview = titles.join(" | ");
-        if use_english {
-            format!("Found a similar-title memory cluster: [{preview}]. These are likely paraphrases of the same fact. Prefer `merge` or `update`; avoid creating additional `new` memories.")
-        } else {
-            format!("发现一组相似标题记忆: [{preview}]。它们很可能是同一事实的不同表述。请优先 `merge` 或 `update`，避免继续创建新的重复记忆。")
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn knowledgeGraphDuplicateHeader(use_english: bool) -> &'static str {
-        if use_english {
-            "[IMPORTANT: deduplicate memories]\n"
-        } else {
-            "【重要指令：清理重复记忆】\n"
         }
     }
 
@@ -373,60 +298,6 @@ impl FunctionalPrompts {
     }
 
     #[allow(non_snake_case)]
-    pub fn waifuEmotionRule(emotion_list_text: &str) -> String {
-        format!("**表达情绪规则：你必须在每个句末判断句中包含的情绪或增强语气，并使用<emotion>标签在句末插入情绪状态。后续会根据情绪生成表情包。可用情绪包括：{emotion_list_text}。例如：<emotion>happy</emotion>、<emotion>miss_you</emotion>等。如果没有这些情绪则不插入。**")
-    }
-
-    #[allow(non_snake_case)]
-    pub fn waifuNoCustomEmojiRule() -> &'static str {
-        "**当前没有可用的自定义表情，请不要使用<emotion>标签。**"
-    }
-
-    #[allow(non_snake_case)]
-    pub fn waifuCustomPromptRule(custom_prompt: &str) -> String {
-        custom_prompt.trim().to_string()
-    }
-
-    #[allow(non_snake_case)]
-    pub fn waifuSelfieRule(waifu_selfie_prompt: &str) -> String {
-        format!("**绘图（自拍）**: 当你需要自拍时，你会调用绘图功能。\n*   **基础关键词**: `{waifu_selfie_prompt}`。\n*   **自定义内容**: 你会根据主人的要求，在基础关键词后添加表情、动作、穿着、背景等描述。\n*   **合影**: 如果需要主人出镜，你会根据指令明确包含`2 girl` （2 girl 代表2个女孩主人也是女孩，主人为黑色长发可爱女生）等关键词。")
-    }
-
-    #[allow(non_snake_case)]
-    pub fn avatarMoodRulesText(
-        custom_mood_definitions: &[(&str, &str)],
-        use_english: bool,
-    ) -> String {
-        let mut allowed = vec!["angry", "happy", "shy", "aojiao", "cry"];
-        allowed.extend(custom_mood_definitions.iter().map(|(key, _)| *key));
-        let custom_section = if custom_mood_definitions.is_empty() {
-            String::new()
-        } else {
-            let mut lines = String::new();
-            lines.push('\n');
-            lines.push_str(if use_english {
-                "Custom moods (use only when the description clearly matches):\n"
-            } else {
-                "自定义 mood（仅在描述明显符合时使用）：\n"
-            });
-            for (key, prompt_hint) in custom_mood_definitions {
-                lines.push_str(&format!("- {key}：{prompt_hint}\n"));
-            }
-            lines.push_str(if use_english {
-                "If both a custom mood and a base mood fit, prefer the more specific one."
-            } else {
-                "若自定义 mood 与基础 mood 同时适用，优先更精确的那个。"
-            });
-            lines
-        };
-        if use_english {
-            format!("[Avatar Mood]\nYour reply can drive the avatar motion. Output <mood> only when emotion is clear. For calm conversation, ordinary questions, or daily chat, do not output it.\n\nBase mapping:\n- angry: insults, unfair blame, accusation\n- happy: explicit praise, achieving a goal, receiving a gift\n- shy: being praised, being called cute, mild flirting\n- aojiao: being teased but refusing to yield, cute stubbornness in a small argument\n- cry: frustration, sadness, apologizing with sadness, talking about something upsetting\n\nIf multiple moods match, priority: angry > cry > aojiao > shy > happy.\nIf there is no clear trigger for 2 consecutive turns, return to calm and do not output <mood>.\nAllowed mood values: {}.{}\nOutput rules:\n- At most one <mood> per reply\n- End the main text naturally and keep sentence-ending punctuation\n- If you output <mood>, put it on a new line after the main text as <mood>...</mood>\n- Do not output any custom tag other than <mood>, and do not output empty tags, multiple tags, or undefined values\n- Do not exaggerate colloquial tone, fillers, suffixes, or style just for mood", allowed.join(", "), custom_section)
-        } else {
-            format!("[Avatar Mood]\n你当前的回复会驱动虚拟形象动作。只有在情绪明显时才输出 <mood>，平静交流、普通提问、日常闲聊不要输出。\n\n基础映射：\n- angry：侮辱、不公、责备\n- happy：明确表扬、达成目标、收到礼物\n- shy：被夸、被戳到可爱点、轻微暧昧\n- aojiao：被调侃又不想服软、小争执里的可爱不服\n- cry：受挫、失落、道歉并难过、讲伤心事\n\n多个同时命中时，优先级：angry > cry > aojiao > shy > happy。\n连续 2 轮没有明显触发时恢复平静，不输出 <mood>。\n允许的 mood 值：{}。{}\n输出规则：\n- 每条回复最多 1 个 <mood>\n- 正文正常收尾，保留句末标点\n- 若输出 <mood>，必须在正文后换一行单独输出 <mood>...</mood>\n- 不要输出除 <mood> 以外的自定义标签，不要输出空标签、多个标签或未定义值\n- 不要为了 mood 额外强化口语化、拟声词、尾音或文风", allowed.join(", "), custom_section)
-        }
-    }
-
-    #[allow(non_snake_case)]
     pub fn translationSystemPrompt() -> &'static str {
         "你是一个专业的翻译助手，能够准确翻译各种语言，并保持原文的语气和风格。"
     }
@@ -455,15 +326,6 @@ impl FunctionalPrompts {
             format!("Please generate a concise description for the MCP tool package named \"{plugin_name}\". This package includes the following tools:\n\n{tool_list}\n\nReturn only the description.")
         } else {
             format!("请为名为“{plugin_name}”的 MCP 工具包生成一句简洁描述。该包包含以下工具：\n\n{tool_list}\n\n只返回描述文本。")
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn personaCardGenerationSystemPrompt(use_english: bool) -> String {
-        if use_english {
-            "You are a persona card generator. Convert the user's description into a structured persona card while preserving explicit role constraints.".to_string()
-        } else {
-            "你是角色卡生成器。请把用户描述转换成结构化角色卡，并保留明确的角色约束。".to_string()
         }
     }
 
@@ -555,141 +417,5 @@ Output must be a JSON object with keys "queries" (array of regex strings) and "r
         } else {
             format!("你是一个代码检索助手。你需要从候选片段中选择最相关的部分。\n\n用户意图：{intent}\n搜索路径：{display_path}\n\n候选列表（每条以 #id 开头）：\n{candidates_digest}\n\n要求：\n1) 输出严格 JSON，不要输出任何其他文字。\n2) 从候选中选择最多 {max_results} 条，按相关度从高到低输出 id。\n\n输出格式：{{\"selected\":[0,1,2]}}")
         }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn buildMemoryAutoCategorizePrompt(
-        existing_folders: &[String],
-        memories_digest: &str,
-        use_english: bool,
-    ) -> String {
-        let folders_text = if existing_folders.is_empty() {
-            String::new()
-        } else {
-            existing_folders.join(", ")
-        };
-        if use_english {
-            format!("You are a knowledge classification expert. Based on memory content, assign an appropriate folder path to each memory.\n\nExisting folders: {folders_text}\n\nPlease categorize the following memories. Prefer existing folders and only create new folders when necessary.\nReturn a JSON array: [{{\"title\":\"memory title\",\"folder\":\"folder path\"}}]\n\nMemory list:\n{memories_digest}\n\nOnly return the JSON array. Do not output any other content.")
-        } else {
-            format!("你是知识分类专家。根据记忆内容，为每条记忆分配合适的文件夹路径。\n\n已存在的文件夹：{folders_text}\n\n请为以下记忆分类，优先使用已有文件夹，必要时创建新文件夹。\n返回 JSON 数组：[{{\"title\": \"记忆标题\", \"folder\": \"文件夹路径\"}}]\n\n记忆列表：\n{memories_digest}\n\n只返回 JSON 数组，不要其他内容。")
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn buildKnowledgeGraphExtractionPrompt(
-        duplicates_prompt_part: &str,
-        existing_memories_prompt: &str,
-        existing_folders_prompt: &str,
-        current_preferences: &str,
-        use_english: bool,
-    ) -> String {
-        if use_english {
-            format!(
-                r#"You are building a long-term memory graph from this conversation.
-
-{duplicates_prompt_part}
-{existing_memories_prompt}
-{existing_folders_prompt}
-
-[Selection gate - apply first]
-- Store only user-specific reusable knowledge: stable preferences, constraints, confirmed decisions, recurring mistakes, project facts, or recurring worldbuilding facts.
-- Do NOT store common/public definitions.
-- Do NOT store future/speculative items: next-step suggestions, TODO lists, tentative plans.
-- If no valuable long-term signal exists, return `{{}}`.
-
-[Extraction policy]
-- Prefer `update` / `merge` over creating `new`.
-- Use `new` only when concept is truly novel (max 5 items).
-- Existing memories provided in context are actionable: you may directly `update` / `merge` / `link` them.
-- Keep user profile facts in `USER.md`. Use graph memory nodes for entities, project facts, decisions, mistakes, and relations.
-
-[Output schema - strict JSON only]
-- Keys: `main`, `new`, `update`, `merge`, `links`, `user`.
-- `main`: `["Title", "Content", ["tags"], "folder_path"]` or `null`.
-- `new`: `[["Title", "Content", ["tags"], "folder_path", "alias_for_or_null"], ...]`.
-- `update`: `[["Title", "New full content", "Reason", credibility_or_null, importance_or_null], ...]`.
-- `merge`: `[{{"source_titles":["A","B"],"new_title":"...","new_content":"...","new_tags":["..."],"folder_path":"...","reason":"..."}}, ...]`.
-- `links`: `[["Source", "Target", "RELATION_TYPE", "Description", weight], ...]`.
-- `user`: full updated `USER.md` markdown string, or `""` when the user profile should not change.
-
-Current USER.md:
-{current_preferences}
-
-Return only a valid JSON object. No extra text."#
-            )
-        } else {
-            format!(
-                r#"你要从对话中构建长期记忆图谱。
-
-{duplicates_prompt_part}
-{existing_memories_prompt}
-{existing_folders_prompt}
-
-【写入前先过筛】
-- 只记录"用户特异且可复用"的信息：稳定偏好、约束、已确认决策、反复错误、项目事实、长期世界观中的稳定设定。
-- 不记录常识/公开定义。
-- 不记录未来推测项：下一步建议、TODO、暂定计划。
-- 若没有长期价值信号，直接返回 `{{}}`。
-
-【抽取策略】
-- 优先 `update` / `merge`，其次才是 `new`。
-- `new` 仅在确实新增概念时使用（最多 5 条）。
-- 提供给你的已有记忆样本是可操作对象：即使本轮没有 `new`，也可以直接对这些已有记忆做 `update`、`merge`、`links`。
-- 用户画像信息写入 `USER.md`。实体、项目事实、决策、反复错误和关系写入图记忆节点。
-
-【输出格式（严格JSON）】
-- 顶层键：`main`、`new`、`update`、`merge`、`links`、`user`。
-- `main`: `["标题","内容",["标签"],"folder_path"]` 或 `null`。
-- `new`: `[["标题","内容",["标签"],"folder_path","alias_for_or_null"], ...]`。
-- `update`: `[["标题","新完整内容","原因",可信度或null,重要性或null], ...]`。
-- `merge`: `[{{"source_titles":["A","B"],"new_title":"...","new_content":"...","new_tags":["..."],"folder_path":"...","reason":"..."}}, ...]`。
-- `links`: `[["源","目标","RELATION_TYPE","描述",权重], ...]`。
-- `user`: 更新后的完整 `USER.md` markdown 字符串；用户画像不需要变化时填空字符串。
-
-当前 USER.md：
-{current_preferences}
-
-只返回合法 JSON 对象，不要输出其他内容。"#
-            )
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn groupRoleResponsePlannerPrompt(use_english: bool) -> &'static str {
-        if use_english {
-            GROUP_ROLE_RESPONSE_PLANNER_PROMPT
-        } else {
-            GROUP_ROLE_RESPONSE_PLANNER_PROMPT_CN
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn buildGroupRoleResponsePlannerPrompt(
-        member_lines: &str,
-        user_text: &str,
-        use_english: bool,
-    ) -> String {
-        let base_prompt = Self::groupRoleResponsePlannerPrompt(use_english);
-        if use_english {
-            format!(
-                "{base_prompt}\nMembers:\n{}\n\nUser message:\n{}",
-                text_or_none(member_lines, "(none)"),
-                text_or_none(user_text, "(user sent attachments or empty text)")
-            )
-        } else {
-            format!(
-                "{base_prompt}\n成员列表：\n{}\n\n用户消息：\n{}",
-                text_or_none(member_lines, "（无）"),
-                text_or_none(user_text, "（用户发送了附件或空文本）")
-            )
-        }
-    }
-}
-
-fn text_or_none<'a>(value: &'a str, empty_text: &'a str) -> &'a str {
-    if value.trim().is_empty() {
-        empty_text
-    } else {
-        value
     }
 }

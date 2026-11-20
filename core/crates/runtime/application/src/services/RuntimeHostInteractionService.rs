@@ -32,6 +32,8 @@ pub enum RuntimeHostInteractionKind {
     ComposeWebViewController,
     #[serde(rename = "compose_file_picker")]
     ComposeFilePicker,
+    #[serde(rename = "compose_file_save")]
+    ComposeFileSave,
     #[serde(rename = "system_capture_screenshot")]
     SystemCaptureScreenshot,
     #[serde(rename = "system_language_code")]
@@ -56,8 +58,6 @@ pub enum RuntimeHostInteractionKind {
     TtsPlayback,
     #[serde(rename = "local_inference")]
     LocalInference,
-    #[serde(rename = "web_access_pairing")]
-    WebAccessPairing,
     #[serde(rename = "app_notification")]
     AppNotification,
 }
@@ -72,6 +72,7 @@ pub struct RuntimeHostInteractionRequest {
     pub webVisit: Option<RuntimeHostInteractionWebVisitPayload>,
     pub composeWebViewController: Option<RuntimeHostInteractionComposeWebViewControllerPayload>,
     pub composeFilePicker: Option<RuntimeHostInteractionComposeFilePickerPayload>,
+    pub composeFileSave: Option<RuntimeHostInteractionComposeFileSavePayload>,
     pub systemCaptureScreenshot: Option<RuntimeHostInteractionSystemCaptureScreenshotPayload>,
     pub systemLanguageCode: Option<RuntimeHostInteractionSystemLanguageCodePayload>,
     pub systemRecognizeText: Option<RuntimeHostInteractionSystemRecognizeTextPayload>,
@@ -84,7 +85,6 @@ pub struct RuntimeHostInteractionRequest {
     pub ttsSynthesis: Option<RuntimeHostInteractionTtsSynthesisPayload>,
     pub ttsPlayback: Option<RuntimeHostInteractionTtsPlaybackPayload>,
     pub localInference: Option<RuntimeHostInteractionLocalInferencePayload>,
-    pub webAccessPairing: Option<RuntimeHostInteractionWebAccessPairingPayload>,
     pub appNotification: Option<RuntimeHostInteractionAppNotificationPayload>,
 }
 
@@ -132,6 +132,13 @@ impl RuntimeHostInteractionRequest {
     fn composeFilePicker(payload: RuntimeHostInteractionComposeFilePickerPayload) -> Self {
         let mut request = Self::empty(RuntimeHostInteractionKind::ComposeFilePicker);
         request.composeFilePicker = Some(payload);
+        request
+    }
+
+    /// Creates a request for the owner file-save selector.
+    fn composeFileSave(payload: RuntimeHostInteractionComposeFileSavePayload) -> Self {
+        let mut request = Self::empty(RuntimeHostInteractionKind::ComposeFileSave);
+        request.composeFileSave = Some(payload);
         request
     }
 
@@ -211,12 +218,7 @@ impl RuntimeHostInteractionRequest {
         request
     }
 
-    /// Builds a non-blocking notification for one browser Web Access pairing request.
-    fn webAccessPairing(payload: RuntimeHostInteractionWebAccessPairingPayload) -> Self {
-        let mut request = Self::empty(RuntimeHostInteractionKind::WebAccessPairing);
-        request.webAccessPairing = Some(payload);
-        request
-    }
+
 
     /// Builds a non-blocking notification for one application-level event.
     fn appNotification(payload: RuntimeHostInteractionAppNotificationPayload) -> Self {
@@ -234,6 +236,7 @@ impl RuntimeHostInteractionRequest {
             webVisit: None,
             composeWebViewController: None,
             composeFilePicker: None,
+            composeFileSave: None,
             systemCaptureScreenshot: None,
             systemLanguageCode: None,
             systemRecognizeText: None,
@@ -246,7 +249,6 @@ impl RuntimeHostInteractionRequest {
             ttsSynthesis: None,
             ttsPlayback: None,
             localInference: None,
-            webAccessPairing: None,
             appNotification: None,
         }
     }
@@ -294,6 +296,12 @@ pub struct RuntimeHostInteractionComposeWebViewControllerPayload {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Compose DSL file-picker request payload.
 pub struct RuntimeHostInteractionComposeFilePickerPayload {
+    pub requestJson: String,
+}
+
+/// Compose DSL file-save request payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeHostInteractionComposeFileSavePayload {
     pub requestJson: String,
 }
 
@@ -446,6 +454,7 @@ pub struct RuntimeHostInteractionResponse {
     pub webVisit: Option<RuntimeHostInteractionWebVisitResponse>,
     pub composeWebViewController: Option<RuntimeHostInteractionComposeWebViewControllerResponse>,
     pub composeFilePicker: Option<RuntimeHostInteractionComposeFilePickerResponse>,
+    pub composeFileSave: Option<RuntimeHostInteractionComposeFileSaveResponse>,
     pub systemCaptureScreenshot: Option<RuntimeHostInteractionSystemCaptureScreenshotResponse>,
     pub systemLanguageCode: Option<RuntimeHostInteractionSystemLanguageCodeResponse>,
     pub systemRecognizeText: Option<RuntimeHostInteractionSystemRecognizeTextResponse>,
@@ -495,6 +504,13 @@ impl RuntimeHostInteractionResponse {
     pub fn composeFilePicker(response: RuntimeHostInteractionComposeFilePickerResponse) -> Self {
         let mut value = Self::empty();
         value.composeFilePicker = Some(response);
+        value
+    }
+
+    /// Creates the response for an owner file-save interaction.
+    pub fn composeFileSave(response: RuntimeHostInteractionComposeFileSaveResponse) -> Self {
+        let mut value = Self::empty();
+        value.composeFileSave = Some(response);
         value
     }
 
@@ -594,6 +610,7 @@ impl RuntimeHostInteractionResponse {
             webVisit: None,
             composeWebViewController: None,
             composeFilePicker: None,
+            composeFileSave: None,
             systemCaptureScreenshot: None,
             systemLanguageCode: None,
             systemRecognizeText: None,
@@ -671,6 +688,12 @@ pub struct RuntimeHostInteractionComposeFilePickerResponse {
     pub resultJson: String,
 }
 
+/// Compose DSL file-save response payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeHostInteractionComposeFileSaveResponse {
+    pub resultJson: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Screenshot capture response payload.
 pub struct RuntimeHostInteractionSystemCaptureScreenshotResponse {
@@ -732,16 +755,7 @@ pub struct RuntimeHostInteractionLocalInferenceResponse {
     pub resultJson: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-/// Browser identity and code for one Web Access pairing request.
-pub struct RuntimeHostInteractionWebAccessPairingPayload {
-    pub pairingId: String,
-    pub clientDeviceId: String,
-    pub clientPlatform: String,
-    pub clientModel: String,
-    pub pairingCode: String,
-    pub createdAt: i64,
-}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Application event that the owning Flutter process may surface as a system notification.
@@ -821,6 +835,7 @@ impl ChatToolPermissionBroker {
                 .cmp(&right.requestedAtMillis)
                 .then_with(|| left.requestId.cmp(&right.requestId))
         });
+        crate::services::WorkActivityService::permissionsChanged(requests.clone());
         self.requests.set_value(requests);
     }
 
@@ -936,6 +951,243 @@ impl ChatToolPermissionBroker {
 /// Service facade for publishing and responding to host interaction requests.
 pub struct RuntimeHostInteractionService {
     systemOperationHost: Option<Arc<dyn SystemOperationHost>>,
+    httpHost: Option<Arc<dyn operit_host_api::HttpHost>>,
+}
+
+/// A terminal image download result transported through the runtime proxy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeImageData {
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+    pub displayUrl: Option<String>,
+    pub error: Option<String>,
+}
+
+/// A cold image source whose collection lifetime owns any host byte request.
+pub struct RuntimeImageStream {
+    url: String,
+    host: Option<Arc<dyn operit_host_api::HttpHost>>,
+}
+
+/// Closes the host request when collection completes or is cancelled.
+struct RuntimeImageRequest {
+    id: String,
+    host: Arc<dyn operit_host_api::HttpHost>,
+}
+
+impl Drop for RuntimeImageRequest {
+    /// Releases the request, including when the proxy drops its collector.
+    fn drop(&mut self) {
+        let _ = self.host.closeHttpByteStream(&self.id);
+    }
+}
+
+/// Accumulates at most sixteen MiB without buffering an unbounded chunk queue.
+#[derive(Default)]
+struct RuntimeImageBuffer {
+    bytes: Vec<u8>,
+    completion: Option<oneshot::Sender<Result<Vec<u8>, String>>>,
+}
+
+impl RuntimeImageBuffer {
+    /// Accepts a chunk or terminates the request when its byte budget is exceeded.
+    fn push(&mut self, chunk: Vec<u8>) {
+        if self.completion.is_none() {
+            return;
+        }
+        if chunk.len() > 16 * 1024 * 1024 - self.bytes.len() {
+            self.finish(Err("Image exceeded 16 MiB size limit".to_string()));
+            return;
+        }
+        self.bytes.extend_from_slice(&chunk);
+    }
+
+    /// Publishes exactly one terminal result and releases the buffered bytes.
+    fn finish(&mut self, result: Result<(), String>) {
+        if let Some(completion) = self.completion.take() {
+            let bytes = std::mem::take(&mut self.bytes);
+            let result = result.and_then(|()| {
+                if bytes.is_empty() {
+                    Err("Image response was empty".to_string())
+                } else {
+                    Ok(bytes)
+                }
+            });
+            let _ = completion.send(result);
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtimeImageBufferTests {
+    use super::RuntimeImageBuffer;
+    use tokio::sync::oneshot;
+
+    /// Verifies the byte limit rejects excess data before retaining it.
+    #[test]
+    fn rejectsOversizedImage() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut buffer = RuntimeImageBuffer {
+            bytes: vec![0; 16 * 1024 * 1024],
+            completion: Some(sender),
+        };
+        buffer.push(vec![1]);
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap_err(),
+            "Image exceeded 16 MiB size limit"
+        );
+        assert!(buffer.bytes.is_empty());
+        buffer.push(vec![2]);
+        assert!(buffer.bytes.is_empty());
+    }
+
+    /// Verifies ordered chunks are delivered only after successful completion.
+    #[test]
+    fn completesOrderedImage() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut buffer = RuntimeImageBuffer {
+            bytes: Vec::new(),
+            completion: Some(sender),
+        };
+        buffer.push(vec![1, 2]);
+        buffer.push(vec![3]);
+        buffer.finish(Ok(()));
+        assert_eq!(receiver.try_recv().unwrap().unwrap(), vec![1, 2, 3]);
+    }
+
+    /// Verifies an empty successful response cannot become an image result.
+    #[test]
+    fn rejectsEmptyImage() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut buffer = RuntimeImageBuffer {
+            bytes: Vec::new(),
+            completion: Some(sender),
+        };
+        buffer.finish(Ok(()));
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap_err(),
+            "Image response was empty"
+        );
+    }
+}
+
+impl RuntimeImageStream {
+    /// Resolves image delivery through the host and bounds byte-stream downloads.
+    async fn load(&self) -> Result<RuntimeImageData, String> {
+        if let Some(data) = self.url.strip_prefix("data:") {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let (metadata, payload) = data.split_once(',').ok_or("Invalid image data URI")?;
+            if !metadata.split(';').any(|part| part == "base64") {
+                return Err("Image data URI must use base64 encoding".to_string());
+            }
+            if payload.len() > (16 * 1024 * 1024 + 2) / 3 * 4 {
+                return Err("Image exceeded 16 MiB size limit".to_string());
+            }
+            let bytes = STANDARD.decode(payload).map_err(|error| error.to_string())?;
+            let mimeType = metadata.split(';').next().ok_or("Image data URI must declare its MIME type")?;
+            if !mimeType.starts_with("image/") {
+                return Err("Image data URI must declare an image MIME type".to_string());
+            }
+            let bytes = match mimeType {
+                "image/heic" | "image/heif" | "image/heic-sequence" | "image/heif-sequence" => {
+                    crate::services::media::images::heif_display_bytes(&bytes)?
+                }
+                _ => bytes,
+            };
+            return Ok(RuntimeImageData {
+                bytes,
+                displayUrl: None,
+                error: None,
+            });
+        }
+        let url = url::Url::parse(&self.url).map_err(|error| error.to_string())?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("Image URL must use HTTP or HTTPS".to_string());
+        }
+        let host = self.host.clone().ok_or("HTTP host is not registered")?;
+        let requiresDecode = matches!(
+            url.path().rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
+            Some("heic" | "heif")
+        );
+        match host.imageDelivery() {
+            operit_host_api::HttpImageDelivery::DisplayUrl if !requiresDecode => {
+                return Ok(RuntimeImageData {
+                    bytes: Vec::new(),
+                    displayUrl: Some(url.to_string()),
+                    error: None,
+                });
+            }
+            _ => {}
+        }
+        let request = RuntimeImageRequest {
+            id: format!("markdown-image-{}", Uuid::new_v4()),
+            host,
+        };
+        let (sender, receiver) = oneshot::channel();
+        let buffer = Arc::new(Mutex::new(RuntimeImageBuffer {
+            bytes: Vec::new(),
+            completion: Some(sender),
+        }));
+        let chunkBuffer = buffer.clone();
+        request
+            .host
+            .openHttpByteStream(
+                request.id.clone(),
+                operit_host_api::HttpRequestData {
+                    url: url.to_string(),
+                    method: "GET".to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    formFields: Vec::new(),
+                    fileParts: Vec::new(),
+                    connectTimeoutSeconds: 20,
+                    readTimeoutSeconds: 30,
+                    followRedirects: true,
+                    ignoreSsl: false,
+                    proxyHost: String::new(),
+                    proxyPort: 0,
+                },
+                Arc::new(|| {}),
+                Arc::new(move |chunk| chunkBuffer.lock().expect("image buffer lock").push(chunk)),
+                Arc::new(move |result| buffer.lock().expect("image buffer lock").finish(result)),
+            )
+            .map_err(|error| error.message)?;
+        let scheduler = defaultHostRuntimeTaskSchedulerHost();
+        let timeout = scheduler.waitForHostRuntimeDelay(30_000);
+        let bytes = tokio::select! {
+            result = receiver => result.map_err(|error| error.to_string())?,
+            _ = timeout => Err("Image download timed out after 30 seconds".to_string()),
+        }?;
+        let bytes = if requiresDecode {
+            crate::services::media::images::heif_display_bytes(&bytes)?
+        } else {
+            bytes
+        };
+        Ok(RuntimeImageData {
+            bytes,
+            displayUrl: None,
+            error: None,
+        })
+    }
+}
+
+impl Stream for RuntimeImageStream {
+    type Item = RuntimeImageData;
+
+    /// Emits one result and cancels the HTTP request when collection is dropped.
+    fn collect<'a>(&'a mut self, collector: &'a mut dyn FnMut(Self::Item)) -> CollectFuture<'a> {
+        Box::pin(async move {
+            let result = match self.load().await {
+                Ok(data) => data,
+                Err(error) => RuntimeImageData {
+                    bytes: Vec::new(),
+                    displayUrl: None,
+                    error: Some(error),
+                },
+            };
+            collector(result);
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -993,6 +1245,15 @@ impl RuntimeHostInteractionService {
     pub fn getInstance(context: &HostManager) -> Self {
         Self {
             systemOperationHost: context.systemOperationHost.clone(),
+            httpHost: context.httpHost.clone(),
+        }
+    }
+
+    /// Creates a cancellable image download through the active runtime HTTP host.
+    pub fn imageBytes(&self, url: String) -> RuntimeImageStream {
+        RuntimeImageStream {
+            url,
+            host: self.httpHost.clone(),
         }
     }
 
@@ -1109,16 +1370,19 @@ pub fn requestOwnerBrowserAutomation(
         .ok_or_else(|| "browser automation response payload is missing".to_string())
 }
 
-/// Requests a browser session command from the owner host and waits for a response.
-pub fn requestOwnerBrowserSession(
+/// Requests a browser session command from the owner host and waits without
+/// blocking the calling runtime worker.
+pub async fn requestOwnerBrowserSessionAsync(
     payload: RuntimeHostInteractionBrowserSessionPayload,
     timeout: Duration,
 ) -> Result<RuntimeHostInteractionBrowserSessionResponse, String> {
-    let response = runtimeHostInteractionBroker().request(
-        RuntimeHostInteractionTarget::OwnerHost,
-        RuntimeHostInteractionRequest::browserSession(payload),
-        timeout,
-    )?;
+    let response = runtimeHostInteractionBroker()
+        .requestAsync(
+            RuntimeHostInteractionTarget::OwnerHost,
+            RuntimeHostInteractionRequest::browserSession(payload),
+            timeout,
+        )
+        .await?;
     response
         .browserSession
         .ok_or_else(|| "browser session response payload is missing".to_string())
@@ -1167,6 +1431,19 @@ pub fn requestOwnerComposeFilePicker(
     response
         .composeFilePicker
         .ok_or_else(|| "compose file picker response payload is missing".to_string())
+}
+
+/// Requests an export through the owner host file-save selector.
+pub fn requestOwnerComposeFileSave(
+    payload: RuntimeHostInteractionComposeFileSavePayload,
+    timeout: Duration,
+) -> Result<RuntimeHostInteractionComposeFileSaveResponse, String> {
+    let response = runtimeHostInteractionBroker().request(
+        RuntimeHostInteractionTarget::OwnerHost,
+        RuntimeHostInteractionRequest::composeFileSave(payload),
+        timeout,
+    )?;
+    response.composeFileSave.ok_or_else(|| "compose file save response payload is missing".to_string())
 }
 
 /// Requests a screenshot capture from the owner host.
@@ -1383,13 +1660,7 @@ pub async fn requestChatToolPermissionAsync(
         .await
 }
 
-/// Publishes one browser Web Access pairing request to the owner host.
-pub fn publishOwnerWebAccessPairing(payload: RuntimeHostInteractionWebAccessPairingPayload) {
-    runtimeHostInteractionBroker().publish(
-        RuntimeHostInteractionTarget::OwnerHost,
-        RuntimeHostInteractionRequest::webAccessPairing(payload),
-    );
-}
+
 
 /// Publishes one application notification event to the owner host.
 pub fn publishOwnerAppNotification(payload: RuntimeHostInteractionAppNotificationPayload) {
@@ -1513,7 +1784,16 @@ impl RuntimeHostInteractionBroker {
             .map_err(|error| error.message)?;
 
         loop {
-            let changed = self.asyncChanged.notified();
+            // Register the change waiter before scanning shared state, because
+            // notify_waiters only wakes waiters that are already registered; a
+            // response inserted between the scan and the select below would
+            // otherwise be missed until the timeout fires.
+            let mut changed = Box::pin(self.asyncChanged.notified());
+            std::future::poll_fn(|context| {
+                let _ = changed.as_mut().poll(context);
+                std::task::Poll::Ready(())
+            })
+            .await;
             {
                 let mut state = self
                     .state
@@ -1530,7 +1810,7 @@ impl RuntimeHostInteractionBroker {
             }
 
             tokio::select! {
-                _ = changed => {}
+                _ = changed.as_mut() => {}
                 timeout = &mut timeoutReceiver => {
                     timeout.map_err(|_| "host interaction timeout task was cancelled".to_string())?;
                     let mut state = self
@@ -1539,20 +1819,21 @@ impl RuntimeHostInteractionBroker {
                         .map_err(|error| format!("host interaction mutex poisoned: {error}"))?;
                     if let Some(response) = state.responses.remove(&requestId) {
                         state.pending.remove(&requestId);
-                                        self.notifyChanged();
+                        self.notifyChanged();
                         if let Some(error) = response.error.as_ref() {
                             return Err(error.clone());
                         }
                         return Ok(response);
                     }
                     state.pending.remove(&requestId);
-                                self.notifyChanged();
+                    self.notifyChanged();
                     return Err(format!("host interaction timed out: {requestId}"));
                 }
             }
         }
     }
 
+    /// Retires a pending operation atomically before making its result available.
     fn respond(
         &self,
         requestId: &str,
@@ -1571,6 +1852,7 @@ impl RuntimeHostInteractionBroker {
             ));
         }
         state.responses.insert(requestId.to_string(), response);
+        state.pending.remove(requestId);
         self.notifyChanged();
         Ok(())
     }
@@ -1619,12 +1901,37 @@ impl RuntimeHostInteractionBroker {
 mod tests {
     use super::*;
 
+    /// Verifies a real HEIC image becomes a Flutter-readable, nonempty PNG.
+    #[tokio::test]
+    async fn heifImagesDecodeToPng() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let service = RuntimeHostInteractionService::getInstance(&HostManager::new());
+        let source = include_bytes!("../../tests/fixtures/heif-checker-64.heic");
+        let data = service.imageBytes(format!("data:image/heic;base64,{}", STANDARD.encode(source)))
+            .load().await.expect("decode HEIC fixture through image delivery");
+        let png = data.bytes;
+        let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("display bytes must be valid PNG");
+        assert_eq!((image.width(), image.height()), (64, 64));
+        let rgba = image.to_rgba8();
+        assert!(rgba.pixels().any(|pixel| pixel != rgba.get_pixel(0, 0)));
+        let unchanged = service.imageBytes(format!("data:image/png;base64,{}", STANDARD.encode(&png)))
+            .load().await.expect("read ordinary PNG");
+        assert_eq!(unchanged.bytes, png);
+        let mut invalid = source.to_vec();
+        invalid.truncate(32);
+        assert!(crate::services::media::images::heif_display_bytes(&invalid).is_err());
+    }
+
     /// Verifies image and audio/video pool entries are returned by pool id.
     #[test]
     fn mediaPoolDataIsReadByIdWithTypeValidation() {
         let service = RuntimeHostInteractionService::getInstance(&HostManager::new());
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png).unwrap();
         let imageId = ImagePoolManager::add_image_bytes(
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01",
+            png.get_ref(),
             Some("image/png"),
             None,
         );
@@ -1655,43 +1962,49 @@ mod tests {
         MediaPoolManager::remove_media(&audioId);
         MediaPoolManager::remove_media(&videoId);
         MediaPoolManager::remove_media(&invalidAudioId);
+        ImagePoolManager::remove_image(&imageId);
     }
 
-    /// Verifies non-blocking owner notifications remain pending until acknowledged.
+
+
+    /// Verifies reconnects cannot replay an answered operation before its waiter resumes.
     #[test]
-    fn brokerRemovesPublishedNotificationAfterAcknowledgement() {
+    fn brokerRetiresRespondedRequestsBeforeReplay() {
         let broker = RuntimeHostInteractionBroker::default();
-        let request = RuntimeHostInteractionRequest::webAccessPairing(
-            RuntimeHostInteractionWebAccessPairingPayload {
-                pairingId: "pairing-1".to_string(),
-                clientDeviceId: "browser-1".to_string(),
-                clientPlatform: "web".to_string(),
-                clientModel: "browser".to_string(),
-                pairingCode: "123456".to_string(),
-                createdAt: 1,
+        let request = RuntimeHostInteractionRequest::fileOpen(
+            RuntimeHostInteractionFileOpenPayload {
+                path: "/tmp/file".to_string(),
             },
         );
         let requestId = request.requestId.clone();
+        broker.state.lock().unwrap().pending.insert(
+            requestId.clone(),
+            RuntimeHostInteractionPending {
+                target: RuntimeHostInteractionTarget::OwnerHost,
+                request,
+                sequence: 0,
+                awaitsResponse: true,
+            },
+        );
+        let mut response = RuntimeHostInteractionResponse::empty();
+        response.error = Some("native open failed".to_string());
 
-        broker.publish(RuntimeHostInteractionTarget::OwnerHost, request);
+        broker.respond(&requestId, response).unwrap();
 
-        assert!(broker
-            .state
-            .lock()
-            .expect("host interaction mutex poisoned")
-            .pending
-            .contains_key(&requestId));
-
-        broker
-            .acknowledge(&requestId)
-            .expect("notification acknowledgement must succeed");
-
-        assert!(!broker
-            .state
-            .lock()
-            .expect("host interaction mutex poisoned")
-            .pending
-            .contains_key(&requestId));
+        {
+            let state = broker.state.lock().unwrap();
+            assert!(!state.pending.contains_key(&requestId));
+            assert_eq!(
+                state.responses[&requestId].error.as_deref(),
+                Some("native open failed"),
+            );
+        }
+        assert_eq!(
+            broker
+                .respond(&requestId, RuntimeHostInteractionResponse::empty())
+                .unwrap_err(),
+            format!("host interaction request not found: {requestId}"),
+        );
     }
 
     /// Verifies that a structured owner error returns without waiting for timeout.

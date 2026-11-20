@@ -1,11 +1,39 @@
 // Generated from operit-plugin-sdk Rust declarations.
 
-import type { AgentStatusResultData, CharacterCardListResultData, ChatCallResultData, ChatCreationResultData, ChatDeleteResultData, ChatFindResultData, ChatListResultData, ChatMessagesResultData, ChatServiceStartResultData, ChatSwitchResultData, ChatTitleUpdateResultData, MessageSendResultData, MessageSendStreamEventData } from "./results";
+import type { JsonObject } from "./core";
+import type { AgentStatusResultData, ChatCallResultData, ChatCancelResultData, ChatCancelScheduledMessageResultData, ChatCreationResultData, ChatDeleteExtensionResultData, ChatDeleteResultData, ChatFindResultData, ChatListResultData, ChatMessagesResultData, ChatPreparedDeliveryResultData, ChatReadExtensionResultData, ChatScheduleMessageResultData, ChatScheduledMessagesResultData, ChatSendMessageResultData, ChatServiceStartResultData, ChatSwitchResultData, ChatTitleUpdateResultData, ChatWriteExtensionResultData, MessageSendResultData } from "./results";
 
 /**
- * Starts the chat service and manages conversations, messages, and character cards.
+ * Starts the chat service and manages generic conversations and execution participants.
  */
 export namespace Chat {
+  /**
+   * Identifies an existing conversation or an exact persisted message revision.
+   */
+  export type ExtensionTarget = { kind: "chat"; chatId: string; } | { kind: "message"; chatId: string; messageTimestamp: number; variantIndex: number; };
+
+  /**
+   * Configures workspace conversation creation without exposing plugin associations.
+   */
+  export interface CreateOptions {
+    /**
+     * Controls whether the newly persisted conversation becomes current.
+     */
+    setAsCurrentChat?: boolean;
+    /**
+     * Identifies an explicitly selected existing source conversation for creation hooks.
+     */
+    sourceChatId?: string | null;
+    /**
+     * Places the new conversation beneath an existing parent without cloning its history.
+     */
+    parentChatId?: string | null;
+    /**
+     * Supplies opaque creation input interpreted solely by registered plugins.
+     */
+    input?: JsonObject | null;
+  }
+
   /**
    * Describes one prompt turn supplied to a non-persistent functional model call.
    */
@@ -69,6 +97,10 @@ export namespace Chat {
    * Configures filtering, ordering, and result limits when listing conversations.
    */
   export interface HostListChatsParams {
+    /**
+     * Selects an explicit batch of 1..200 generic chat identities through SQL.
+     */
+    chat_ids?: string[];
     /**
      * Contains the text or pattern used to filter conversations.
      */
@@ -157,6 +189,107 @@ export namespace Chat {
   export type StartServiceOptionsInitialMode = "WINDOW" | "BALL" | "VOICE_BALL" | "FULLSCREEN" | "RESULT_DISPLAY" | "SCREEN_OCR";
 
   /**
+   * Preserves the original submitted text, attachments and reply target for a native sequence.
+   */
+  export interface TurnInput {
+    text: string;
+    attachments: SendAttachment[];
+    replyToMessageTimestamp: number | null;
+  }
+
+  /**
+   * Selects real user-only persistence or one explicitly selected execution participant.
+   */
+  export type InitialTurn = { kind: "record_only"; } | { kind: "execute"; participantId?: string; };
+
+  /**
+   * Controls summary scheduling for an explicitly continued user turn.
+   */
+  export type SummaryPolicy = "defer" | "after_reply";
+
+  /**
+   * Sends original input once or generates a reply to an explicitly identified persisted user message.
+   */
+  export type SendRequest = { kind: "submit"; chatId: string; runtime: Runtime; input: TurnInput; turn: InitialTurn; notifyReply: boolean; } | { kind: "continue"; chatId: string; runtime: Runtime; userMessageTimestamp: number; participantId: string; notifyReply: boolean; summaryPolicy: SummaryPolicy; };
+
+  /**
+   * Describes one already parsed semantic message block, including its structured tool fields.
+   */
+  export interface MessagePart {
+    partId: string;
+    sequence: number;
+    kind: MessagePartKind;
+    content: string;
+    toolCallId: string | null;
+    toolName: string | null;
+    attributes: Record<string, string>;
+  }
+
+  /**
+   * Identifies semantic content without requiring plugins to parse provider markup.
+   */
+  export type MessagePartKind = "markdown" | "thinking" | "tool_call" | "tool_result" | "status";
+
+  /**
+   * Publishes atomic semantic snapshots followed by the actual finalized receipt.
+   * A part event replaces the entire ordered part list, including removed or revised blocks.
+   * Slow consumers observe the latest snapshot; snapshots are not an append-only chunk log.
+   */
+  export type SendEvent = { type: "part"; chatId: string; messageTimestamp: number; revision: number; parts: MessagePart[]; } | { type: "completed"; result: MessageSendResultData; };
+
+  /**
+   * Reports cancellation of this authenticated plugin's execution in the named chat.
+   */
+  export interface CancelResult {
+    chatId: string;
+    cancelRequested: boolean;
+  }
+
+  /**
+   * Publishes already generated assistant text to one existing conversation on any platform.
+   */
+  export interface PreparedMessageRequest {
+    chatId: string;
+    text: string;
+    /**
+     * Positive Unix milliseconds; must have reached this time before committing.
+     */
+    timestamp: number;
+    notify: boolean;
+  }
+
+  /**
+   * Requests a proactive reply from the target conversation's actual execution profile.
+   */
+  export interface ScheduledGeneration {
+    /**
+     * Supplies instructions for a proactive reply using the target conversation's resolved participant and context.
+     */
+    instruction: string;
+  }
+
+  /**
+   * Schedules supplied text or asks the host to prepare a contextual assistant reply.
+   */
+  export interface ScheduledMessageRequest {
+    /**
+     * Scoped automatically to the authenticated plugin. Identical retries are idempotent.
+     */
+    id: string;
+    chatId: string;
+    title: string;
+    text: string;
+    /**
+     * Requires empty text. The host saves the actual author, model usage and generation timing with the prepared reply.
+     */
+    generation?: ScheduledGeneration;
+    /**
+     * Absolute Unix milliseconds, from one second to 30 days ahead.
+     */
+    timestamp: number;
+  }
+
+  /**
    * Check chat input processing status
    */
   function agentStatus(chatId: string): Promise<AgentStatusResultData>;
@@ -166,17 +299,31 @@ export namespace Chat {
    */
   function call(options: CallOptions): Promise<ChatCallResultData>;
   /**
-   * Create a new chat conversation
-   * @param group - Optional group name for the new chat
-   * @param setAsCurrentChat - Optional, whether to switch to the new chat (default true)
-   * @param characterCardId - Optional character card id to bind for the new chat
-   * @returns Promise resolving to the new chat creation result
+   * Cancels only the calling plugin's execution captured in the specified conversation.
    */
-  function createNew(group?: string, setAsCurrentChat?: boolean, characterCardId?: string): Promise<ChatCreationResultData>;
+  function cancel(chatId: string): Promise<ChatCancelResultData>;
+  /**
+   * Cancels this plugin's scheduled message and any associated system notification.
+   */
+  function cancelScheduledMessage(id: string): Promise<ChatCancelScheduledMessageResultData>;
+  /**
+   * Creates a workspace conversation through the registered creation hooks.
+   * @param options - Current-chat control, an explicit source chat, and opaque plugin input.
+   * @returns The identity and timestamp of the actually persisted conversation.
+   */
+  function createNew(options?: CreateOptions): Promise<ChatCreationResultData>;
   /**
    * Delete a chat conversation by id
    */
   function deleteChat(chatId: string): Promise<ChatDeleteResultData>;
+  /**
+   * Deletes only the authenticated executing package's extension on an existing target.
+   */
+  function deleteExtension(target: ExtensionTarget): Promise<ChatDeleteExtensionResultData>;
+  /**
+   * Commits prepared assistant text once by chat ID and timestamp, without changing the selected chat.
+   */
+  function deliverPrepared(request: PreparedMessageRequest): Promise<ChatPreparedDeliveryResultData>;
   /**
    * Find a chat by title or id
    */
@@ -199,33 +346,37 @@ export namespace Chat {
    */
   function listAll(): Promise<ChatListResultData>;
   /**
-   * List all character cards
-   */
-  function listCharacterCards(): Promise<CharacterCardListResultData>;
-  /**
    * List chat conversations with filters
    */
   function listChats(params?: HostListChatsParams): Promise<ChatListResultData>;
   /**
-   * Send a message to the AI
-   * @param message - The message content to send
-   * @param chatId - Optional chat ID to send the message to (defaults to current chat)
-   * @param roleCardId - Optional role card ID to use for this send
-   * @param senderName - Optional display name when AI sends as user
-   * @param options - Optional per-turn controls for persistence, notification, hidden user-message display, and timeout
-   * @returns Promise resolving to the message send result
+   * Lists this plugin's scheduled messages and delivery outcomes without platform-specific handling.
    */
-  function sendMessage(message: string, chatId?: string, roleCardId?: string, senderName?: string, options?: SendMessageOptions): Promise<MessageSendResultData>;
+  function listScheduledMessages(): Promise<ChatScheduledMessagesResultData>;
   /**
-   * Send a message to the AI and receive incremental reply chunks.
-   * @param message - The message content to send
-   * @param chatId - Optional chat ID to send the message to (defaults to current chat)
-   * @param roleCardId - Optional role card ID to use for this send
-   * @param senderName - Optional display name when AI sends as user
-   * @param options - Optional per-turn controls, plus streaming callback and waifu-style chunk aggregation
-   * @returns Promise resolving to the final message send result
+   * Clears the parent relationship while preserving the conversation and its children.
    */
-  function sendMessageStreaming(message: string, chatId?: string, roleCardId?: string, senderName?: string, options?: SendMessageStreamingOptions): Promise<MessageSendResultData>;
+  function promoteToRoot(chatId: string): Promise<string>;
+  /**
+   * Reads only the authenticated executing package's extension on an existing target.
+   */
+  function readExtension(target: ExtensionTarget): Promise<ChatReadExtensionResultData>;
+  /**
+   * Persists the supplied unique existing chat identifiers in display order.
+   */
+  function reorder(chatIds: string[]): Promise<string>;
+  /**
+   * Durably schedules prepared assistant text for a chat. The host handles delivery and platform restrictions.
+   */
+  function scheduleMessage(request: ScheduledMessageRequest): Promise<ChatScheduleMessageResultData>;
+  /**
+   * Sends one request and resolves only after its real receipt and native cleanup are complete.
+   */
+  function sendMessage(request: SendRequest): Promise<ChatSendMessageResultData>;
+  /**
+   * Streams authoritative parsed part snapshots and the real terminal receipt through one async iterator.
+   */
+  function sendMessageStreaming(request: SendRequest): AsyncIterable<SendEvent>;
   /**
    * Start the chat service (floating window)
    * @param options - Optional service startup options
@@ -243,9 +394,23 @@ export namespace Chat {
    */
   function switchTo(chatId: string): Promise<ChatSwitchResultData>;
   /**
+   * Updates only the pinned state of an existing canonical chat.
+   * Assigns existing conversations to a native folder; null removes folder membership.
+   */
+  function updateGroup(chatIds: string[], groupName: string | null): Promise<string>;
+  /**
+   * Updates only the deletion lock of an existing canonical chat.
+   */
+  function updateLocked(chatId: string, locked: boolean): Promise<string>;
+  function updatePinned(chatId: string, pinned: boolean): Promise<string>;
+  /**
    * Update chat title
    */
   function updateTitle(chatId: string, title: string): Promise<ChatTitleUpdateResultData>;
+  /**
+   * Replaces only the authenticated executing package's object extension on an existing target.
+   */
+  function writeExtension(target: ExtensionTarget, value: JsonObject): Promise<ChatWriteExtensionResultData>;
   /**
    * Selects the application surface that owns a chat turn.
    */
@@ -278,6 +443,50 @@ export namespace Chat {
   }
 
   /**
+   * Carries every attachment field that the host passes to submit hooks and the real input processor.
+   */
+  export interface SendAttachment {
+    /**
+     * Preserves a saved VFS locator independently of the local media path.
+     */
+    vfsPath?: string | null;
+    /**
+     * Contains the original logical file path, not a reconstructed placeholder.
+     */
+    filePath: string;
+    /**
+     * Identifies the actual originating node or explicitly contains null.
+     */
+    nodeId?: string | null;
+    /**
+     * Contains the original attachment filename.
+     */
+    fileName: string;
+    /**
+     * Contains the actual MIME type.
+     */
+    mimeType: string;
+    /**
+     * Contains the attachment size in bytes.
+     */
+    fileSize: number;
+    /**
+     * Contains the original inline attachment payload.
+     */
+    content: string;
+  }
+
+  /**
+   * Continues a real committed user turn without inserting or modifying the original submitted message.
+   */
+  export interface SendContinuation {
+    /**
+     * Identifies the existing user-message row in the explicitly selected conversation.
+     */
+    userMessageTimestamp: number;
+  }
+
+  /**
    * Controls persistence, presentation, and timing for one AI chat turn.
    */
   export interface SendMessageOptions {
@@ -305,20 +514,18 @@ export namespace Chat {
      * Sets the maximum turn-processing time in milliseconds.
      */
     timeout_ms?: number;
-  }
-
-  /**
-   * Extends chat-turn controls with incremental reply delivery.
-   */
-  export interface SendMessageStreamingOptions extends SendMessageOptions {
     /**
-     * Enables waifu-style aggregation of streamed reply chunks.
+     * Supplies complete original attachments only for an initial submit.
      */
-    waifu?: boolean;
+    attachments?: SendAttachment[];
     /**
-     * Receives each intermediate event emitted while the assistant reply is generated.
+     * Identifies the real replied-to message on an initial submit.
      */
-    onIntermediateResult?: (arg0: MessageSendStreamEventData) => void;
+    replyToMessageTimestamp?: number;
+    /**
+     * Continues the identified committed user message; attachments, reply and replacement text are prohibited.
+     */
+    continuation?: SendContinuation;
   }
 
 }

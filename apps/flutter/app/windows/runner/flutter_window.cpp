@@ -1,8 +1,12 @@
 #include "flutter_window.h"
 
 #include <optional>
+#include <dwmapi.h>
+#include <flutter/method_channel.h>
+#include <flutter/standard_method_codec.h>
 
 #include <desktop_multi_window/desktop_multi_window_plugin.h>
+#include <file_selector_windows/file_selector_windows.h>
 
 #include "crash_channel.h"
 #include "engine_channel_lifetime.h"
@@ -10,12 +14,75 @@
 #include "operit_runtime_channel.h"
 #include "system_audio_input_channel.h"
 
-/// Creates a window that owns one Flutter view controller.
-FlutterWindow::FlutterWindow(const flutter::DartProject& project)
-    : project_(project) {}
+namespace {
 
-/// Destroys the window after Win32 teardown has released hosted content.
-FlutterWindow::~FlutterWindow() {}
+/// Keeps the system caption controls while joining its color to the sidebar.
+void RegisterWindowChromeChannel(flutter::FlutterEngine* engine, HWND view) {
+  using flutter::EncodableMap;
+  using flutter::EncodableValue;
+  auto channel = std::make_shared<flutter::MethodChannel<EncodableValue>>(
+      engine->messenger(), "operit/window_chrome",
+      &flutter::StandardMethodCodec::GetInstance());
+  channel->SetMethodCallHandler(
+      [view](const auto& call, auto result) {
+        if (call.method_name() != "configure") {
+          result->NotImplemented();
+          return;
+        }
+        const auto* arguments = call.arguments()
+            ? std::get_if<EncodableMap>(call.arguments()) : nullptr;
+        if (!arguments) {
+          result->Error("invalid_arguments", "Window appearance is required");
+          return;
+        }
+        const auto dark_entry = arguments->find(EncodableValue("dark"));
+        const auto background = arguments->find(EncodableValue("backgroundColor"));
+        const auto foreground = arguments->find(EncodableValue("foregroundColor"));
+        if (dark_entry == arguments->end() || background == arguments->end() ||
+            foreground == arguments->end() ||
+            !std::holds_alternative<bool>(dark_entry->second)) {
+          result->Error("invalid_arguments", "Window appearance is incomplete");
+          return;
+        }
+        const auto to_color = [](const EncodableValue& value) -> COLORREF {
+          const auto* wide = std::get_if<int64_t>(&value);
+          const auto* narrow = std::get_if<int32_t>(&value);
+          const auto argb = static_cast<uint32_t>(wide ? *wide : narrow ? *narrow : 0);
+          return RGB((argb >> 16) & 0xff, (argb >> 8) & 0xff, argb & 0xff);
+        };
+        const HWND window = GetAncestor(view, GA_ROOT);
+        if (!IsWindow(window)) {
+          result->Error("window_unavailable", "Window is unavailable");
+          return;
+        }
+        const BOOL dark = std::get<bool>(dark_entry->second);
+        const COLORREF caption_color = to_color(background->second);
+        const COLORREF text_color = to_color(foreground->second);
+        DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                              &dark, sizeof(dark));
+        // Windows 11 caption/text colors. Older Windows still uses the native
+        // light/dark caption selected above; its resizing and Snap stay native.
+        DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(35),
+                              &caption_color, sizeof(caption_color));
+        DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(36),
+                              &text_color, sizeof(text_color));
+        result->Success(EncodableValue(0.0));
+      });
+  RegisterOperitEngineChannelShutdown(engine, [channel]() {
+    channel->SetMethodCallHandler(nullptr);
+  });
+}
+
+}  // namespace
+
+/// Creates a window that owns one Flutter view controller.
+FlutterWindow::FlutterWindow(const flutter::DartProject& project, bool data_rescue)
+    : project_(project), data_rescue_(data_rescue) {}
+
+/// Releases hosted engines before C++ destroys the controller member.
+FlutterWindow::~FlutterWindow() {
+  Destroy();
+}
 
 /// Initializes Flutter, plugins, and native channels for the window.
 bool FlutterWindow::OnCreate() {
@@ -33,11 +100,18 @@ bool FlutterWindow::OnCreate() {
   if (!flutter_controller_->engine() || !flutter_controller_->view()) {
     return false;
   }
-  RegisterPlugins(flutter_controller_->engine());
-  RegisterOperitCrashChannel(flutter_controller_->engine());
+  if (data_rescue_) {
+    FileSelectorWindowsRegisterWithRegistrar(
+        flutter_controller_->engine()->GetRegistrarForPlugin("FileSelectorWindows"));
+  } else {
+    RegisterPlugins(flutter_controller_->engine());
+  }
   RegisterOperitRuntimeChannel(flutter_controller_->engine(), GetHandle());
-  RegisterSystemAudioInputChannel(flutter_controller_->engine());
-  DesktopMultiWindowSetWindowCreatedCallback([](void* controller) {
+  if (!data_rescue_) {
+    RegisterOperitCrashChannel(flutter_controller_->engine());
+    RegisterSystemAudioInputChannel(flutter_controller_->engine());
+    RegisterWindowChromeChannel(flutter_controller_->engine(), GetHandle());
+    DesktopMultiWindowSetWindowCreatedCallback([](void* controller) {
     auto* flutter_view_controller =
         reinterpret_cast<flutter::FlutterViewController*>(controller);
     RegisterPlugins(flutter_view_controller->engine());
@@ -45,7 +119,16 @@ bool FlutterWindow::OnCreate() {
         flutter_view_controller->engine(),
         flutter_view_controller->view()->GetNativeWindow());
     RegisterSystemAudioInputChannel(flutter_view_controller->engine());
-  });
+    RegisterWindowChromeChannel(
+        flutter_view_controller->engine(),
+        flutter_view_controller->view()->GetNativeWindow());
+    });
+    DesktopMultiWindowSetWindowDestroyedCallback([](void* controller) {
+      auto* flutter_view_controller =
+          static_cast<flutter::FlutterViewController*>(controller);
+      ShutdownOperitEngineChannels(flutter_view_controller->engine());
+    });
+  }
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -60,14 +143,16 @@ bool FlutterWindow::OnCreate() {
   return true;
 }
 
-/// Releases native channels before destroying the Flutter controller.
+/// Closes secondary engines before releasing the runtime and main controller.
 void FlutterWindow::OnDestroy() {
-  if (flutter_controller_) {
+  auto controller = std::move(flutter_controller_);
+  if (controller) {
+    DesktopMultiWindowShutdown();
     ShutdownOperitRuntimeChannel();
     ShutdownAllOperitEngineChannels();
     ShutdownSystemAudioInputChannel();
     ShutdownOperitCrashChannel();
-    flutter_controller_ = nullptr;
+    controller.reset();
   }
 
   Win32Window::OnDestroy();

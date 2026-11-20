@@ -1,20 +1,19 @@
-use std::collections::VecDeque;
+use crate::process::background_command;
+
 use std::env;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::process::Stdio;
 
 use operit_host_api::{
     HostError, HostResult, ManagedRuntimeHost, ManagedRuntimeProcess, ManagedRuntimeProgram,
-    RuntimeCommandOutput, RuntimeProcessRequest,
+    RuntimeCommandOutput, RuntimePathAction, RuntimeProcessRequest,
 };
 
-const MANAGED_RUNTIME_STDIO_BUFFER_BYTES: usize = 64 * 1024;
-const MANAGED_RUNTIME_SINGLE_FRAME_MIN_BYTES: usize = 4 * 1024;
+#[path = "../../../../common/managed_runtime_process.rs"]
+mod managed_runtime_process;
+use managed_runtime_process::{
+    ensureExecutablePath, findExecutable, runtimeCommand, NativeManagedRuntimeProcess,
+};
 
 #[derive(Clone, Default)]
 pub struct WindowsManagedRuntimeHost;
@@ -26,87 +25,56 @@ impl WindowsManagedRuntimeHost {
     }
 }
 
-struct NativeManagedRuntimeProcess {
-    child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
-    stdoutRx: Mutex<Receiver<String>>,
-    stderrLines: Arc<Mutex<VecDeque<String>>>,
-}
-
-impl ManagedRuntimeProcess for NativeManagedRuntimeProcess {
-    /// Writes one protocol line to the managed runtime stdin.
-    fn writeLine(&self, line: &str) -> HostResult<()> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| HostError::new("stdin mutex poisoned"))?;
-        writeManagedRuntimeLine(&mut stdin, line)
-    }
-
-    /// Writes multiple protocol lines to the managed runtime stdin.
-    fn writeLines(&self, lines: &[String]) -> HostResult<()> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| HostError::new("stdin mutex poisoned"))?;
-        writeManagedRuntimeLines(&mut stdin, lines)
-    }
-
-    /// Reads one protocol line from the managed runtime stdout queue.
-    fn readStdoutLine(&self, timeoutMs: u64) -> HostResult<Option<String>> {
-        let receiver = self
-            .stdoutRx
-            .lock()
-            .map_err(|_| HostError::new("stdout mutex poisoned"))?;
-        match receiver.recv_timeout(Duration::from_millis(timeoutMs)) {
-            Ok(line) => Ok(Some(line)),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(None),
-        }
-    }
-
-    /// Drains buffered stderr lines collected from the managed runtime.
-    fn drainStderr(&self) -> HostResult<String> {
-        let mut lines = self
-            .stderrLines
-            .lock()
-            .map_err(|_| HostError::new("stderr mutex poisoned"))?;
-        let mut output = String::new();
-        while let Some(line) = lines.pop_front() {
-            output.push_str(&line);
-            if !line.ends_with('\n') {
-                output.push('\n');
-            }
-        }
-        Ok(output)
-    }
-
-    /// Returns whether the managed runtime process is still alive.
-    fn isRunning(&self) -> HostResult<bool> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| HostError::new("child mutex poisoned"))?;
-        Ok(child.try_wait()?.is_none())
-    }
-
-    /// Terminates the managed runtime process.
-    fn kill(&self) -> HostResult<()> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| HostError::new("child mutex poisoned"))?;
-        match child.try_wait()? {
-            Some(_) => Ok(()),
-            None => {
-                child.kill()?;
-                Ok(())
-            }
-        }
-    }
-}
-
 impl ManagedRuntimeHost for WindowsManagedRuntimeHost {
+    /// Launches external file, editor and terminal intents without constructing shell commands.
+    fn openPath(&self, path: &str, action: RuntimePathAction) -> HostResult<()> {
+        use std::os::windows::process::CommandExt;
+        let is_terminal = matches!(&action, RuntimePathAction::Terminal);
+        let target = Path::new(path);
+        let directory = if target.is_dir() {
+            target
+        } else {
+            target
+                .parent()
+                .ok_or_else(|| HostError::new("The target has no parent directory"))?
+        };
+        let mut command = match action {
+            RuntimePathAction::Reveal => {
+                let mut command = background_command("explorer.exe");
+                if !target.is_dir() {
+                    command.arg("/select,");
+                }
+                command.arg(path);
+                command
+            }
+            RuntimePathAction::Terminal => {
+                let mut command = std::process::Command::new("cmd.exe");
+                command
+                    .arg("/k")
+                    .current_dir(directory)
+                    .creation_flags(0x00000010);
+                command
+            }
+            RuntimePathAction::Application { program, args } => {
+                let executable =
+                    self.resolveRuntimeExecutable(ManagedRuntimeProgram::Command(program), None)?;
+                let mut command = background_command(executable);
+                command.args(args).arg(path).current_dir(directory);
+                command
+            }
+        };
+        if is_terminal {
+            command.spawn()?;
+        } else {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+        }
+        Ok(())
+    }
+
     /// Returns the persistent Windows managed runtime workspace directory.
     fn runtimeWorkspaceDir(&self) -> HostResult<String> {
         let localAppData = env::var_os("LOCALAPPDATA").ok_or_else(|| {
@@ -138,6 +106,7 @@ impl ManagedRuntimeHost for WindowsManagedRuntimeHost {
             ManagedRuntimeProgram::Python => vec!["python.exe"],
             ManagedRuntimeProgram::Uv => vec!["uv.exe"],
             ManagedRuntimeProgram::Pnpm => vec!["pnpm.cmd"],
+            ManagedRuntimeProgram::Command(ref name) => vec![name.as_str()],
         };
         findExecutable(&names).ok_or_else(|| {
             HostError::new(format!(
@@ -154,62 +123,12 @@ impl ManagedRuntimeHost for WindowsManagedRuntimeHost {
     ) -> HostResult<Box<dyn ManagedRuntimeProcess>> {
         let executable = self
             .resolveRuntimeExecutable(request.program.clone(), request.executablePath.as_deref())?;
-        let mut command = Command::new(executable);
-        command.args(request.args);
-        if let Some(cwd) = request.cwd {
-            command.current_dir(cwd);
-        }
-        command.envs(request.env);
+        let mut command = runtimeCommand(executable, request);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let mut child = command.spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HostError::new("managed runtime process has no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HostError::new("managed runtime process has no stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| HostError::new("managed runtime process has no stderr"))?;
-
-        let (stdoutTx, stdoutRx) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::with_capacity(MANAGED_RUNTIME_STDIO_BUFFER_BYTES, stdout)
-                .lines()
-                .flatten()
-            {
-                let _ = stdoutTx.send(line);
-            }
-        });
-
-        let stderrLines = Arc::new(Mutex::new(VecDeque::new()));
-        let stderrLinesForThread = stderrLines.clone();
-        thread::spawn(move || {
-            for line in BufReader::with_capacity(MANAGED_RUNTIME_STDIO_BUFFER_BYTES, stderr)
-                .lines()
-                .flatten()
-            {
-                if let Ok(mut lines) = stderrLinesForThread.lock() {
-                    lines.push_back(line);
-                    while lines.len() > 400 {
-                        lines.pop_front();
-                    }
-                }
-            }
-        });
-
-        Ok(Box::new(NativeManagedRuntimeProcess {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
-            stdoutRx: Mutex::new(stdoutRx),
-            stderrLines,
-        }))
+        NativeManagedRuntimeProcess::start(command.spawn()?)
     }
 
     /// Runs a one-shot managed runtime command and captures output.
@@ -219,92 +138,7 @@ impl ManagedRuntimeHost for WindowsManagedRuntimeHost {
     ) -> HostResult<RuntimeCommandOutput> {
         let executable = self
             .resolveRuntimeExecutable(request.program.clone(), request.executablePath.as_deref())?;
-        let mut command = Command::new(executable);
-        command.args(request.args);
-        if let Some(cwd) = request.cwd {
-            command.current_dir(cwd);
-        }
-        command.envs(request.env);
-        let output = command.output()?;
-        Ok(RuntimeCommandOutput {
-            exitCode: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        })
+        let command = runtimeCommand(executable, request);
+        NativeManagedRuntimeProcess::run(command)
     }
-}
-
-/// Writes one newline-terminated managed runtime frame with a single pipe write.
-#[allow(non_snake_case)]
-fn writeManagedRuntimeLine(stdin: &mut ChildStdin, line: &str) -> HostResult<()> {
-    let lineBytes = line.as_bytes();
-    match lineBytes.len() >= MANAGED_RUNTIME_SINGLE_FRAME_MIN_BYTES {
-        true => writeManagedRuntimeLargeLine(stdin, lineBytes),
-        false => writeManagedRuntimeSmallLine(stdin, lineBytes),
-    }
-}
-
-/// Writes a small managed runtime line without per-message heap allocation.
-#[allow(non_snake_case)]
-fn writeManagedRuntimeSmallLine(stdin: &mut ChildStdin, lineBytes: &[u8]) -> HostResult<()> {
-    stdin.write_all(lineBytes)?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
-    Ok(())
-}
-
-/// Writes a large managed runtime line as one contiguous pipe frame.
-#[allow(non_snake_case)]
-fn writeManagedRuntimeLargeLine(stdin: &mut ChildStdin, lineBytes: &[u8]) -> HostResult<()> {
-    let mut frame = Vec::with_capacity(lineBytes.len() + 1);
-    frame.extend_from_slice(lineBytes);
-    frame.push(b'\n');
-    stdin.write_all(&frame)?;
-    stdin.flush()?;
-    Ok(())
-}
-
-/// Writes many managed runtime lines through one contiguous pipe frame.
-#[allow(non_snake_case)]
-fn writeManagedRuntimeLines(stdin: &mut ChildStdin, lines: &[String]) -> HostResult<()> {
-    let frameBytes = lines.iter().map(|line| line.len() + 1).sum();
-    let mut frame = Vec::with_capacity(frameBytes);
-    for line in lines {
-        frame.extend_from_slice(line.as_bytes());
-        frame.push(b'\n');
-    }
-    stdin.write_all(&frame)?;
-    stdin.flush()?;
-    Ok(())
-}
-
-/// Resolves a directly supplied executable path.
-#[allow(non_snake_case)]
-fn ensureExecutablePath(path: &str) -> HostResult<String> {
-    let candidate = PathBuf::from(path);
-    if candidate.exists() {
-        return Ok(candidate.to_string_lossy().to_string());
-    }
-    findExecutable(&[path]).ok_or_else(|| HostError::new(format!("Executable not found: {path}")))
-}
-
-/// Finds the first executable candidate from PATH.
-#[allow(non_snake_case)]
-fn findExecutable(names: &[&str]) -> Option<String> {
-    let pathValue = env::var_os("PATH")?;
-    for dir in env::split_paths(&pathValue) {
-        for name in names {
-            let candidate = dir.join(name);
-            if isExecutableCandidate(&candidate) {
-                return Some(candidate.to_string_lossy().to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Returns whether a path points to an executable file candidate.
-#[allow(non_snake_case)]
-fn isExecutableCandidate(path: &Path) -> bool {
-    path.is_file()
 }

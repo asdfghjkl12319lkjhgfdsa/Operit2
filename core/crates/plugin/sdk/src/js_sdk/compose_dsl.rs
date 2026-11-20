@@ -1,7 +1,9 @@
 //! Types and host contracts for constructing Compose UI trees in plugin runtime modules.
 use super::compose_dsl_material3_generated::*;
+use super::toolpkg::ToolPkgJsonValue;
 use super::{JsDate, JsFuture, JsOptional};
 use serde::{Deserialize, Serialize};
+use operit_plugin_sdk_macros::js_declaration;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 /// Options for deriving a theme color token with adjusted opacity.
@@ -20,6 +22,9 @@ pub enum ComposeModifierCombinedClickableOptionsOnClickOutput {
     Variant1(()),
     /// The handler continues asynchronously.
     Variant2(JsFuture<()>),
+    /// Optional generic result delivered through the host's existing action boundary.
+    Variant3(ToolPkgJsonValue),
+    Variant4(JsFuture<ToolPkgJsonValue>),
 }
 /// Completion mode returned by the long-click handler.
 pub enum ComposeModifierCombinedClickableOptionsOnLongClickOutput {
@@ -392,6 +397,10 @@ pub enum RowPropsOnClickOutput {
     Variant1(()),
     /// The click handler continues asynchronously.
     Variant2(JsFuture<()>),
+    /// Returns a generic JSON result through the Compose action response.
+    Variant3(ToolPkgJsonValue),
+    /// Resolves a generic JSON result through the Compose action response.
+    Variant4(JsFuture<ToolPkgJsonValue>),
 }
 /// Label content accepted by a text field.
 pub enum TextFieldPropsLabel {
@@ -413,6 +422,10 @@ pub enum ButtonPropsOnClickOutput {
     Variant1(()),
     /// The click handler continues asynchronously.
     Variant2(JsFuture<()>),
+    /// Returns arbitrary JSON through the existing action response.
+    Variant3(ToolPkgJsonValue),
+    /// Resolves arbitrary JSON through the existing action response.
+    Variant4(JsFuture<ToolPkgJsonValue>),
 }
 /// Completion mode returned by an icon-button click handler.
 pub enum IconButtonPropsOnClickOutput {
@@ -420,6 +433,10 @@ pub enum IconButtonPropsOnClickOutput {
     Variant1(()),
     /// The click handler continues asynchronously.
     Variant2(JsFuture<()>),
+    /// Returns a generic JSON result through the Compose action response.
+    Variant3(ToolPkgJsonValue),
+    /// Resolves a generic JSON result through the Compose action response.
+    Variant4(JsFuture<ToolPkgJsonValue>),
 }
 /// Completion mode returned by a clickable surface.
 pub enum SurfacePropsOnClickOutput {
@@ -688,6 +705,15 @@ pub enum ComposeArrangement {
 /// Cross-axis placement for children inside a layout container.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum ComposeAlignment {
+    /// Aligns to the top-left corner of a two-dimensional box.
+    #[serde(rename = "topStart")]
+    TopStart,
+    /// Centers horizontally along the top edge of a box.
+    #[serde(rename = "topCenter")]
+    TopCenter,
+    /// Aligns to the top-right corner of a box.
+    #[serde(rename = "topEnd")]
+    TopEnd,
     /// Aligns children with the cross-axis start edge.
     #[serde(rename = "start")]
     Start,
@@ -697,6 +723,15 @@ pub enum ComposeAlignment {
     /// Aligns children with the cross-axis end edge.
     #[serde(rename = "end")]
     End,
+    /// Aligns to the bottom-left corner of a box.
+    #[serde(rename = "bottomStart")]
+    BottomStart,
+    /// Centers horizontally along the bottom edge of a box.
+    #[serde(rename = "bottomCenter")]
+    BottomCenter,
+    /// Aligns to the bottom-right corner of a box.
+    #[serde(rename = "bottomEnd")]
+    BottomEnd,
 }
 /// Geometry used to clip or outline a Compose component.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -750,10 +785,29 @@ pub struct ComposeBorder {
 }
 /// Insets applied symmetrically on the horizontal and vertical axes.
 pub struct ComposePadding {
+    /// Overrides the top inset independently of symmetric padding.
+    pub top: Option<f64>,
+    /// Overrides the bottom inset independently of symmetric padding.
+    pub bottom: Option<f64>,
+    /// Overrides the leading inset independently of symmetric padding.
+    pub start: Option<f64>,
+    /// Overrides the trailing inset independently of symmetric padding.
+    pub end: Option<f64>,
     /// Inset applied to the start and end edges.
     pub horizontal: Option<f64>,
     /// Inset applied to the top and bottom edges.
     pub vertical: Option<f64>,
+}
+/// Independently styled edges of a rectangular border.
+pub struct ComposeBorderSides {
+    /// Leading vertical edge.
+    pub start: Option<ComposeBorder>,
+    /// Trailing vertical edge.
+    pub end: Option<ComposeBorder>,
+    /// Upper horizontal edge.
+    pub top: Option<ComposeBorder>,
+    /// Lower horizontal edge.
+    pub bottom: Option<ComposeBorder>,
 }
 /// Coordinate unit accepted by canvas drawing commands.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -849,6 +903,8 @@ pub struct ComposeColorToken {
     pub __colorToken: String,
     /// Opacity multiplier applied when resolving the token.
     pub alpha: Option<f64>,
+    /// Optional background used for native alpha compositing.
+    pub over: Option<Box<ComposeColor>>,
 }
 /// Operations available on a theme color token.
 pub trait ComposeColorTokenMethods: Send + Sync {
@@ -861,6 +917,17 @@ pub enum ComposeColor {
     Variant1(String),
     /// Resolves a semantic color from the active Material theme.
     Variant2(ComposeColorToken),
+    /// Retains floating-point opacity for a concrete color without quantizing it to ARGB8.
+    Variant3(ComposeColorValue),
+}
+/// A concrete color with native floating-point opacity.
+pub struct ComposeColorValue {
+    /// CSS-style hexadecimal color.
+    pub value: String,
+    /// Optional opacity replacing the color's original alpha channel.
+    pub alpha: Option<f64>,
+    /// Optional background used for native alpha compositing.
+    pub over: Option<Box<ComposeColor>>,
 }
 /// Named semantic colors available from the active Material theme.
 pub struct ComposeColorScheme {
@@ -2108,6 +2175,10 @@ pub trait ComposeModifierProxyApi: Send + Sync {
         value: ComposeCanvasBrush,
         shape: Option<ComposeShape>,
     ) -> ComposeModifierProxy;
+    /// Paints independent rectangular edges without changing child constraints.
+    fn borderSides(&self, sides: ComposeBorderSides) -> ComposeModifierProxy;
+    /// Selects a cross-platform native mouse cursor for this node's bounds.
+    fn cursor(&self, name: String) -> ComposeModifierProxy;
     /// Clips the node and descendant drawing to the supplied shape.
     fn clip(&self, shape: ComposeShape) -> ComposeModifierProxy;
     /// Clips descendant drawing to the node's rectangular layout bounds.
@@ -2180,6 +2251,8 @@ pub trait ComposeModifierProxyApi: Send + Sync {
 }
 /// Typography and color overrides applied to editable text.
 pub struct ComposeTextFieldStyle {
+    /// Applies only explicit overrides without importing Material role metrics.
+    pub inheritStyle: Option<bool>,
     /// Font size used for the entered value.
     pub fontSize: Option<f64>,
     /// Font weight name or numeric weight used for the entered value.
@@ -2195,6 +2268,8 @@ pub struct ComposeCommonProps {
     pub key: Option<String>,
     /// Runs after the host has created and loaded the node.
     pub onLoad: Option<Arc<dyn Fn() -> ComposeCommonPropsOnLoadOutput + Send + Sync>>,
+    /// Runs after host inputs update in the same live execution context.
+    pub onInputsChanged: Option<Arc<dyn Fn() -> ComposeCommonPropsOnLoadOutput + Send + Sync>>,
     /// Content presented as the host screen's top-bar title.
     pub topBarTitle: Option<ComposeChildren>,
     /// Ordered modifier operations applied to layout, drawing, and input.
@@ -2283,8 +2358,50 @@ pub struct FlowRowProps {
     /// Gap inserted between completed horizontal lines.
     pub runSpacing: Option<f64>,
 }
+/// Easing curve for implicit visual transitions.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum ComposeAnimationCurve {
+    /// Interpolates at constant speed.
+    #[serde(rename = "linear")]
+    Linear,
+    /// Decelerates with a cubic curve.
+    #[serde(rename = "easeOutCubic")]
+    EaseOutCubic,
+    /// Accelerates and then decelerates.
+    #[serde(rename = "easeInOut")]
+    EaseInOut,
+    /// Decelerates toward the target.
+    #[serde(rename = "easeOut")]
+    EaseOut,
+}
+/// Generic implicit transition options; animation frames are rendered by the host.
+pub struct ComposeBoxAnimation {
+    /// Animates intrinsic child size changes, including inserting or removing content.
+    pub animateContentSize: Option<bool>,
+    /// Transition duration in milliseconds; zero applies changes immediately.
+    pub durationMillis: Option<u32>,
+    /// Easing curve, defaulting to linear.
+    pub curve: Option<ComposeAnimationCurve>,
+    /// Anchor kept fixed when intrinsic child size changes.
+    pub alignment: Option<ComposeAlignment>,
+}
+/// Visual overrides while the enclosing HoverRegion is hovered or its menu is open.
+pub struct ComposeBoxHoverStyle {
+    /// Overrides the requested width.
+    pub width: Option<f64>,
+    /// Overrides the requested height.
+    pub height: Option<f64>,
+    /// Overrides the solid background paint.
+    pub backgroundColor: Option<ComposeColor>,
+    /// Overrides background corner geometry.
+    pub backgroundShape: Option<ComposeShape>,
+}
 /// Properties for stacking child nodes in the same layout bounds.
 pub struct BoxProps {
+    /// Optional host-rendered transitions for size, background paint and corner geometry.
+    pub animation: Option<ComposeBoxAnimation>,
+    /// Partial visual overrides from the enclosing HoverRegion, independent of touch visibility.
+    pub hoverStyle: Option<ComposeBoxHoverStyle>,
     /// Shared node layout, drawing, identity, and lifecycle properties.
     pub base_compose_common_props: ComposeCommonProps,
     /// Child nodes drawn in stacking order.
@@ -2307,6 +2424,8 @@ pub struct TextProps {
     pub text: String,
     /// Material typography role supplying default metrics.
     pub style: Option<ComposeTextStyle>,
+    /// Inherits ambient native text metrics instead of a Material typography role.
+    pub inheritStyle: Option<bool>,
     /// Foreground color of rendered glyphs.
     pub color: Option<ComposeColor>,
     /// Font weight override applied after the typography role.
@@ -2315,14 +2434,189 @@ pub struct TextProps {
     pub fontSize: Option<f64>,
     /// Font family override used to resolve glyphs.
     pub fontFamily: Option<String>,
+    /// Ordered font families used when the primary family has no glyph.
+    pub fontFamilyFallback: Option<Vec<String>>,
+    /// Multiplier for native line metrics.
+    pub lineHeight: Option<f64>,
+    /// Extra logical pixels between adjacent glyphs.
+    pub letterSpacing: Option<f64>,
     /// Maximum number of lines before overflow handling.
     pub maxLines: Option<f64>,
     /// Whether text may wrap at soft line-break opportunities.
     pub softWrap: Option<bool>,
     /// Rendering behavior for text beyond the available lines or bounds.
     pub overflow: Option<ComposeTextOverflow>,
+    /// Horizontal alignment within the available text width.
+    pub textAlign: Option<String>,
     /// Share of remaining main-axis space when placed in a row or column.
     pub weight: Option<f64>,
+}
+/// One native inline text run, retaining typography and color within one layout.
+pub struct ComposeTextRun {
+    /// Literal content of this run.
+    pub text: String,
+    /// Foreground paint for this run.
+    pub color: Option<ComposeColor>,
+    /// Background paint for changed inline ranges.
+    pub textBackgroundColor: Option<ComposeColor>,
+    /// Material typography role supplying default metrics.
+    pub style: Option<ComposeTextStyle>,
+    /// Font size in logical pixels.
+    pub fontSize: Option<f64>,
+    /// Font weight understood by the native typography adapter.
+    pub fontWeight: Option<String>,
+    /// Font family override.
+    pub fontFamily: Option<String>,
+    /// Multiplier for native line metrics.
+    pub lineHeight: Option<f64>,
+    /// Extra logical pixels between adjacent glyphs.
+    pub letterSpacing: Option<f64>,
+}
+/// Styled inline runs sharing native wrapping, overflow and baseline layout.
+pub struct RichTextProps {
+    /// Shared node layout, identity and lifecycle.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Ordered text spans rendered in one native paragraph.
+    pub spans: Vec<ComposeTextRun>,
+    /// Maximum paragraph line count.
+    pub maxLines: Option<u32>,
+    /// Whether the paragraph wraps at soft break opportunities.
+    pub softWrap: Option<bool>,
+    /// Overflow behavior at the paragraph bounds.
+    pub overflow: Option<ComposeTextOverflow>,
+}
+/// A styled interval in an otherwise unchanged source-code line.
+pub struct ComposeCodeEmphasis {
+    /// Inclusive UTF-16 start offset.
+    pub start: usize,
+    /// Exclusive UTF-16 end offset.
+    pub end: usize,
+    /// Background paint for the interval.
+    pub color: ComposeColor,
+    /// Font weight override for the interval.
+    pub fontWeight: Option<String>,
+}
+/// Native syntax typography for any plugin-owned source line, without domain parsing.
+pub struct CodeTextProps {
+    /// Shared text geometry and typography.
+    pub base_text_props: TextProps,
+    /// Filename used solely to select a syntax grammar.
+    pub filePath: String,
+    /// Plugin-supplied styled intervals, independent of the syntax grammar.
+    pub emphasis: Option<Vec<ComposeCodeEmphasis>>,
+}
+/// Native tooltip around arbitrary plugin-owned content.
+pub struct TooltipProps {
+    /// Shared node layout, identity and lifecycle.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Tooltip text shown on hover or long press.
+    pub message: String,
+    /// Delay before showing the tooltip, in milliseconds.
+    pub waitMillis: Option<u32>,
+    /// Child content.
+    pub content: Option<ComposeChildren>,
+}
+/// A native scroll viewport with an independently owned scrollbar controller.
+pub struct ScrollAreaProps {
+    /// Keeps the native scrollbar track visible with an explicitly visible thumb.
+    pub trackVisibility: Option<bool>,
+    /// Shared node layout, identity and lifecycle.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Scroll direction: vertical or horizontal.
+    pub axis: Option<String>,
+    /// Keeps the scrollbar thumb visible while content can scroll.
+    pub thumbVisibility: Option<bool>,
+    /// Child content.
+    pub content: Option<ComposeChildren>,
+}
+
+/// Intrinsic source extent and gutter space in one custom editor column.
+pub struct ComposeCodeEditorColumn {
+    pub text: String,
+    /// Proportion of available body width, between zero and one.
+    pub fraction: Option<f64>,
+    /// Reserved horizontal space for gutter, padding and column separators.
+    pub horizontalPadding: Option<f64>,
+}
+
+/// The shared native code editor in read-only or custom-body presentation mode.
+pub struct CodeEditorProps {
+    /// Shared layout properties.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Source document. Omit when supplying a custom body.
+    pub text: Option<String>,
+    /// Material typography role and optional source font overrides.
+    pub style: Option<ComposeTextStyle>,
+    pub fontSize: Option<f64>,
+    pub fontFamily: Option<String>,
+    pub fontWeight: Option<String>,
+    pub color: Option<ComposeColor>,
+    pub lineHeight: Option<f64>,
+    /// Filename used to choose the editor's syntax grammar.
+    pub filePath: Option<String>,
+    /// Optional unscaled document width for custom source rows.
+    pub contentWidth: Option<f64>,
+    /// Source columns measured by the native editor for unwrapped custom bodies.
+    pub contentColumns: Option<Vec<ComposeCodeEditorColumn>>,
+    /// Reflows text to the viewport as it zooms. Defaults to true.
+    pub wrapToViewport: Option<bool>,
+    /// Shows the editor's logical line-number gutter for ordinary source text.
+    pub showLineNumbers: Option<bool>,
+    /// Enables diagonal panning; defaults to true for read-only code views.
+    pub panEnabled: Option<bool>,
+    /// Controlled zoom factor and allowed zoom interval.
+    pub scale: Option<f64>,
+    pub minScale: Option<f64>,
+    pub maxScale: Option<f64>,
+    /// Optional decorated body containing one vertical scrollable. Omit for text.
+    pub content: Option<ComposeChildren>,
+}
+
+/// A native popup whose anchor and menu items are supplied by the plugin.
+pub struct MenuAnchorProps {
+    /// Shared node layout, identity and lifecycle.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Composed anchor content, independent of the menu entries.
+    pub anchor: ComposeChildren,
+    /// Composed entries selected by their zero-based index.
+    pub content: Option<ComposeChildren>,
+    /// Tooltip for the menu anchor.
+    pub tooltip: Option<String>,
+    /// Native menu item height.
+    pub itemHeight: Option<f64>,
+    /// Per-entry interaction and separator metadata, indexed like content.
+    pub items: Option<Vec<ComposeMenuItem>>,
+    /// Receives the selected item index.
+    pub onSelect: Arc<dyn Fn(usize) + Send + Sync>,
+}
+/// Native popup entry behavior independent of its plugin-owned presentation.
+pub struct ComposeMenuItem {
+    /// Whether this entry accepts selection.
+    pub enabled: Option<bool>,
+    /// Renders a native separator instead of the entry content.
+    pub divider: Option<bool>,
+    /// Optional native height overriding the menu default.
+    pub height: Option<f64>,
+}
+/// A native Material ink response with plugin-owned content and action.
+pub struct InkWellProps {
+    /// Shared node layout, identity and lifecycle.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Rounded boundary for hover, focus and ink paint.
+    pub shape: Option<ComposeShape>,
+    /// Completed tap action.
+    pub onClick: Option<Arc<dyn Fn() -> ButtonPropsOnClickOutput + Send + Sync>>,
+    /// Child content.
+    pub content: Option<ComposeChildren>,
+}
+/// Plugin-owned inline SVG rendered through the shared native vector adapter.
+pub struct SvgProps {
+    /// Shared node layout, identity and lifecycle.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// SVG document source.
+    pub source: String,
+    /// Optional monochrome tint.
+    pub tint: Option<ComposeColor>,
 }
 /// Properties for parsing and rendering Markdown content.
 pub struct MarkdownProps {
@@ -2339,8 +2633,62 @@ pub struct MarkdownProps {
     /// Tag used to associate incremental Markdown updates with one stream.
     pub streamTagName: Option<String>,
 }
+/// Optional native input decoration overrides; omitted fields inherit the host theme.
+pub struct ComposeTextFieldDecoration {
+    /// Suppresses all native input border geometry and painting.
+    pub borderless: Option<bool>,
+    /// Uses compact vertical layout for the input decoration.
+    pub isDense: Option<bool>,
+    /// Paints the input container with its fill color.
+    pub filled: Option<bool>,
+    /// Background paint inside the input border.
+    pub fillColor: Option<ComposeColor>,
+    /// Rounded outline radius; the resting outline is hidden unless borderColor is supplied.
+    pub cornerRadius: Option<f64>,
+    /// Resting outline color.
+    pub borderColor: Option<ComposeColor>,
+    /// Outline color while the field has focus.
+    pub focusedBorderColor: Option<ComposeColor>,
+    /// Insets around editable input content.
+    pub contentPadding: Option<ComposePadding>,
+    /// Typography and color overrides for the placeholder.
+    pub hintStyle: Option<ComposeTextFieldStyle>,
+}
+/// State, decoration, validation, and typography for an editable text field.
+/// Standard themed input frame for arbitrary plugin-owned content.
+/// Controlled horizontally swipeable pages.
+pub struct HorizontalPagerProps {
+    /// Shared layout and lifecycle properties.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Selected zero-based page.
+    pub currentPage: i32,
+    /// Receives a user-selected page.
+    pub onPageChanged: Arc<dyn Fn(i32) + Send + Sync>,
+    /// Page content.
+    pub content: Option<ComposeChildren>,
+}
+/// Standard themed input frame for arbitrary plugin-owned content.
+pub struct InputDecoratorProps {
+    /// Shared layout and lifecycle properties.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Floating field label.
+    pub label: String,
+    /// Whether the field frame is enabled.
+    pub enabled: Option<bool>,
+    /// Arbitrary composed field content.
+    pub content: Option<ComposeChildren>,
+}
 /// State, decoration, validation, and typography for an editable text field.
 pub struct TextFieldProps {
+    /// Explicit cursor geometry in logical pixels.
+    pub cursorWidth: Option<f64>,
+    pub cursorHeight: Option<f64>,
+    /// Optional native input decoration overrides.
+    pub decoration: Option<ComposeTextFieldDecoration>,
+    /// Optional width constraint for suffix icon content.
+    pub suffixIconWidth: Option<f64>,
+    /// Optional height constraint for suffix icon content.
+    pub suffixIconHeight: Option<f64>,
     /// Shared node layout, drawing, identity, and lifecycle properties.
     pub base_compose_common_props: ComposeCommonProps,
     /// Plain or composed label displayed with the field.
@@ -2361,6 +2709,10 @@ pub struct TextFieldProps {
     pub value: String,
     /// Receives each user-proposed value for controlled-state updates.
     pub onValueChange: Arc<dyn Fn(String) -> () + Send + Sync>,
+    /// Receives the current text when Enter or the keyboard action submits the field.
+    pub onSubmitted: Option<Arc<dyn Fn(String) -> ComposeInteractionOutput + Send + Sync>>,
+    /// Native keyboard action, such as search, done, send or next.
+    pub imeAction: Option<String>,
     /// Restricts input and layout to one visual line.
     pub singleLine: Option<bool>,
     /// Minimum visible line count reserved by the field.
@@ -2375,6 +2727,90 @@ pub struct TextFieldProps {
     pub isPassword: Option<bool>,
     /// Typography and foreground overrides for the entered value.
     pub style: Option<ComposeTextFieldStyle>,
+}
+/// Completion of a generic interaction callback, including asynchronous plugin work.
+pub enum ComposeInteractionOutput {
+    Variant1(()),
+    Variant2(JsFuture<()>),
+}
+/// Final coordinates and acceptance status of an arbitrary drag payload.
+pub struct ComposeDragEndEvent {
+    pub data: ToolPkgJsonValue,
+    pub dragType: String,
+    pub wasAccepted: bool,
+    pub x: f64,
+    pub y: f64,
+    pub velocityX: f64,
+    pub velocityY: f64,
+}
+/// Native dragging of arbitrary JSON data; content and feedback remain composable.
+pub struct DraggableProps {
+    pub base_compose_common_props: ComposeCommonProps,
+    pub data: ToolPkgJsonValue,
+    pub dragType: Option<String>,
+    pub enabled: Option<bool>,
+    pub axis: Option<String>,
+    pub longPress: Option<bool>,
+    pub delayMillis: Option<f64>,
+    pub maxSimultaneousDrags: Option<f64>,
+    pub feedback: Option<ComposeChildren>,
+    pub childWhenDragging: Option<ComposeChildren>,
+    pub content: Option<ComposeChildren>,
+    pub onDragStarted: Option<Arc<dyn Fn(ToolPkgJsonValue) -> ComposeInteractionOutput + Send + Sync>>,
+    pub onDragEnd: Option<Arc<dyn Fn(ComposeDragEndEvent) -> ComposeInteractionOutput + Send + Sync>>,
+}
+/// Native drop acceptance with optional declarative type/data filters, not business rules.
+pub struct DragTargetProps {
+    pub base_compose_common_props: ComposeCommonProps,
+    pub enabled: Option<bool>,
+    pub acceptedTypes: Option<Vec<String>>,
+    pub acceptedData: Option<Vec<ToolPkgJsonValue>>,
+    /// Rejects matching payloads independently of the accepted type and data filters.
+    pub excludedData: Option<Vec<ToolPkgJsonValue>>,
+    pub hoverBackground: Option<ComposeColor>,
+    pub hoverBorderColor: Option<ComposeColor>,
+    pub shape: Option<ComposeShape>,
+    pub content: Option<ComposeChildren>,
+    pub onDrop: Option<Arc<dyn Fn(ToolPkgJsonValue) -> ComposeInteractionOutput + Send + Sync>>,
+    pub onLeave: Option<Arc<dyn Fn(ToolPkgJsonValue) -> ComposeInteractionOutput + Send + Sync>>,
+}
+/// Bounded horizontal swipe actions with arbitrary background slots and callbacks.
+pub struct SwipeActionsProps {
+    pub base_compose_common_props: ComposeCommonProps,
+    pub enabled: Option<bool>,
+    pub actionThreshold: Option<f64>,
+    pub startBackground: Option<ComposeChildren>,
+    pub endBackground: Option<ComposeChildren>,
+    pub content: Option<ComposeChildren>,
+    pub onStartAction: Option<Arc<dyn Fn() -> ComposeInteractionOutput + Send + Sync>>,
+    pub onEndAction: Option<Arc<dyn Fn() -> ComposeInteractionOutput + Send + Sync>>,
+}
+/// Application Material 3 morphing polygon indicator, independent of business state.
+pub struct LoadingIndicatorProps {
+    pub base_compose_common_props: ComposeCommonProps,
+    pub size: Option<f64>,
+    pub color: Option<ComposeColor>,
+}
+/// Controlled Material slider with explicit bounds and independent drag completion.
+pub struct SliderProps {
+    /// Shared layout and identity properties.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Current value within the declared bounds.
+    pub value: f64,
+    /// Inclusive lower bound.
+    pub min: f64,
+    /// Inclusive upper bound.
+    pub max: f64,
+    /// Optional number of evenly spaced intervals.
+    pub divisions: Option<i32>,
+    /// Value label shown during interaction.
+    pub label: Option<String>,
+    /// Whether the slider accepts interaction.
+    pub enabled: Option<bool>,
+    /// Receives each local value change.
+    pub onValueChange: Arc<dyn Fn(f64) -> () + Send + Sync>,
+    /// Receives the final drag value for durable settings writes.
+    pub onValueChangeFinished: Option<Arc<dyn Fn(f64) -> () + Send + Sync>>,
 }
 /// Controlled state and colors for a binary sliding switch.
 pub struct SwitchProps {
@@ -2410,6 +2846,8 @@ pub struct CheckboxProps {
 }
 /// Content, shape, state, and action for a standard Material button.
 pub struct ButtonProps {
+    /// Removes native minimum size and uses a compact tap target and density.
+    pub compact: Option<bool>,
     /// Shared node layout, drawing, identity, and lifecycle properties.
     pub base_compose_common_props: ComposeCommonProps,
     /// Arbitrary composed content rendered inside the button.
@@ -2426,6 +2864,10 @@ pub struct ButtonProps {
     pub shape: Option<ComposeShape>,
     /// Foreground color used by the shared Material button renderer.
     pub contentColor: Option<ComposeColor>,
+    /// Background color used by the Material button renderer.
+    pub containerColor: Option<ComposeColor>,
+    /// Optional outline drawn around the button shape.
+    pub border: Option<ComposeBorder>,
 }
 /// Host popup menu with a labeled anchor and indexed selection callback.
 pub struct DropdownMenuProps {
@@ -2449,6 +2891,10 @@ pub struct FloatingActionButtonProps {
 }
 /// Icon or custom content rendered as a compact clickable control.
 pub struct IconButtonProps {
+    /// Label shown on long press or pointer hover.
+    pub tooltip: Option<String>,
+    /// Internal inset around the icon.
+    pub contentPadding: Option<ComposePadding>,
     /// Shared node layout, drawing, identity, and lifecycle properties.
     pub base_compose_common_props: ComposeCommonProps,
     /// Arbitrary content rendered inside the icon-button bounds.
@@ -2462,12 +2908,29 @@ pub struct IconButtonProps {
     /// Outline used for interaction feedback and clipping.
     pub shape: Option<ComposeShape>,
 }
+/// Global surface layer whose material treatment follows the host theme settings.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum ComposeThemeSurfaceLayer {
+    /// Broad background panels.
+    #[serde(rename = "panel")]
+    Panel,
+    /// Cards above the page background.
+    #[serde(rename = "card")]
+    Card,
+    /// Controls and rows nested inside a card.
+    #[serde(rename = "control")]
+    Control,
+}
 /// Elevated or outlined Material container for grouped content.
 pub struct CardProps {
+    /// Wraps themed content in Material; true retains the normal card behavior.
+    pub material: Option<bool>,
     /// Shared node layout, drawing, identity, and lifecycle properties.
     pub base_compose_common_props: ComposeCommonProps,
     /// Child nodes rendered inside the card container.
     pub content: Option<ComposeChildren>,
+    /// Uses global transparency and blur for this layer; requires containerColor and has no elevation.
+    pub themeSurface: Option<ComposeThemeSurfaceLayer>,
     /// Background color of the card surface.
     pub containerColor: Option<ComposeColor>,
     /// Opacity multiplier applied to the card background.
@@ -2502,6 +2965,10 @@ pub struct SurfaceProps {
 }
 /// Properties for rendering and optionally animating a Material icon.
 pub struct IconProps {
+    /// Animated absolute rotation in turns.
+    pub turns: Option<f64>,
+    /// Duration of an absolute rotation transition in milliseconds.
+    pub durationMillis: Option<u32>,
     /// Shared node layout, drawing, identity, and lifecycle properties.
     pub base_compose_common_props: ComposeCommonProps,
     /// Material icon name resolved by the host icon registry.
@@ -2515,8 +2982,56 @@ pub struct IconProps {
     /// Duration in milliseconds of one full rotation.
     pub spinDurationMs: Option<f64>,
 }
+/// Fixed-extent item generation owned by one keyed list in a bounded viewport.
+pub struct ComposeLazyItemOptions {
+    /// Uses natural row heights; itemExtent then estimates only unloaded placeholders.
+    pub variableExtent: Option<bool>,
+    /// Stable list identity within the owning page.
+    pub key: String,
+    /// Total number of items, including items outside the current window.
+    pub itemCount: u32,
+    /// Unscaled main-axis item extent, including its separator; Flutter applies the current text scale.
+    pub itemExtent: f64,
+    /// Number of items materialized before Flutter reports its viewport.
+    pub initialItemCount: u32,
+}
+/// Visible item interval with an exclusive last index.
+pub struct ComposeLazyRange {
+    /// First materialized item index.
+    pub firstIndex: u32,
+    /// Exclusive end of the materialized interval.
+    pub lastIndex: u32,
+}
+/// Total extent and range action delivered through the existing node protocol.
+pub struct ComposeLazyViewport {
+    /// Uses natural item measurement instead of constraining every row to itemExtent.
+    pub variableExtent: Option<bool>,
+    /// Invalidates measured placeholder sizes when plugin content changes.
+    pub contentRevision: Option<u64>,
+    /// Absolute index of the first delivered child.
+    pub firstIndex: u32,
+    /// Total item count independent of the delivered child count.
+    pub itemCount: u32,
+    /// Unscaled main-axis item extent; Flutter applies the current text scale.
+    pub itemExtent: f64,
+    /// Number of eager items before the windowed items in a sliver host.
+    pub staticItemCount: Option<u32>,
+    /// Requests the next materialized range through normal action dispatch.
+    pub onRangeChanged: Arc<dyn Fn(ComposeLazyRange) -> () + Send + Sync>,
+}
+/// Windowed content accepted by the existing lazy column and row factories.
+pub struct ComposeLazyItems {
+    /// Materialized nodes with stable item identities.
+    pub content: Vec<ComposeNode>,
+    /// Viewport metadata for the owning Flutter list.
+    pub viewport: ComposeLazyViewport,
+}
 /// Vertically scrolling list whose child content is hosted by a lazy column.
 pub struct LazyColumnProps {
+    /// Insets that scroll together with list items rather than shrinking the viewport.
+    pub contentPadding: Option<ComposePadding>,
+    /// Optional viewport protocol supplied by lazyItems for generated content.
+    pub viewport: Option<ComposeLazyViewport>,
     /// Shared node layout, drawing, identity, and lifecycle properties.
     pub base_compose_common_props: ComposeCommonProps,
     /// List content rendered in vertical order.
@@ -2549,6 +3064,10 @@ pub struct SnackbarHostProps {
 pub struct AiChatProps {
     /// Shared node layout, drawing, identity, and lifecycle properties.
     pub base_compose_common_props: ComposeCommonProps,
+    /// Identifies the conversation shown in a local embedded chat runtime without changing the main selection.
+    pub chatId: Option<String>,
+    /// Controls the native composer; false leaves sending and cancellation to the surrounding workflow.
+    pub showInput: Option<bool>,
 }
 /// Properties for a responsive trailing panel controlled by the Compose screen.
 pub struct AdaptiveSidePanelProps {
@@ -2753,6 +3272,10 @@ pub enum ComposeDialogActionOutput {
     Variant1(()),
     /// Completes asynchronously.
     Variant2(JsFuture<()>),
+    /// Returns a generic JSON result through the Compose action response.
+    Variant3(ToolPkgJsonValue),
+    /// Resolves a generic JSON result through the Compose action response.
+    Variant4(JsFuture<ToolPkgJsonValue>),
 }
 /// Dialog text supplied as a literal or a node slot.
 pub enum ComposeDialogText {
@@ -2763,6 +3286,8 @@ pub enum ComposeDialogText {
 }
 /// Modal dismissal and window layout policies.
 pub struct DialogProperties {
+    /// Expands a custom Dialog to the window without platform dialog margins.
+    pub fullscreen: Option<bool>,
     /// Allows dismissal requests from the back button.
     pub dismissOnBackPress: Option<bool>,
     /// Allows dismissal requests from the modal barrier.
@@ -2844,6 +3369,22 @@ pub struct AlertDialogProps {
 }
 /// Core component factories available through `ComposeDslContext::UI`.
 pub struct ComposeUiFactoryRegistry {
+    /// Creates one native paragraph with individually styled spans.
+    pub RichText: ComposeNodeFactory<RichTextProps>,
+    /// Renders source text using the shared native syntax palette and font metrics.
+    pub CodeText: ComposeNodeFactory<CodeTextProps>,
+    /// Wraps content in a native tooltip.
+    pub Tooltip: ComposeNodeFactory<TooltipProps>,
+    /// Creates one independently controlled native scroll viewport.
+    pub ScrollArea: ComposeNodeFactory<ScrollAreaProps>,
+    /// Presents source text or custom diff rows through the shared native editor.
+    pub CodeEditor: ComposeNodeFactory<CodeEditorProps>,
+    /// Opens a native popup with plugin-composed anchor and entries.
+    pub MenuAnchor: ComposeNodeFactory<MenuAnchorProps>,
+    /// Adds a native Material ink response without imposing button geometry.
+    pub InkWell: ComposeNodeFactory<InkWellProps>,
+    /// Renders an inline SVG resource without a WebView.
+    pub Svg: ComposeNodeFactory<SvgProps>,
     /// Creates a text-only Material button.
     pub TextButton: ComposeNodeFactory<ButtonProps>,
     /// Creates a filled tonal Material button.
@@ -2866,16 +3407,30 @@ pub struct ComposeUiFactoryRegistry {
     pub FlowRow: ComposeNodeFactory<FlowRowProps>,
     /// Creates a stacking layout container.
     pub Box: ComposeNodeFactory<BoxProps>,
+    /// Drags arbitrary serializable data using native gesture arbitration.
+    pub Draggable: ComposeNodeFactory<DraggableProps>,
+    /// Accepts arbitrary drag payloads without host business-model knowledge.
+    pub DragTarget: ComposeNodeFactory<DragTargetProps>,
+    /// Composes independent start/end swipe callbacks and background content.
+    pub SwipeActions: ComposeNodeFactory<SwipeActionsProps>,
     /// Creates an empty element that reserves layout space.
     pub Spacer: ComposeNodeFactory<SpacerProps>,
     /// Creates a plain text element.
     pub Text: ComposeNodeFactory<TextProps>,
+    /// Native selectable literal text with the same typography properties as Text.
+    pub SelectableText: ComposeNodeFactory<TextProps>,
     /// Creates a Markdown-rendering element.
     pub Markdown: ComposeNodeFactory<MarkdownProps>,
     /// Creates a controlled editable text field.
     pub TextField: ComposeNodeFactory<TextFieldProps>,
+    /// Creates a themed field frame around arbitrary content.
+    pub InputDecorator: ComposeNodeFactory<InputDecoratorProps>,
+    /// Creates controlled horizontally swipeable pages.
+    pub HorizontalPager: ComposeNodeFactory<HorizontalPagerProps>,
     /// Creates a controlled binary switch.
     pub Switch: ComposeNodeFactory<SwitchProps>,
+    /// Factory used to construct a bounded native Material slider.
+    pub Slider: ComposeNodeFactory<SliderProps>,
     /// Creates a controlled checkbox.
     pub Checkbox: ComposeNodeFactory<CheckboxProps>,
     /// Creates a standard Material button.
@@ -2894,6 +3449,7 @@ pub struct ComposeUiFactoryRegistry {
     pub LinearProgressIndicator: ComposeNodeFactory<LinearProgressIndicatorProps>,
     /// Creates a circular progress indicator.
     pub CircularProgressIndicator: ComposeNodeFactory<CircularProgressIndicatorProps>,
+    pub LoadingIndicator: ComposeNodeFactory<LoadingIndicatorProps>,
     /// Creates the presentation slot for queued snackbars.
     pub SnackbarHost: ComposeNodeFactory<SnackbarHostProps>,
     /// Embeds the host AI chat content without the workspace panel.
@@ -2969,12 +3525,14 @@ pub struct ComposeFilePickerOptions {
     pub allowMultiple: Option<bool>,
     /// MIME types accepted by the document selector.
     pub mimeTypes: Option<Vec<String>>,
+    /// Includes base64 file contents when set; the host rejects files larger than this positive byte limit before reading.
+    pub maxContentBytes: Option<u64>,
 }
 /// File metadata returned by the host picker.
 pub struct ComposePickedFile {
-    /// URI representing the selected document or media item.
+    /// URI reference to the selected resource in the VFS; equal to path.
     pub uri: String,
-    /// Platform file path or browser object URL for the selected item.
+    /// Canonical VFS path accepted by file tools; selected files remain available until runtime cleanup.
     pub path: String,
     /// Display name reported by the content provider.
     pub name: Option<String>,
@@ -2982,6 +3540,8 @@ pub struct ComposePickedFile {
     pub mimeType: Option<String>,
     /// File size in bytes.
     pub size: f64,
+    /// Selected file contents when maxContentBytes was requested; no source path access is required.
+    pub contentBase64: Option<String>,
 }
 /// Outcome of a host file-picker request.
 pub struct ComposeFilePickerResult {
@@ -2989,6 +3549,26 @@ pub struct ComposeFilePickerResult {
     pub cancelled: bool,
     /// Files selected by the user; empty when the request was cancelled.
     pub files: Vec<ComposePickedFile>,
+}
+/// Text or binary content and metadata passed to the host file-save selector.
+pub struct ComposeFileSaveOptions {
+    /// File name suggested in the save dialog, without directory components.
+    pub suggestedName: String,
+    /// Exact UTF-8 text. Supply exactly one of content or contentBase64.
+    pub content: Option<String>,
+    /// Base64-encoded binary bytes, decoded before opening the save selector.
+    pub contentBase64: Option<String>,
+    /// Media type of the exported file.
+    pub mimeType: String,
+    /// File extensions accepted by the save dialog, without leading dots.
+    pub extensions: Vec<String>,
+}
+/// Outcome returned after the file is saved or the user cancels.
+pub struct ComposeFileSaveResult {
+    /// Whether the user dismissed the selector without saving.
+    pub cancelled: bool,
+    /// Destination reported by the host; null on cancellation.
+    pub path: JsOptional<String>,
 }
 /// Discoverable navigation target exposed to a Compose DSL screen.
 pub struct ComposeRouteInfo {
@@ -3042,6 +3622,12 @@ pub struct ComposeDslContext {
 }
 /// Stateful rendering and host-service operations available to Compose screens.
 pub trait ComposeDslContextMethods: Send + Sync {
+    /// Builds the requested range using stable item keys and a fixed main-axis extent.
+    fn lazyItems(
+        &self,
+        options: ComposeLazyItemOptions,
+        itemBuilder: Arc<dyn Fn(u32) -> ComposeNode + Send + Sync>,
+    ) -> ComposeLazyItems;
     /// Retains a keyed value across renders and returns a setter that schedules updates.
     fn useState<T>(&self, key: String, initialValue: T) -> (T, Arc<dyn Fn(T) -> () + Send + Sync>);
     /// Retains a keyed mutable value and returns a callback for replacing it.
@@ -3059,6 +3645,8 @@ pub trait ComposeDslContextMethods: Send + Sync {
         factory: Arc<dyn Fn() -> T + Send + Sync>,
         deps: Option<Vec<serde_json::Value>>,
     ) -> T;
+    /// Runs composition-owned work and cleans it up on dependency change or disposal.
+    fn useEffect(&self, key: String, setup: Arc<dyn Fn() -> Arc<dyn Fn() + Send + Sync> + Send + Sync>, dependencies: Vec<super::JsAny>);
     /// Measures text using host font metrics and the supplied layout constraints.
     fn measureText(&self, request: ComposeTextMeasureRequest) -> ComposeTextMeasureResult;
     /// Invokes a resolved tool by name and asynchronously decodes its result.
@@ -3071,7 +3659,11 @@ pub trait ComposeDslContextMethods: Send + Sync {
     fn getEnv(&self, key: String) -> Option<String>;
     /// Writes one runtime environment value for subsequent screen operations.
     fn setEnv(&self, key: String, value: String) -> ComposeDslContextMethodsSetEnvReturn;
-    /// Requests navigation to a route with optional destination arguments.
+    /// Requests navigation using optional destination arguments; workspace routes open in the side workspace.
+    /// Workspace args may include workspaceTabId to open/focus a distinct instance within this plugin route,
+    /// and workspaceTabTitle to name its tab. Repeated navigation with the same ID reuses either workspace pane.
+    /// These reserved fields are removed from the screen's input; omitting the ID reuses one tab per route.
+    /// May be called from callbacks and composition-owned effects without returning a navigation object.
     fn navigate(
         &self,
         route: String,
@@ -3088,6 +3680,8 @@ pub trait ComposeDslContextMethods: Send + Sync {
         &self,
         options: Option<ComposeFilePickerOptions>,
     ) -> JsFuture<ComposeFilePickerResult>;
+    /// Saves text or binary bytes to a user-selected destination through the host file selector.
+    fn saveFile(&self, options: ComposeFileSaveOptions) -> JsFuture<ComposeFileSaveResult>;
     /// Returns the registered runtime-module specification decoded as the requested type.
     fn getModuleSpec<TSpec>(&self) -> TSpec;
     /// Returns the package name that owns the current Compose DSL module.
@@ -3148,6 +3742,7 @@ pub trait ComposeDslContextMethods: Send + Sync {
 /// Screen renderer that receives a host context and produces a root node tree.
 pub type ComposeDslScreen = Arc<dyn Fn(ComposeDslContext) -> ComposeDslScreenOutput + Send + Sync>;
 /// Defines numeric unit accessors installed on the JavaScript `Number` interface.
+#[js_declaration(scope = "global", name = "Number")]
 pub struct ComposeNumberExtensions {
     /// Converts the number to a pixel unit value.
     pub px: ComposeUnitValue,

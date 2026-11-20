@@ -1,32 +1,69 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+pub mod server;
+mod connector;
+use futures_util::{SinkExt, StreamExt};
+use operit_host_native_scheduler::NativeHostRuntimeTaskSchedulerHost;
+pub use server::NativeHttpServerHost;
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
+use tokio_tungstenite::tungstenite;
 
 use operit_host_api::{
     httpDownloadPartialTargetPath, HostError, HostResult, HttpDownloadControl,
     HttpDownloadFileRequest, HttpDownloadFileResult, HttpDownloadProgress,
     HttpDownloadProgressCallback, HttpDownloadProgressState, HttpDownloadRequest,
-    HttpDownloadResult, HttpHost, HttpRequestData, HttpResponseData, HttpStreamChunkCallback,
-    HttpStreamClosedCallback, HttpStreamHost, HttpStreamOpenedCallback, WebSocketClosedCallback,
-    WebSocketHost, WebSocketMessageCallback, WebSocketOpenedCallback, WebSocketRequestData,
+    HttpDownloadResult, HttpFileDownloadResult, HttpHost, HttpRequestData, HttpResponseData,
+    HttpResponseHead, HttpStreamChunkCallback, HttpStreamClosedCallback, HttpStreamHost,
+    HttpStreamOpenedCallback, HttpStreamResponseCallback, WebSocketClosedCallback, WebSocketHost,
+    WebSocketMessageCallback, WebSocketOpenedCallback, WebSocketRequestData,
 };
-use reqwest::blocking::{multipart, Client as BlockingClient};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_RANGE, RANGE};
+use reqwest::multipart;
 use reqwest::{Client as AsyncClient, Method, Proxy, StatusCode};
 use tungstenite::client::IntoClientRequest;
 
 #[derive(Clone, Debug, Default)]
 pub struct NativeHttpHost {
-    byteStreams: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Sender<bool>>>>,
-    webSockets: Arc<Mutex<BTreeMap<String, mpsc::Sender<NativeWebSocketCommand>>>>,
-    httpClients: Arc<Mutex<BTreeMap<HttpClientPolicy, BlockingClient>>>,
+    state: Arc<NativeHttpHostState>,
 }
 
-/// Identifies the connection pool for an exact buffered HTTP request policy.
+/// Only public Host clones own this state; workers retain the registries separately.
+#[derive(Debug, Default)]
+struct NativeHttpHostState {
+    byteStreams: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Sender<bool>>>>,
+    webSockets: Arc<Mutex<BTreeMap<String, NativeWebSocketRegistration>>>,
+    httpClients: Arc<Mutex<BTreeMap<HttpClientPolicy, AsyncClient>>>,
+}
+
+impl Drop for NativeHttpHostState {
+    fn drop(&mut self) {
+        let streams = std::mem::take(
+            &mut *self
+                .byteStreams
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for cancel in streams.into_values() {
+            cancel.send_replace(true);
+        }
+        let sockets = std::mem::take(
+            &mut *self
+                .webSockets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for socket in sockets.into_values() {
+            socket.cancel.send_replace(true);
+        }
+    }
+}
+
+/// Identifies the shared connection pool for an exact HTTP request policy.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct HttpClientPolicy {
     connectTimeoutSeconds: u64,
@@ -37,10 +74,11 @@ struct HttpClientPolicy {
     proxyPort: u16,
 }
 
-/// Carries one command from a Link carrier into a host-owned WebSocket thread.
-enum NativeWebSocketCommand {
-    Send(Vec<u8>),
-    Close,
+/// Owns cancellation independently of a bounded WebSocket send queue.
+#[derive(Clone, Debug)]
+struct NativeWebSocketRegistration {
+    commands: tokio::sync::mpsc::Sender<tungstenite::Message>,
+    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 impl NativeHttpHost {
@@ -51,7 +89,7 @@ impl NativeHttpHost {
 }
 
 impl NativeHttpHost {
-    /// Opens one native WebSocket on a dedicated blocking network thread.
+    /// Opens one socket on the Host's shared four-worker network executor.
     #[allow(non_snake_case)]
     fn openNativeWebSocket(
         &self,
@@ -61,34 +99,50 @@ impl NativeHttpHost {
         onMessage: WebSocketMessageCallback,
         onClosed: WebSocketClosedCallback,
     ) -> HostResult<()> {
-        let (commandSender, commandReceiver) = mpsc::channel();
+        let (commands, receiver) = tokio::sync::mpsc::channel(64);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let registration = NativeWebSocketRegistration { commands, cancel };
         {
-            let mut sockets = self
-                .webSockets
+            let mut sockets = self.state.webSockets
                 .lock()
-                .map_err(|error| HostError::new(format!("WebSocket lock poisoned: {error}")))?;
+                .map_err(|error| HostError::new(error.to_string()))?;
             if sockets.contains_key(&streamId) {
                 return Err(HostError::new(format!(
                     "WebSocket is already open: {streamId}"
                 )));
             }
-            sockets.insert(streamId.clone(), commandSender);
+            sockets.insert(streamId.clone(), registration.clone());
         }
-        let sockets = self.webSockets.clone();
-        let taskStreamId = streamId.clone();
-        std::thread::Builder::new()
-            .name(format!("operit-websocket-{streamId}"))
-            .spawn(move || {
-                let result = executeNativeWebSocket(request, commandReceiver, onOpened, onMessage)
-                    .map_err(|error| error.to_string());
-                onClosed(result);
-                sockets
-                    .lock()
-                    .expect("WebSocket lock poisoned")
-                    .remove(&taskStreamId);
-            })
-            .map_err(|error| HostError::new(error.to_string()))?;
-        Ok(())
+        let sockets = self.state.webSockets.clone();
+        let task_id = streamId.clone();
+        let result = NativeHostRuntimeTaskSchedulerHost::new().scheduleNetworkAsyncTask(
+            "native-websocket",
+            Box::new(move || {
+                Box::pin(async move {
+                    let result =
+                        executeNativeWebSocket(request, receiver, cancelled, onOpened, onMessage)
+                            .await
+                            .map_err(|error| error.to_string());
+                    {
+                        let mut sockets = sockets.lock().expect("WebSocket lock poisoned");
+                        if sockets
+                            .get(&task_id)
+                            .is_some_and(|entry| entry.cancel.same_channel(&registration.cancel))
+                        {
+                            sockets.remove(&task_id);
+                        }
+                    }
+                    onClosed(result);
+                })
+            }),
+        );
+        if result.is_err() {
+            self.state.webSockets
+                .lock()
+                .map_err(|error| HostError::new(error.to_string()))?
+                .remove(&streamId);
+        }
+        result
     }
 }
 
@@ -109,105 +163,180 @@ impl WebSocketHost for NativeHttpHost {
     /// Sends one binary message through a native WebSocket.
     #[allow(non_snake_case)]
     fn sendWebSocketMessage(&self, streamId: &str, message: Vec<u8>) -> HostResult<()> {
-        let sender = self
-            .webSockets
+        let sender = self.state.webSockets
             .lock()
             .map_err(|error| HostError::new(format!("WebSocket lock poisoned: {error}")))?
             .get(streamId)
             .cloned()
             .ok_or_else(|| HostError::new(format!("WebSocket is not open: {streamId}")))?;
         sender
-            .send(NativeWebSocketCommand::Send(message))
+            .commands
+            .try_send(tungstenite::Message::Binary(message))
             .map_err(|error| HostError::new(error.to_string()))
+    }
+
+    /// Sends one UTF-8 text frame through a native WebSocket.
+    #[allow(non_snake_case)]
+    fn sendWebSocketText(&self, streamId: &str, text: String) -> HostResult<()> {
+        let sender = self.state.webSockets.lock().map_err(|error| HostError::new(error.to_string()))?
+            .get(streamId).cloned().ok_or_else(|| HostError::new(format!("WebSocket is not open: {streamId}")))?;
+        sender.commands.try_send(tungstenite::Message::Text(text)).map_err(|error| HostError::new(error.to_string()))
     }
 
     /// Closes one native WebSocket.
     #[allow(non_snake_case)]
     fn closeWebSocket(&self, streamId: &str) -> HostResult<()> {
-        let sender = self
-            .webSockets
+        let sender = self.state.webSockets
             .lock()
             .map_err(|error| HostError::new(format!("WebSocket lock poisoned: {error}")))?
             .remove(streamId)
             .ok_or_else(|| HostError::new(format!("WebSocket is not open: {streamId}")))?;
-        sender
-            .send(NativeWebSocketCommand::Close)
-            .map_err(|error| HostError::new(error.to_string()))
+        sender.cancel.send_replace(true);
+        Ok(())
     }
 }
 
-/// Runs one native WebSocket until the peer or its owner closes the connection.
-fn executeNativeWebSocket(
+/// Drives a socket and its command queue without blocking a network worker.
+async fn executeNativeWebSocket(
     request: WebSocketRequestData,
-    commandReceiver: mpsc::Receiver<NativeWebSocketCommand>,
+    mut commands: tokio::sync::mpsc::Receiver<tungstenite::Message>,
+    mut cancelled: tokio::sync::watch::Receiver<bool>,
     onOpened: WebSocketOpenedCallback,
     onMessage: WebSocketMessageCallback,
 ) -> HostResult<()> {
-    let readTimeoutSeconds = request.connectTimeoutSeconds;
-    let mut websocketRequest = request
+    let mut handshake = request
         .url
         .into_client_request()
         .map_err(|error| HostError::new(error.to_string()))?;
     for (name, value) in request.headers {
-        let headerName = tungstenite::http::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|error| HostError::new(error.to_string()))?;
-        let headerValue = tungstenite::http::header::HeaderValue::from_str(&value)
-            .map_err(|error| HostError::new(error.to_string()))?;
-        websocketRequest
-            .headers_mut()
-            .insert(headerName, headerValue);
+        handshake.headers_mut().insert(
+            tungstenite::http::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| HostError::new(error.to_string()))?,
+            tungstenite::http::header::HeaderValue::from_str(&value)
+                .map_err(|error| HostError::new(error.to_string()))?,
+        );
     }
-    let (mut socket, _) = tungstenite::connect(websocketRequest)
-        .map_err(|error| HostError::new(format!("WebSocket connect failed: {error}")))?;
-    setWebSocketReadTimeout(&mut socket, readTimeoutSeconds);
+    let connect = async {
+        let handshake = tokio_tungstenite::connect_async(handshake);
+        if request.connectTimeoutSeconds == 0 {
+            handshake
+                .await
+                .map_err(|error| HostError::new(error.to_string()))
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(request.connectTimeoutSeconds),
+                handshake,
+            )
+            .await
+            .map_err(|_| HostError::timeout("WebSocket connect deadline exceeded"))?
+            .map_err(|error| HostError::new(error.to_string()))
+        }
+    };
+    let (mut socket, _) = tokio::select! {
+        biased;
+        _ = cancelled.changed() => return Ok(()),
+        connected = connect => connected?,
+    };
     onOpened();
     loop {
-        while let Ok(command) = commandReceiver.try_recv() {
-            match command {
-                NativeWebSocketCommand::Send(message) => socket
-                    .send(tungstenite::Message::Binary(message))
-                    .map_err(|error| HostError::new(error.to_string()))?,
-                NativeWebSocketCommand::Close => {
-                    let _ = socket.close(None);
+        tokio::select! {
+            biased;
+            _ = cancelled.changed() => {
+                let _ = tokio::time::timeout(Duration::from_millis(250), socket.close(None)).await;
+                return Ok(());
+            }
+            command = commands.recv() => match command {
+                Some(message) => tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => return Ok(()),
+                    sent = socket.send(message) => sent.map_err(|error| HostError::new(error.to_string()))?,
+                },
+                None => return Ok(()),
+            },
+            message = socket.next() => match message {
+                Some(Ok(tungstenite::Message::Binary(message))) => onMessage(message),
+                Some(Ok(tungstenite::Message::Text(message))) => onMessage(message.into_bytes()),
+                Some(Ok(tungstenite::Message::Close(Some(frame)))) => {
+                    if frame.code != tungstenite::protocol::frame::coding::CloseCode::Normal {
+                        return Err(HostError::new(format!("WebSocket closed with code {}: {}", u16::from(frame.code), frame.reason)));
+                    }
                     return Ok(());
                 }
+                Some(Ok(tungstenite::Message::Close(None))) | None => return Ok(()),
+                Some(Ok(_)) => {},
+                Some(Err(error)) => return Err(HostError::new(error.to_string())),
             }
-        }
-        match socket.read() {
-            Ok(tungstenite::Message::Binary(message)) => onMessage(message),
-            Ok(tungstenite::Message::Text(message)) => onMessage(message.as_bytes().to_vec()),
-            Ok(tungstenite::Message::Close(_)) => return Ok(()),
-            Ok(tungstenite::Message::Ping(_)) | Ok(tungstenite::Message::Pong(_)) => {}
-            Ok(tungstenite::Message::Frame(_)) => {}
-            Err(tungstenite::Error::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
-                return Ok(())
-            }
-            Err(error) => return Err(HostError::new(error.to_string())),
         }
     }
 }
 
-/// Applies a short polling timeout so sends and closes are observed promptly.
-fn setWebSocketReadTimeout(
-    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
-    connectTimeoutSeconds: u64,
-) {
-    let timeout =
-        Duration::from_millis(connectTimeoutSeconds.saturating_mul(1000).clamp(100, 1000));
-    if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
-        let _ = stream.set_read_timeout(Some(timeout));
-    } else if let tungstenite::stream::MaybeTlsStream::Rustls(stream) = socket.get_mut() {
-        let _ = stream.sock.set_read_timeout(Some(timeout));
+impl NativeHttpHost {
+    /// Owns cancellation and thread cleanup for both metadata and byte-only streams.
+    #[allow(non_snake_case)]
+    fn openNativeHttpStream(
+        &self,
+        streamId: String,
+        request: HttpRequestData,
+        onOpened: HttpStreamOpenedCallback,
+        onResponse: Option<HttpStreamResponseCallback>,
+        onChunk: HttpStreamChunkCallback,
+        onClosed: HttpStreamClosedCallback,
+    ) -> HostResult<()> {
+        let (cancelSender, cancelReceiver) = tokio::sync::watch::channel(false);
+        {
+            let mut streams = self.state.byteStreams.lock().map_err(|error| {
+                HostError::new(format!("HTTP byte stream lock poisoned: {error}"))
+            })?;
+            if streams.contains_key(&streamId) {
+                return Err(HostError::new(format!(
+                    "HTTP byte stream is already open: {streamId}"
+                )));
+            }
+            streams.insert(streamId.clone(), cancelSender.clone());
+        }
+        let streams = self.state.byteStreams.clone();
+        let clients = self.state.httpClients.clone();
+        let taskStreamId = streamId.clone();
+        let spawnResult = NativeHostRuntimeTaskSchedulerHost::new().scheduleNetworkAsyncTask(
+            "native-http-stream",
+            Box::new(move || {
+                Box::pin(async move {
+                    let result = executeHttpByteStream(
+                        request,
+                        clients,
+                        cancelReceiver,
+                        onOpened,
+                        onResponse,
+                        onChunk,
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
+                    {
+                        let mut streams = streams.lock().expect("HTTP byte stream lock poisoned");
+                        if streams
+                            .get(&taskStreamId)
+                            .is_some_and(|entry| entry.same_channel(&cancelSender))
+                        {
+                            streams.remove(&taskStreamId);
+                        }
+                    }
+                    onClosed(result);
+                })
+            }),
+        );
+        if let Err(error) = spawnResult {
+            self.state.byteStreams
+                .lock()
+                .map_err(|error| HostError::new(error.to_string()))?
+                .remove(&streamId);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
 impl HttpStreamHost for NativeHttpHost {
-    /// Opens one native asynchronous HTTP response stream on a Host-owned network thread.
+    /// Opens one byte-only stream without changing its existing status handling.
     #[allow(non_snake_case)]
     fn openHttpByteStream(
         &self,
@@ -217,48 +346,33 @@ impl HttpStreamHost for NativeHttpHost {
         onChunk: HttpStreamChunkCallback,
         onClosed: HttpStreamClosedCallback,
     ) -> HostResult<()> {
-        let (cancelSender, cancelReceiver) = tokio::sync::watch::channel(false);
-        {
-            let mut streams = self.byteStreams.lock().map_err(|error| {
-                HostError::new(format!("HTTP byte stream lock poisoned: {error}"))
-            })?;
-            if streams.contains_key(&streamId) {
-                return Err(HostError::new(format!(
-                    "HTTP byte stream is already open: {streamId}"
-                )));
-            }
-            streams.insert(streamId.clone(), cancelSender);
-        }
-        let streams = self.byteStreams.clone();
-        let taskStreamId = streamId.clone();
-        let spawnResult = std::thread::Builder::new()
-            .name(format!("operit-http-stream-{streamId}"))
-            .spawn(move || {
-                let result = executeHttpByteStream(request, cancelReceiver, onOpened, onChunk)
-                    .map_err(|error| error.to_string());
-                onClosed(result);
-                streams
-                    .lock()
-                    .expect("HTTP byte stream lock poisoned")
-                    .remove(&taskStreamId);
-            });
-        if let Err(error) = spawnResult {
-            self.byteStreams
-                .lock()
-                .map_err(|lockError| {
-                    HostError::new(format!("HTTP byte stream lock poisoned: {lockError}"))
-                })?
-                .remove(&streamId);
-            return Err(HostError::new(error.to_string()));
-        }
-        Ok(())
+        self.openNativeHttpStream(streamId, request, onOpened, None, onChunk, onClosed)
+    }
+
+    /// Delivers response metadata before body chunks, including HTTP error responses.
+    #[allow(non_snake_case)]
+    fn openHttpResponseStream(
+        &self,
+        streamId: String,
+        request: HttpRequestData,
+        onResponse: HttpStreamResponseCallback,
+        onChunk: HttpStreamChunkCallback,
+        onClosed: HttpStreamClosedCallback,
+    ) -> HostResult<()> {
+        self.openNativeHttpStream(
+            streamId,
+            request,
+            Arc::new(|| {}),
+            Some(onResponse),
+            onChunk,
+            onClosed,
+        )
     }
 
     /// Cancels one native asynchronous HTTP response stream.
     #[allow(non_snake_case)]
     fn closeHttpByteStream(&self, streamId: &str) -> HostResult<()> {
-        let sender = self
-            .byteStreams
+        let sender = self.state.byteStreams
             .lock()
             .map_err(|error| HostError::new(format!("HTTP byte stream lock poisoned: {error}")))?
             .remove(streamId)
@@ -271,102 +385,217 @@ impl HttpStreamHost for NativeHttpHost {
 
 /// Runs one HTTP response stream until the server ends it or the Host receives cancellation.
 #[allow(non_snake_case)]
-fn executeHttpByteStream(
+async fn executeHttpByteStream(
     request: HttpRequestData,
+    clients: Arc<Mutex<BTreeMap<HttpClientPolicy, AsyncClient>>>,
     mut cancelReceiver: tokio::sync::watch::Receiver<bool>,
     onOpened: HttpStreamOpenedCallback,
+    onResponse: Option<HttpStreamResponseCallback>,
     onChunk: HttpStreamChunkCallback,
 ) -> HostResult<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| HostError::new(error.to_string()))?;
-    runtime.block_on(async move {
-        let method = Method::from_bytes(request.method.as_bytes())
-            .map_err(|error| HostError::new(error.to_string()))?;
-        let client = buildHttpStreamClient(
-            request.connectTimeoutSeconds,
-            request.readTimeoutSeconds,
-            request.followRedirects,
-            request.ignoreSsl,
-            &request.proxyHost,
-            request.proxyPort,
-        )?;
-        let mut httpRequest = client.request(method, request.url);
-        httpRequest = httpRequest.headers(headersToReqwest(&request.headers)?);
-        if !request.fileParts.is_empty() || !request.formFields.is_empty() {
-            let mut form = reqwest::multipart::Form::new();
-            for (name, value) in request.formFields {
-                form = form.text(name, value);
-            }
-            for file in request.fileParts {
-                let part = reqwest::multipart::Part::bytes(file.content)
-                    .file_name(file.fileName)
-                    .mime_str(&file.contentType)
-                    .map_err(|error| HostError::new(error.to_string()))?;
-                form = form.part(file.fieldName, part);
-            }
-            httpRequest = httpRequest.multipart(form);
-        } else if !request.body.is_empty() {
-            httpRequest = httpRequest.body(request.body);
+    let mut response = tokio::select! {
+        changed = cancelReceiver.changed() => {
+            changed.map_err(|error| HostError::new(error.to_string()))?;
+            return Ok(());
         }
-        let mut response = httpRequest
-            .send()
-            .await
-            .map_err(|error| HostError::new(error.to_string()))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .map_err(|error| HostError::new(error.to_string()))?;
-            return Err(HostError::new(format!("HTTP {status}: {body}")));
+        response = sendHttpRequestAsync(request, clients) => {
+            response?
         }
-        onOpened();
-        loop {
-            tokio::select! {
-                changed = cancelReceiver.changed() => {
-                    changed.map_err(|error| HostError::new(error.to_string()))?;
-                    return Ok(());
-                }
-                chunk = response.chunk() => {
-                    match chunk.map_err(|error| HostError::new(error.to_string()))? {
-                        Some(bytes) => onChunk(bytes.to_vec()),
-                        None => return Ok(()),
-                    }
+    };
+    if let Some(onResponse) = onResponse {
+        onResponse(HttpResponseHead {
+            finalUrl: response.url().to_string(),
+            statusCode: i32::from(response.status().as_u16()),
+            statusMessage: response
+                .status()
+                .canonical_reason()
+                .unwrap_or_default()
+                .to_string(),
+            headers: response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect(),
+        });
+    } else if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.map_err(httpError)?;
+        return Err(HostError::new(format!("HTTP {status}: {body}")));
+    }
+    onOpened();
+    loop {
+        tokio::select! {
+            changed = cancelReceiver.changed() => {
+                changed.map_err(|error| HostError::new(error.to_string()))?;
+                return Ok(());
+            }
+            chunk = response.chunk() => {
+                match chunk.map_err(httpError)? {
+                    Some(bytes) => onChunk(bytes.to_vec()),
+                    None => return Ok(()),
                 }
             }
         }
-    })
+    }
 }
 
 impl HttpHost for NativeHttpHost {
-    /// Executes a buffered request with a shared policy-specific connection pool.
-    fn executeHttpRequest(&self, request: HttpRequestData) -> HostResult<HttpResponseData> {
-        let clients = self.httpClients.clone();
-        std::thread::spawn(move || executeHttpRequestOnBlockingThread(request, clients))
-            .join()
-            .map_err(|_| HostError::new("native HTTP request thread panicked"))?
+    /// Delivers image bytes through cancellable HTTP streams.
+    fn imageDelivery(&self) -> operit_host_api::HttpImageDelivery {
+        operit_host_api::HttpImageDelivery::Bytes
     }
 
-    /// Downloads files on a dedicated manager thread with bounded worker concurrency.
+    /// Executes buffered HTTP through the shared asynchronous network executor.
+    fn executeHttpRequest(&self, request: HttpRequestData) -> HostResult<HttpResponseData> {
+        let clients = self.state.httpClients.clone();
+        NativeHostRuntimeTaskSchedulerHost::new().runNetworkTask("native-http-request", move || {
+            executeHttpRequestAsync(request, clients)
+        })
+    }
+
+    /// Streams a response to disk through the same Host network executor.
+    fn downloadToFile(
+        &self,
+        request: HttpRequestData,
+        target: &dyn operit_host_api::FileTarget,
+    ) -> HostResult<HttpFileDownloadResult> {
+        let targetPath = target.nativePath()?;
+        NativeHostRuntimeTaskSchedulerHost::new().runNetworkTask("native-http-file", move || {
+            downloadToFileAsync(request, targetPath)
+        })
+    }
+
+    /// Polls a bounded set of file futures without creating per-batch worker threads.
     fn downloadFiles(
         &self,
         request: HttpDownloadRequest,
         control: HttpDownloadControl,
         onProgress: HttpDownloadProgressCallback,
     ) -> HostResult<HttpDownloadResult> {
-        std::thread::spawn(move || executeDownloadBatch(request, control, onProgress))
-            .join()
-            .map_err(|_| HostError::new("native HTTP download manager thread panicked"))?
+        NativeHostRuntimeTaskSchedulerHost::new()
+            .runNetworkTask("native-http-downloads", move || {
+                executeDownloadBatch(request, control, onProgress)
+            })
     }
 }
 
-/// Executes one buffered request outside every caller-owned async runtime context.
-fn executeHttpRequestOnBlockingThread(
+/// Streams one successful response directly to a temporary file and publishes
+/// it only after the complete response has been written.
+async fn downloadToFileAsync(
     request: HttpRequestData,
-    clients: Arc<Mutex<BTreeMap<HttpClientPolicy, BlockingClient>>>,
+    targetPath: String,
+) -> HostResult<HttpFileDownloadResult> {
+    if targetPath.trim().is_empty() {
+        return Err(HostError::new("HTTP download target path is empty"));
+    }
+    let client = buildHttpStreamClient(
+        request.connectTimeoutSeconds,
+        request.readTimeoutSeconds,
+        request.followRedirects,
+        request.ignoreSsl,
+        &request.proxyHost,
+        request.proxyPort,
+    )?;
+    let method = Method::from_bytes(request.method.as_bytes())
+        .map_err(|error| HostError::new(error.to_string()))?;
+    let mut httpRequest = client.request(method, request.url);
+    httpRequest = httpRequest.headers(headersToReqwest(&request.headers)?);
+    if !request.fileParts.is_empty() || !request.formFields.is_empty() {
+        let mut form = reqwest::multipart::Form::new();
+        for (name, value) in request.formFields {
+            form = form.text(name, value);
+        }
+        for file in request.fileParts {
+            let part = reqwest::multipart::Part::bytes(file.content)
+                .file_name(file.fileName)
+                .mime_str(&file.contentType)
+                .map_err(httpError)?;
+            form = form.part(file.fieldName, part);
+        }
+        httpRequest = httpRequest.multipart(form);
+    } else if !request.body.is_empty() {
+        httpRequest = httpRequest.body(request.body);
+    }
+    let mut response = sendOnNetworkTask(httpRequest).await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.map_err(httpError)?;
+        return Err(HostError::new(format!("HTTP {status}: {body}")));
+    }
+    let finalUrl = response.url().to_string();
+    let target = Path::new(&targetPath);
+    if let Some(parent) = target.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(httpIoError)?;
+    }
+    let partialPath = httpDownloadPartialTargetPath(&targetPath);
+    let result = async {
+        let mut output = fs::File::create(&partialPath).map_err(httpIoError)?;
+        let mut downloadedBytes = 0u64;
+        while let Some(chunk) = response.chunk().await.map_err(httpError)? {
+            output.write_all(&chunk).map_err(httpIoError)?;
+            downloadedBytes = downloadedBytes
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| HostError::new("HTTP download byte count overflowed"))?;
+        }
+        output.flush().map_err(httpIoError)?;
+        drop(output);
+        fs::rename(&partialPath, target).map_err(httpIoError)?;
+        Ok(HttpFileDownloadResult {
+            finalUrl,
+            targetPath: targetPath.clone(),
+            downloadedBytes,
+        })
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&partialPath);
+    }
+    result
+}
+
+/// Executes a buffered request on its Host-owned asynchronous network context.
+async fn executeHttpRequestAsync(
+    request: HttpRequestData,
+    clients: Arc<Mutex<BTreeMap<HttpClientPolicy, AsyncClient>>>,
 ) -> HostResult<HttpResponseData> {
+    let response = sendHttpRequestAsync(request, clients).await?;
+    let finalUrl = response.url().to_string();
+    let status = response.status();
+    let statusCode = status.as_u16() as i32;
+    let statusMessage = match status.canonical_reason() {
+        Some(reason) => reason.to_string(),
+        None => String::new(),
+    };
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            value
+                .to_str()
+                .map(|text| (name.to_string(), text.to_string()))
+                .map_err(|error| HostError::new(error.to_string()))
+        })
+        .collect::<HostResult<Vec<_>>>()?;
+    let body = response.bytes().await.map_err(httpError)?.to_vec();
+    Ok(HttpResponseData {
+        finalUrl,
+        statusCode,
+        statusMessage,
+        headers,
+        body,
+    })
+}
+
+/// Sends buffered and file requests with the same headers, body, proxy and redirect policy.
+async fn sendHttpRequestAsync(
+    request: HttpRequestData,
+    clients: Arc<Mutex<BTreeMap<HttpClientPolicy, AsyncClient>>>,
+) -> HostResult<reqwest::Response> {
     let policy = HttpClientPolicy {
         connectTimeoutSeconds: request.connectTimeoutSeconds,
         readTimeoutSeconds: request.readTimeoutSeconds,
@@ -382,7 +611,7 @@ fn executeHttpRequestOnBlockingThread(
         if let Some(client) = clients.get(&policy) {
             client.clone()
         } else {
-            let client = buildHttpClient(
+            let client = buildHttpStreamClient(
                 policy.connectTimeoutSeconds,
                 policy.readTimeoutSeconds,
                 policy.followRedirects,
@@ -407,48 +636,67 @@ fn executeHttpRequestOnBlockingThread(
             let part = multipart::Part::bytes(file.content)
                 .file_name(file.fileName)
                 .mime_str(&file.contentType)
-                .map_err(|error| HostError::new(error.to_string()))?;
+                .map_err(httpError)?;
             form = form.part(file.fieldName, part);
         }
         httpRequest = httpRequest.multipart(form);
     } else if !request.body.is_empty() {
         httpRequest = httpRequest.body(request.body);
     }
-    let response = httpRequest
-        .send()
-        .map_err(|error| HostError::new(error.to_string()))?;
-    let finalUrl = response.url().to_string();
-    let status = response.status();
-    let statusCode = status.as_u16() as i32;
-    let statusMessage = match status.canonical_reason() {
-        Some(reason) => reason.to_string(),
-        None => String::new(),
-    };
-    let headers = response
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            value
-                .to_str()
-                .map(|text| (name.to_string(), text.to_string()))
-                .map_err(|error| HostError::new(error.to_string()))
-        })
-        .collect::<HostResult<Vec<_>>>()?;
-    let body = response
-        .bytes()
+    sendOnNetworkTask(httpRequest).await
+}
+
+/// Isolates request construction and HTTP handshaking from the caller's poll frame.
+/// Connection setup already uses the same cancellable task boundary; handshaking
+/// happens after that connector returns and must not re-enter the larger caller.
+async fn sendOnNetworkTask(request: reqwest::RequestBuilder) -> HostResult<reqwest::Response> {
+    connector::runTask(async move { request.send().await })
+        .await
         .map_err(|error| HostError::new(error.to_string()))?
-        .to_vec();
-    Ok(HttpResponseData {
-        finalUrl,
-        statusCode,
-        statusMessage,
-        headers,
-        body,
-    })
+        .map_err(httpError)
+}
+
+/// Preserves the network cause and timeout classification across the Host boundary.
+fn httpError(error: reqwest::Error) -> HostError {
+    let message = errorChain(&error);
+    if error.is_timeout() {
+        HostError::timeout(message)
+    } else {
+        HostError::new(message)
+    }
+}
+
+/// Includes nested HTTP failures when streaming a response through std::io.
+fn httpIoError(error: std::io::Error) -> HostError {
+    let mut source: Option<&(dyn Error + 'static)> = Some(&error);
+    let mut timedOut = error.kind() == std::io::ErrorKind::TimedOut;
+    while let Some(cause) = source {
+        if let Some(networkError) = cause.downcast_ref::<reqwest::Error>() {
+            timedOut |= networkError.is_timeout();
+        }
+        source = cause.source();
+    }
+    let message = errorChain(&error);
+    if timedOut {
+        HostError::timeout(message)
+    } else {
+        HostError::new(message)
+    }
+}
+
+fn errorChain(error: &(dyn Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 /// Executes one validated batch through a bounded native worker pool.
-fn executeDownloadBatch(
+async fn executeDownloadBatch(
     request: HttpDownloadRequest,
     control: HttpDownloadControl,
     onProgress: HttpDownloadProgressCallback,
@@ -469,75 +717,42 @@ fn executeDownloadBatch(
         &request.proxyHost,
         request.proxyPort,
     )?;
-    let queue = Arc::new(Mutex::new(VecDeque::from(request.files.clone())));
     let results = Arc::new(Mutex::new(BTreeMap::<String, HttpDownloadFileResult>::new()));
     let failure = Arc::new(Mutex::new(None::<HostError>));
     let downloadedBytes = Arc::new(AtomicU64::new(0));
     let completedFiles = Arc::new(AtomicUsize::new(0));
     let progressGate = Arc::new(Mutex::new(()));
 
-    std::thread::scope(|scope| {
-        for _ in 0..workerCount {
-            let client = client.clone();
-            let queue = queue.clone();
-            let results = results.clone();
-            let failure = failure.clone();
-            let downloadedBytes = downloadedBytes.clone();
-            let completedFiles = completedFiles.clone();
-            let progressGate = progressGate.clone();
-            let control = control.clone();
-            let onProgress = onProgress.clone();
-            let downloadId = request.downloadId.clone();
-            scope.spawn(move || loop {
-                if control.isCancelled() || downloadHasFailed(&failure) {
-                    break;
-                }
-                let file = match nextDownloadFile(&queue) {
-                    Ok(file) => file,
-                    Err(error) => {
-                        recordDownloadFailure(&failure, error);
-                        break;
-                    }
-                };
-                let Some(file) = file else {
-                    break;
-                };
-                let result = downloadOneFile(
-                    &client,
-                    &downloadId,
-                    &file,
-                    totalBytes,
-                    totalFiles,
-                    &downloadedBytes,
-                    &completedFiles,
-                    &progressGate,
-                    &control,
-                    &failure,
-                    &onProgress,
-                );
-                match result {
-                    Ok(result) => match results.lock() {
-                        Ok(mut entries) => {
-                            entries.insert(result.fileId.clone(), result);
-                        }
-                        Err(error) => {
-                            recordDownloadFailure(
-                                &failure,
-                                HostError::new(format!(
-                                    "HTTP download result lock poisoned: {error}"
-                                )),
-                            );
-                            break;
-                        }
-                    },
-                    Err(error) => {
-                        recordDownloadFailure(&failure, error);
-                        break;
-                    }
-                }
-            });
+    let jobs = futures_util::stream::iter(request.files.iter().map(|file| async {
+        if control.isCancelled() || downloadHasFailed(&failure) {
+            return;
         }
-    });
+        let result = downloadOneFileAsync(
+            &client,
+            &request.downloadId,
+            file,
+            totalBytes,
+            totalFiles,
+            &downloadedBytes,
+            &completedFiles,
+            &progressGate,
+            &control,
+            &failure,
+            &onProgress,
+        )
+        .await;
+        match result {
+            Ok(result) => {
+                results
+                    .lock()
+                    .expect("HTTP download results lock poisoned")
+                    .insert(result.fileId.clone(), result);
+            }
+            Err(error) => recordDownloadFailure(&failure, error),
+        }
+    }))
+    .buffer_unordered(workerCount);
+    jobs.collect::<Vec<_>>().await;
 
     if control.isCancelled() {
         removeQueuedAndIncompleteTargets(&request.files, &results)?;
@@ -621,34 +836,9 @@ fn validateDownloadRequest(request: &HttpDownloadRequest) -> HostResult<()> {
     Ok(())
 }
 
-/// Builds one reqwest client from an explicit Host request policy.
-fn buildHttpClient(
-    connectTimeoutSeconds: u64,
-    readTimeoutSeconds: u64,
-    followRedirects: bool,
-    ignoreSsl: bool,
-    proxyHost: &str,
-    proxyPort: u16,
-) -> HostResult<BlockingClient> {
-    let mut builder = BlockingClient::builder()
-        .connect_timeout(Duration::from_secs(connectTimeoutSeconds))
-        .timeout(Duration::from_secs(readTimeoutSeconds))
-        .danger_accept_invalid_certs(ignoreSsl);
-    if !followRedirects {
-        builder = builder.redirect(reqwest::redirect::Policy::none());
-    }
-    if !proxyHost.trim().is_empty() && proxyPort > 0 {
-        let proxyUrl = format!("http://{}:{}", proxyHost.trim(), proxyPort);
-        builder = builder
-            .proxy(Proxy::http(&proxyUrl).map_err(|error| HostError::new(error.to_string()))?);
-    }
-    builder
-        .build()
-        .map_err(|error| HostError::new(error.to_string()))
-}
-
-/// Builds one asynchronous client for a Host-owned streaming HTTP response.
+/// Builds an asynchronous client for Host-owned streaming HTTP responses.
 #[allow(non_snake_case)]
+/// Builds a Host client whose connection setup has an independent cancellable poll stack.
 fn buildHttpStreamClient(
     connectTimeoutSeconds: u64,
     readTimeoutSeconds: u64,
@@ -658,26 +848,28 @@ fn buildHttpStreamClient(
     proxyPort: u16,
 ) -> HostResult<AsyncClient> {
     let mut builder = AsyncClient::builder()
-        .connect_timeout(Duration::from_secs(connectTimeoutSeconds))
+        .connector_layer(connector::ConnectionTaskLayer)
         .danger_accept_invalid_certs(ignoreSsl);
+    if connectTimeoutSeconds > 0 {
+        builder = builder.connect_timeout(Duration::from_secs(connectTimeoutSeconds));
+    }
     if readTimeoutSeconds > 0 {
-        builder = builder.timeout(Duration::from_secs(readTimeoutSeconds));
+        builder = builder.read_timeout(Duration::from_secs(readTimeoutSeconds));
     }
     if !followRedirects {
         builder = builder.redirect(reqwest::redirect::Policy::none());
     }
     if !proxyHost.trim().is_empty() {
+        if proxyPort == 0 {
+            return Err(HostError::new("HTTP proxy port must be positive"));
+        }
         builder = builder.proxy(
-            Proxy::all(format!("http://{}:{}", proxyHost.trim(), proxyPort))
-                .map_err(|error| HostError::new(error.to_string()))?,
+            Proxy::all(format!("http://{}:{}", proxyHost.trim(), proxyPort)).map_err(httpError)?,
         );
     }
-    builder
-        .build()
-        .map_err(|error| HostError::new(error.to_string()))
+    builder.build().map_err(httpError)
 }
 
-/// Builds one asynchronous client so an active request can observe cancellation immediately.
 fn buildDownloadHttpClient(
     connectTimeoutSeconds: u64,
     readTimeoutSeconds: u64,
@@ -686,64 +878,14 @@ fn buildDownloadHttpClient(
     proxyHost: &str,
     proxyPort: u16,
 ) -> HostResult<AsyncClient> {
-    let mut builder = AsyncClient::builder()
-        .connect_timeout(Duration::from_secs(connectTimeoutSeconds))
-        .timeout(Duration::from_secs(readTimeoutSeconds))
-        .danger_accept_invalid_certs(ignoreSsl);
-    if !followRedirects {
-        builder = builder.redirect(reqwest::redirect::Policy::none());
-    }
-    if !proxyHost.trim().is_empty() && proxyPort > 0 {
-        let proxyUrl = format!("http://{}:{}", proxyHost.trim(), proxyPort);
-        builder = builder
-            .proxy(Proxy::http(&proxyUrl).map_err(|error| HostError::new(error.to_string()))?);
-    }
-    builder
-        .build()
-        .map_err(|error| HostError::new(error.to_string()))
-}
-
-/// Removes and returns the next queued file.
-fn nextDownloadFile(
-    queue: &Mutex<VecDeque<HttpDownloadFileRequest>>,
-) -> HostResult<Option<HttpDownloadFileRequest>> {
-    queue
-        .lock()
-        .map(|mut files| files.pop_front())
-        .map_err(|error| HostError::new(format!("HTTP download queue lock poisoned: {error}")))
-}
-
-/// Downloads one file into its durable partial target and publishes aggregate progress.
-fn downloadOneFile(
-    client: &AsyncClient,
-    downloadId: &str,
-    file: &HttpDownloadFileRequest,
-    totalBytes: u64,
-    totalFiles: usize,
-    downloadedBytes: &AtomicU64,
-    completedFiles: &AtomicUsize,
-    progressGate: &Mutex<()>,
-    control: &HttpDownloadControl,
-    failure: &Mutex<Option<HostError>>,
-    onProgress: &HttpDownloadProgressCallback,
-) -> HostResult<HttpDownloadFileResult> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| HostError::new(error.to_string()))?;
-    runtime.block_on(downloadOneFileAsync(
-        client,
-        downloadId,
-        file,
-        totalBytes,
-        totalFiles,
-        downloadedBytes,
-        completedFiles,
-        progressGate,
-        control,
-        failure,
-        onProgress,
-    ))
+    buildHttpStreamClient(
+        connectTimeoutSeconds,
+        readTimeoutSeconds,
+        followRedirects,
+        ignoreSsl,
+        proxyHost,
+        proxyPort,
+    )
 }
 
 /// Streams one HTTP file while racing every network wait against cancellation.
@@ -809,7 +951,7 @@ async fn downloadOneFileAsync(
         request = request.header(RANGE, format!("bytes={retainedBytes}-"));
     }
     let mut response = tokio::select! {
-        response = request.send() => response.map_err(|error| HostError::new(error.to_string()))?,
+        response = sendOnNetworkTask(request) => response?,
         () = waitForDownloadCancellation(control) => {
             return Err(HostError::new(format!("HTTP download cancelled: {downloadId}")));
         }
@@ -1139,6 +1281,56 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// Verifies a direct file download publishes only the completed destination.
+    #[test]
+    fn downloadsResponseDirectlyToFile() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = readHttpRequest(&mut stream);
+            assert!(request.starts_with("GET /file "));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world")
+                .unwrap();
+        });
+        let directory = uniqueTempDir("direct-file");
+        let target = directory.join("artifact.bin");
+        struct Target(std::path::PathBuf);
+        impl operit_host_api::FileTarget for Target {
+            /// Supplies a portable identity independently of the native destination.
+            fn vfsPath(&self) -> &str { "/operitapp/data/artifact.bin" }
+            /// Rejects buffering because the native download must stream atomically.
+            fn writeBytes(&self, _: &[u8]) -> HostResult<()> { unreachable!() }
+            /// Resolves the destination only within this platform-host fixture.
+            fn nativePath(&self) -> HostResult<String> { Ok(self.0.to_string_lossy().into_owned()) }
+        }
+        let response = NativeHttpHost::new()
+            .downloadToFile(
+                HttpRequestData {
+                    url: format!("http://{address}/file"),
+                    method: "GET".to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    formFields: Vec::new(),
+                    fileParts: Vec::new(),
+                    connectTimeoutSeconds: 2,
+                    readTimeoutSeconds: 2,
+                    followRedirects: true,
+                    ignoreSsl: false,
+                    proxyHost: String::new(),
+                    proxyPort: 0,
+                },
+                &Target(target.clone()),
+            )
+            .unwrap();
+        assert_eq!(response.downloadedBytes, 11);
+        assert_eq!(fs::read(&target).unwrap(), b"hello world");
+        assert!(!target.with_extension("bin.partial").exists());
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(directory);
+    }
+
     /// Verifies the native WebSocket carrier keeps polling until a delayed server message arrives.
     #[test]
     fn websocketReceivesMessageAfterReadTimeoutTick() {
@@ -1190,6 +1382,66 @@ mod tests {
             .unwrap()
             .is_ok());
         server.join().unwrap();
+    }
+
+    /// An idle inbound socket must not delay a newly queued outbound frame by
+    /// the connection timeout (the Link handshake waits for this very frame).
+    #[test]
+    fn websocketSendsPromptlyWhileWaitingForAnInboundMessage() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                socket.read().unwrap(),
+                tungstenite::Message::Binary(b"queued-message".to_vec())
+            );
+            socket
+                .send(tungstenite::Message::Binary(b"received".to_vec()))
+                .unwrap();
+            let _ = socket.close(None);
+        });
+        let host = NativeHttpHost::new();
+        let (openedSender, openedReceiver) = mpsc::channel();
+        let (messageSender, messageReceiver) = mpsc::channel();
+        let (closedSender, closedReceiver) = mpsc::channel();
+        host.openWebSocket(
+            "websocket-send-latency-test".into(),
+            WebSocketRequestData {
+                url: format!("ws://{address}"),
+                headers: Vec::new(),
+                connectTimeoutSeconds: 15,
+                ignoreSsl: false,
+            },
+            Arc::new(move || {
+                openedSender.send(()).unwrap();
+            }),
+            Arc::new(move |message| {
+                let _ = messageSender.send(message);
+            }),
+            Arc::new(move |result| {
+                let _ = closedSender.send(result);
+            }),
+        )
+        .unwrap();
+        openedReceiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Let the network thread enter its read before sending a command.
+        std::thread::sleep(Duration::from_millis(100));
+        host.sendWebSocketMessage("websocket-send-latency-test", b"queued-message".to_vec())
+            .unwrap();
+        let message = messageReceiver.recv_timeout(Duration::from_millis(750));
+        // Close even on a timing assertion failure, so no host thread leaks.
+        let _ = host.closeWebSocket("websocket-send-latency-test");
+        server.join().unwrap();
+        assert_eq!(message.unwrap(), b"received");
+        assert!(closedReceiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_ok());
     }
 
     /// Verifies two files enter the server concurrently and publish aggregate progress.
@@ -1471,3 +1723,8 @@ mod tests {
         root
     }
 }
+
+#[cfg(test)]
+mod response_stream_tests;
+
+mod stream;

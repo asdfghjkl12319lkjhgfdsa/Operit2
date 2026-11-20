@@ -9,6 +9,18 @@ class AppLocalizationsZh extends AppLocalizations {
   AppLocalizationsZh([String locale = 'zh']) : super(locale);
 
   @override
+  String get chatPromoteToRoot => '提升为主对话';
+
+  @override
+  String get workspaceUnsavedChangesTitle => '有未保存的修改';
+
+  @override
+  String get workspaceUnsavedChangesMessage => '关闭此文件前，要保存你的修改吗？';
+
+  @override
+  String get workspaceDiscardChanges => '放弃修改';
+
+  @override
   String get askOperitHint => '向 Operit 提问';
 
   @override
@@ -16,6 +28,12 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get fullscreenInput => '全屏输入';
+
+  @override
+  String get noticeExpand => '展开全文';
+
+  @override
+  String get noticeCollapse => '收起';
 
   @override
   String get expandInput => '展开输入框';
@@ -40,9 +58,6 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get attachmentCamera => '拍照';
-
-  @override
-  String get attachmentMemory => '记忆';
 
   @override
   String get attachmentFile => '文件';
@@ -84,9 +99,6 @@ class AppLocalizationsZh extends AppLocalizations {
   String get attachmentCameraUnavailable => '当前 Flutter 端没有相机采集能力';
 
   @override
-  String get attachmentMemoryUnavailable => '当前 Flutter 端没有记忆文件夹选择器';
-
-  @override
   String get clearSearch => '清空搜索';
 
   @override
@@ -99,6 +111,33 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get chatQueueAdded => '已加入发送队列';
+
+  @override
+  String get chatSendOptions => '选择发送方式';
+
+  @override
+  String get chatQueueAddMessageDescription => '当前回复结束后自动发送（默认）';
+
+  @override
+  String get chatGuideCurrentTurn => '引导当前对话';
+
+  @override
+  String get chatGuideCurrentTurnDescription => '不打断当前任务，在后续模型请求中生效';
+
+  @override
+  String get chatInterruptAndSend => '打断并发送';
+
+  @override
+  String get chatInterruptAndSendDescription => '停止当前回复，立即发送这条消息';
+
+  @override
+  String get chatGuidanceAccepted => '已添加引导，将在后续模型请求中生效';
+
+  @override
+  String get chatGuidanceTextOnly => '引导仅支持文本，请先移除附件和回复目标。';
+
+  @override
+  String get chatQueueWithdrawToEditor => '撤回到编辑框';
 
   @override
   String get chatPleaseCreateNewChat => '请新建对话';
@@ -128,21 +167,31 @@ class AppLocalizationsZh extends AppLocalizations {
   String get receivingToolResultAiResponse => '正在接收工具执行后的 AI 响应...';
 
   @override
-  String get roleResponsePlannerPlanning => '正在规划群组发言顺序...';
-
-  @override
-  String roleResponsePlannerMemberReplying(String memberName) {
-    return '正在生成「$memberName」的回复...';
-  }
-
-  @override
-  String get roleResponsePlannerFailed => '群组规划失败';
-
-  @override
   String get summarizingMemories => '正在总结记忆...';
 
   @override
   String get summaryGenerating => '正在生成总结...';
+
+  @override
+  String get summaryStageCore => '正在整理核心任务...';
+
+  @override
+  String get summaryStageConstraints => '正在整理用户需求与约束...';
+
+  @override
+  String get summaryStageFiles => '正在整理关键文件与代码...';
+
+  @override
+  String get summaryStageErrors => '正在整理错误与修复...';
+
+  @override
+  String get summaryStageInteraction => '正在整理互动与设定...';
+
+  @override
+  String get summaryStageNext => '正在整理下一步...';
+
+  @override
+  String get summaryStageFormatting => '正在调整总结格式...';
 
   @override
   String get chatCompressingHistory => '正在压缩历史记录...';
@@ -183,6 +232,27 @@ class AppLocalizationsZh extends AppLocalizations {
   String get close => '关闭';
 
   @override
+  String get workspaceCloseOtherTabs => '关闭其他';
+
+  @override
+  String get workspaceDockDropTarget => '拖到工作区';
+
+  @override
+  String get workspaceOpenWith => '打开方式';
+
+  @override
+  String get workspaceBuiltInPreview => '内置预览';
+
+  @override
+  String get workspacePluginUnsavedChanges => '请先在编辑器中保存，或放弃未保存的修改。';
+
+  @override
+  String get workspaceCloseTabsToRight => '关闭右侧';
+
+  @override
+  String get workspaceCloseAllTabs => '关闭全部';
+
+  @override
   String get commonExpand => '展开';
 
   @override
@@ -220,12 +290,6 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get toolApprovalAlwaysAllow => '本次会话中始终允许';
-
-  @override
-  String get createGroupTitle => '新建分组';
-
-  @override
-  String get groupNameLabel => '群组名称';
 
   @override
   String get renameConversationTitle => '编辑标题';
@@ -288,6 +352,38 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
+  String get messageLocatorSearchMessages => '搜索消息';
+
+  @override
+  String get messageLocatorViewFavorites => '查看收藏';
+
+  @override
+  String get messageLocatorAll => '全部';
+
+  @override
+  String get messageLocatorFavorites => '收藏';
+
+  @override
+  String get messageLocatorNoFavorites => '还没有收藏的消息';
+
+  @override
+  String get messageLocatorLoadFailed => '暂时无法加载消息，请重试';
+
+  @override
+  String messageTransformFailed(String error) {
+    return '消息显示处理失败：$error';
+  }
+
+  @override
+  String get messageLocatorFavoriteFailed => '收藏更新失败，请重试';
+
+  @override
+  String get messageLocatorAddFavorite => '收藏消息';
+
+  @override
+  String get messageLocatorRemoveFavorite => '取消收藏';
+
+  @override
   String get messageLocatorNoMatches => '没有匹配的消息';
 
   @override
@@ -345,6 +441,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get hiddenUserMessage => '隐藏的用户消息';
 
   @override
+  String get autoTriggeredUserMessage => '自动触发';
+
+  @override
   String get workspaceSetupTitle => '设置工作区';
 
   @override
@@ -382,6 +481,22 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get workspaceProjectTypeDialogDescription => '请选择要创建的默认工作区类型';
+
+  @override
+  String get workspaceUnbindTitle => '从当前对话移除项目';
+
+  @override
+  String get workspaceUnbindDescription => '解除当前会话的关联，保留工作区文件';
+
+  @override
+  String get workspaceUnbindConfirmation =>
+      '确定解除当前会话与工作区的绑定吗？工作区和文件都会保留，不影响其他会话，之后可以重新绑定工作区。';
+
+  @override
+  String get workspaceUnbindFailed => '解除绑定失败，请重试。';
+
+  @override
+  String get workspaceUnbindChanged => '当前会话或工作区已切换，请取消后重试。';
 
   @override
   String get workspaceBindDialogTitle => '选择已有工作区';
@@ -518,7 +633,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String desktopWidgetsCount(int count) {
-    return '桌面组件 $count';
+    return '桌面小部件 $count';
   }
 
   @override
@@ -559,6 +674,26 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get environmentVariables => '环境变量';
+
+  @override
+  String get packageConfigureEnvironmentVariables => '配置环境变量';
+
+  @override
+  String get packageNoEnvironmentVariables => '当前已启用的工具包没有声明需要的环境变量。';
+
+  @override
+  String get packageEnvironmentOptional => '可选';
+
+  @override
+  String get packageEnvironmentInputRequired => '输入值（必需）';
+
+  @override
+  String get packageEnvironmentInputOptional => '输入值（可选）';
+
+  @override
+  String packageEnvironmentDefault(String value) {
+    return '默认: $value';
+  }
 
   @override
   String get required => '必填';
@@ -657,6 +792,12 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get openFile => '打开文件';
+
+  @override
+  String get workspaceFileOpening => '正在打开文件…';
+
+  @override
+  String get workspaceFileOpenTimedOut => '打开文件超时，请重试。';
 
   @override
   String get openLocation => '打开位置';
@@ -869,30 +1010,10 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsCategoryLocalModelsTitle => '本地模型';
 
   @override
-  String get settingsCategoryLocalModelsSubtitle => '下载、引擎、STT / TTS';
+  String get settingsCategoryLocalModelsSubtitle => 'LLM、下载、STT / TTS';
 
   @override
   String get settingsCategoryLocalModelsDescription => '管理按需安装的本地模型和推理引擎。';
-
-  @override
-  String get settingsCategoryCharactersTitle => '角色';
-
-  @override
-  String get settingsCategoryCharactersSubtitle => '角色卡、群组、绑定';
-
-  @override
-  String get settingsCategoryCharactersDescription =>
-      '管理角色卡、群组、当前激活角色和角色级模型/记忆/工具绑定。';
-
-  @override
-  String get settingsCategoryMemoryTitle => '记忆';
-
-  @override
-  String get settingsCategoryMemorySubtitle => '记忆图谱、共享记忆库、用户资料';
-
-  @override
-  String get settingsCategoryMemoryDescription =>
-      '管理角色与共享记忆库、记忆图谱可视化、用户资料与自动更新策略。';
 
   @override
   String get settingsCategoryToolsTitle => '工具与权限';
@@ -921,7 +1042,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsCategoryGlobalBehaviorSubtitle => '输入处理与交互';
 
   @override
-  String get settingsCategoryGlobalBehaviorDescription => '设置不随角色卡变化的输入与交互行为。';
+  String get settingsCategoryGlobalBehaviorDescription => '设置应用全局的输入与交互行为。';
 
   @override
   String get settingsCategoryAppearanceTitle => '外观与交互';
@@ -937,10 +1058,16 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsCategoryDataTitle => '数据与备份';
 
   @override
-  String get settingsCategoryDataSubtitle => '备份、恢复、统计';
+  String get settingsCategoryDataSubtitle => '备份、恢复、存储';
 
   @override
-  String get settingsCategoryDataDescription => '备份聊天、角色和模型配置，恢复备份内容，并查看数据统计。';
+  String get settingsCategoryDataDescription => '备份和恢复聊天、插件数据及模型配置，并管理存储位置。';
+
+  @override
+  String get settingsUsageReportTitle => 'Token 用量报告';
+
+  @override
+  String get settingsUsageReportSubtitle => '模型用量、缓存与费用';
 
   @override
   String get settingsCategoryAccessLinksTitle => '设备空间';
@@ -978,7 +1105,7 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
-  String get settingsComingSoon => '这个区域会继续接入现有 runtime 能力。当前优先完成模型、角色和工具设置。';
+  String get settingsComingSoon => '这个区域会继续接入现有 runtime 能力。当前优先完成模型和工具设置。';
 
   @override
   String get settingsAdvanced => '高级设置';
@@ -1011,12 +1138,6 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsModelSetCurrentActive => '设为当前';
-
-  @override
-  String get settingsChatThinkingMode => '思考模式';
-
-  @override
-  String get settingsChatThinkingModeDescription => '让支持的模型输出更稳的推理过程。';
 
   @override
   String get settingsChatStreamOutput => '流式输出';
@@ -1112,9 +1233,6 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsTtsCurrentConfigCannotDelete => '当前正在使用的 TTS 配置不能删除';
-
-  @override
-  String get settingsTtsConfigUsedByCharacter => '该 TTS 配置正在被角色卡使用，不能删除';
 
   @override
   String get settingsModelChatAutoGlmWarning =>
@@ -1220,6 +1338,12 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelApiKey => 'API Key';
 
   @override
+  String get settingsModelShowApiKey => '显示 API Key';
+
+  @override
+  String get settingsModelHideApiKey => '隐藏 API Key';
+
+  @override
   String get settingsModelCodexLogin => 'ChatGPT 登录';
 
   @override
@@ -1266,7 +1390,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyPoolDescription =>
-      '给同一个模型配置准备多个 Key，用于多 Key 轮换。';
+      '持续使用健康的 Key；遇到鉴权、额度、限流或临时故障时切换，并跳过冷却中的 Key。';
 
   @override
   String settingsModelApiKeyPoolCount(int count) {
@@ -1274,7 +1398,7 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
-  String get settingsModelApiKeyPoolEmpty => '还没有 Key。添加后，运行时会按当前配置使用 Key 池。';
+  String get settingsModelApiKeyPoolEmpty => 'Key 池为空，请添加 Key 后再启用。';
 
   @override
   String get settingsModelAddApiKey => '添加 Key';
@@ -1287,6 +1411,33 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyEnabled => '启用这个 Key';
+
+  @override
+  String get settingsModelPoolAddSingle => '添加当前单 Key';
+
+  @override
+  String get settingsModelPoolPaste => '每行粘贴一个 Key，可批量添加。';
+
+  @override
+  String get settingsModelPoolNoEligible => '请至少启用一个非空且未标记为不可用的 Key。';
+
+  @override
+  String get settingsModelPoolUntested => '未测试';
+
+  @override
+  String get settingsModelPoolAvailable => '可用';
+
+  @override
+  String get settingsModelPoolUnavailable => '不可用';
+
+  @override
+  String get settingsModelPoolClearMarks => '重置 Key 状态';
+
+  @override
+  String get settingsModelPoolTest => '测试未检测的 Key';
+
+  @override
+  String get settingsModelPoolNeedsModel => '保存供应商并添加模型后，即可测试 Key。';
 
   @override
   String get settingsModelProviderId => '供应商 ID';
@@ -1364,9 +1515,6 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelProviderTypeSiliconflow => '硅基流动';
 
   @override
-  String get settingsModelProviderTypeIflow => '心流';
-
-  @override
   String get settingsModelProviderTypeOpenrouter => 'OpenRouter';
 
   @override
@@ -1411,6 +1559,41 @@ class AppLocalizationsZh extends AppLocalizations {
   String localModelsOperationFailed(Object error) {
     return '本地模型操作失败：$error';
   }
+
+  @override
+  String get localModelsAddModel => '添加模型';
+
+  @override
+  String get localModelsFilterDownloads => '下载任务';
+
+  @override
+  String get localModelsAllTypes => '全部类型';
+
+  @override
+  String get localModelsNoMatches => '没有符合条件的模型';
+
+  @override
+  String get localModelsResetFilters => '重置筛选';
+
+  @override
+  String get localModelsDetails => '模型详情';
+
+  @override
+  String get localModelsMoreActions => '更多操作';
+
+  @override
+  String localModelsResultCount(int count, int total) {
+    return '显示 $count / $total 个模型';
+  }
+
+  @override
+  String get localModelsHubRepositoryTab => '仓库地址';
+
+  @override
+  String get localModelsDownloadFailed => '下载失败';
+
+  @override
+  String get localModelsDownloadPausedLabel => '已暂停';
 
   @override
   String get localModelsCatalog => '模型目录';
@@ -1636,6 +1819,30 @@ class AppLocalizationsZh extends AppLocalizations {
       '没有拉取到的模型。可选择「包含历史」查看目录中的模型 ID。';
 
   @override
+  String get settingsModelUnrecognized => '未识别';
+
+  @override
+  String settingsModelCatalogUpdatedAt(String time) {
+    return '能力和上下文信息来自 models.dev，$time 更新';
+  }
+
+  @override
+  String settingsModelCatalogUpdateFailed(String error) {
+    return '模型信息下载失败：$error';
+  }
+
+  @override
+  String settingsModelCatalogUpdateFailedUsing(String time, String error) {
+    return '模型信息更新失败，暂用 $time 的信息：$error';
+  }
+
+  @override
+  String get settingsModelCatalogBundled => '使用内置模型信息，联网更新成功后自动替换';
+
+  @override
+  String get settingsModelCatalogRetry => '更新';
+
+  @override
   String get settingsModelCustomModel => '自定义模型';
 
   @override
@@ -1705,13 +1912,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelMaxContextLengthInvalid => '请输入大于 0 的最大上下文长度';
 
   @override
-  String get settingsModelSummaryThreshold => '总结 Token 阈值';
-
-  @override
-  String get settingsModelSummaryByMessageCount => '按消息数总结';
-
-  @override
-  String get settingsModelSummaryMessageCount => '总结消息数阈值';
+  String get settingsModelSummaryThreshold => '总结阈值';
 
   @override
   String get settingsModelCustomHeaders => '自定义 Headers';
@@ -1750,7 +1951,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelGoogleSearchDescription => '启用供应商侧搜索能力。';
 
   @override
-  String get settingsModelContext => '上下文窗口';
+  String get settingsModelContext => '上下文';
 
   @override
   String get settingsModelSummary => '自动总结';
@@ -1759,10 +1960,68 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelThinking => '思考';
 
   @override
-  String get settingsModelThinkingOption => '思考档位';
+  String get thinkingLevelLabel => '思考程度';
 
   @override
-  String get settingsModelThinkingRules => '思考规则 JSON';
+  String get thinkingAlwaysOn => '始终思考';
+
+  @override
+  String get thinkingChip => '思考';
+
+  @override
+  String get settingsModelThinkingSourceDeclared => '档位按你的描述';
+
+  @override
+  String get settingsModelThinkingSourceLocalRuntime =>
+      '本地运行：可以开关思考，模型本身不会思考时开关不起作用';
+
+  @override
+  String get settingsModelThinkingUnknown => '目录里没有这个模型的思考信息';
+
+  @override
+  String get settingsModelThinkingNotAdjustable => '当前接口不能调节这个模型的思考';
+
+  @override
+  String get settingsModelThinkingNotSupported => '这个模型不会思考';
+
+  @override
+  String get settingsModelThinkingCarried => '沿用你最近一次设置的档位';
+
+  @override
+  String get settingsModelThinkingDescribe => '手动描述';
+
+  @override
+  String get settingsModelThinkingUseCatalog => '改回目录描述';
+
+  @override
+  String get settingsModelThinkingDescribeTitle => '这个模型怎么思考';
+
+  @override
+  String get settingsModelThinkingKindNone => '不会思考';
+
+  @override
+  String get settingsModelThinkingKindAlways => '总是思考，不能调节';
+
+  @override
+  String get settingsModelThinkingKindSwitch => '只能开关';
+
+  @override
+  String get settingsModelThinkingKindLevels => '分档位';
+
+  @override
+  String get settingsModelThinkingKindBudget => '按 token 预算';
+
+  @override
+  String get settingsModelThinkingCanTurnOff => '可以关闭思考';
+
+  @override
+  String get settingsModelThinkingBudgetMin => '最少 token';
+
+  @override
+  String get settingsModelThinkingBudgetMax => '最多 token';
+
+  @override
+  String get settingsModelThinkingLevelsRequired => '至少选一个档位';
 
   @override
   String get settingsModelMediaHistory => '媒体历史';
@@ -1777,13 +2036,117 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelBuiltinToolExclusive => '开启后会关闭外部工具调用';
 
   @override
-  String get settingsModelConnectionTestSection => '连接测试';
-
-  @override
   String get settingsModelRunConnectionTest => '测试当前模型';
 
   @override
-  String get settingsModelTestModel => '测试模型';
+  String get settingsModelTestModel => '测试';
+
+  @override
+  String get settingsModelCapabilityToolCall => '工具调用';
+
+  @override
+  String get settingsModelCapabilityImage => '图片';
+
+  @override
+  String get settingsModelCapabilityAudio => '音频';
+
+  @override
+  String get settingsModelCapabilityVideo => '视频';
+
+  @override
+  String get settingsModelClaudeCache => 'Claude 1 小时缓存';
+
+  @override
+  String get settingsModelClaudeCacheDescription =>
+      '为显式缓存断点设置 1 小时 TTL；关闭时使用默认 TTL。';
+
+  @override
+  String get settingsModelSummaryThresholdDescription =>
+      '上下文占用达到这个比例时自动总结，填 0 关闭。';
+
+  @override
+  String get settingsModelMoreActions => '更多操作';
+
+  @override
+  String get settingsModelRestoreDefaults => '恢复默认值';
+
+  @override
+  String get settingsModelDescribeThinking => '手动描述思考档位';
+
+  @override
+  String get settingsModelDeleteModel => '删除模型';
+
+  @override
+  String settingsModelSaveFailed(String error) {
+    return '保存失败：$error';
+  }
+
+  @override
+  String get settingsModelTestAll => '测试全部';
+
+  @override
+  String settingsModelTestProgress(int done, int total) {
+    return '测试中 $done/$total';
+  }
+
+  @override
+  String settingsModelTestSummary(int passed, int failed) {
+    return '$passed 个通过，$failed 个失败';
+  }
+
+  @override
+  String settingsModelTestSummaryWithRestricted(
+    int passed,
+    int failed,
+    int restricted,
+  ) {
+    return '$passed 个通过，$failed 个失败，$restricted 个受限';
+  }
+
+  @override
+  String settingsModelTestAllPassed(int count) {
+    return '$count 个全部通过';
+  }
+
+  @override
+  String get settingsModelTestCouldNotRun => '测试没能运行';
+
+  @override
+  String get settingsModelCopyError => '复制错误信息';
+
+  @override
+  String get settingsModelSelect => '多选';
+
+  @override
+  String get settingsModelCheckAll => '全选';
+
+  @override
+  String settingsModelCheckedCount(int count) {
+    return '已选 $count 个';
+  }
+
+  @override
+  String settingsModelDeleteModelsTitle(int count) {
+    return '删除 $count 个模型？';
+  }
+
+  @override
+  String get settingsModelDeleteModelsMessage => '这些模型的设置会一起删除。';
+
+  @override
+  String settingsModelDeleteModelsKept(int count, String names) {
+    return '$count 个正在被功能使用，会保留：$names';
+  }
+
+  @override
+  String settingsModelDeleteModelsBlocked(String functions) {
+    return '所选模型正在被这些功能使用，请先更改功能模型分配：$functions';
+  }
+
+  @override
+  String settingsModelDeletedCount(int count) {
+    return '已删除 $count 个模型';
+  }
 
   @override
   String get settingsModelTestingConnection => '正在测试当前模型连接…';
@@ -1796,6 +2159,15 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsModelConnectionTestFailed => '存在失败项';
+
+  @override
+  String get settingsModelConnectionTestRestricted => '检测受限';
+
+  @override
+  String get settingsModelTestCreditRestricted => '账户额度或输出预算受限';
+
+  @override
+  String get settingsModelTestRateRestricted => '上游限流或冷却中';
 
   @override
   String get settingsModelCapabilitiesApplied => '已按测试结果更新模型能力开关。';
@@ -1825,286 +2197,6 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsModelTestItemUnknown => '未知项';
-
-  @override
-  String get settingsCharactersCreateCard => '新建角色卡';
-
-  @override
-  String get settingsCharactersEditCard => '编辑角色卡';
-
-  @override
-  String get settingsCharactersCardName => '角色名称';
-
-  @override
-  String get settingsCharactersCreateGroup => '新建群组';
-
-  @override
-  String get settingsCharactersEditGroup => '编辑群组';
-
-  @override
-  String get settingsCharactersGroupName => '群组名称';
-
-  @override
-  String get settingsCharactersDescription => '描述';
-
-  @override
-  String get settingsCharactersCharacterSetting => '角色设定';
-
-  @override
-  String get settingsCharactersOpeningStatement => '开场白';
-
-  @override
-  String get settingsCharactersOtherContentChat => '聊天附加内容';
-
-  @override
-  String get settingsCharactersOtherContentVoice => '语音附加内容';
-
-  @override
-  String get settingsCharactersAdvancedPrompt => '高级自定义 Prompt';
-
-  @override
-  String get settingsCharactersMarks => '备注';
-
-  @override
-  String get settingsCharactersTags => '标签';
-
-  @override
-  String get settingsCharactersNoTags => '当前没有可选标签。可在标签管理中创建后绑定到角色卡。';
-
-  @override
-  String get settingsCharactersImport => '导入';
-
-  @override
-  String get settingsCharactersExport => '导出';
-
-  @override
-  String get settingsCharactersImportJson => '导入 JSON';
-
-  @override
-  String get settingsCharactersExportJson => '导出 JSON';
-
-  @override
-  String get settingsCharactersImportTavernJson => '导入 Tavern JSON';
-
-  @override
-  String get settingsCharactersExportTavernJson => '导出 Tavern JSON';
-
-  @override
-  String get settingsCharactersImportCardJson => '导入角色卡 JSON';
-
-  @override
-  String get settingsCharactersImportCardJsonDone => '已导入角色卡。';
-
-  @override
-  String get settingsCharactersImportTavernJsonDone => '已导入 Tavern 角色卡。';
-
-  @override
-  String get settingsCharactersImportGroupJson => '导入群组 JSON';
-
-  @override
-  String get settingsCharactersImportGroupJsonDone => '已导入群组。';
-
-  @override
-  String settingsCharactersImportJsonError(String error) {
-    return '导入 JSON 失败：$error';
-  }
-
-  @override
-  String settingsCharactersImportTavernJsonError(String error) {
-    return '导入 Tavern JSON 失败：$error';
-  }
-
-  @override
-  String settingsCharactersExportJsonError(String error) {
-    return '导出 JSON 失败：$error';
-  }
-
-  @override
-  String settingsCharactersExportTavernJsonError(String error) {
-    return '导出 Tavern JSON 失败：$error';
-  }
-
-  @override
-  String get settingsCharactersTagsSection => '标签';
-
-  @override
-  String get settingsCharactersManageTags => '管理标签';
-
-  @override
-  String get settingsCharactersCreateTag => '新建标签';
-
-  @override
-  String get settingsCharactersEditTag => '编辑标签';
-
-  @override
-  String get settingsCharactersDeleteTag => '删除标签';
-
-  @override
-  String settingsCharactersDeleteTagMessage(String name) {
-    return '确定删除“$name”吗？';
-  }
-
-  @override
-  String get settingsCharactersTagName => '标签名称';
-
-  @override
-  String get settingsCharactersTagDescription => '标签描述';
-
-  @override
-  String get settingsCharactersTagPromptContent => 'Prompt 内容';
-
-  @override
-  String get settingsCharactersChatModelBindingMode => '聊天模型绑定模式';
-
-  @override
-  String get settingsCharactersChatModelConfigId => '聊天模型配置 ID';
-
-  @override
-  String get settingsCharactersChatModelIndex => '聊天模型序号';
-
-  @override
-  String get settingsCharactersToolAccess => '工具权限模式';
-
-  @override
-  String get settingsCharactersChatModelFollowGlobal => '跟随全局模型';
-
-  @override
-  String get settingsCharactersChatModelFixedConfig => '固定模型配置';
-
-  @override
-  String get settingsCharactersChatModelConfig => '模型配置';
-
-  @override
-  String get settingsCharactersToolAccessFollowGlobal => '跟随全局工具权限';
-
-  @override
-  String get settingsCharactersToolAccessCustom => '自定义角色工具权限';
-
-  @override
-  String get settingsCharactersToolAccessEmpty => '已启用，但未选择任何工具';
-
-  @override
-  String settingsCharactersToolAccessSummaryCounts(
-    int builtinCount,
-    int packageCount,
-    int skillCount,
-    int mcpCount,
-  ) {
-    return '内置 $builtinCount · 工具包 $packageCount · 技能 $skillCount · MCP $mcpCount';
-  }
-
-  @override
-  String get settingsCharactersToolAccessConfigure => '配置工具白名单';
-
-  @override
-  String get settingsCharactersToolAccessTitle => '自定义允许使用的工具';
-
-  @override
-  String get settingsCharactersToolAccessTabBuiltin => '内建工具';
-
-  @override
-  String get settingsCharactersToolAccessTabPackage => '包';
-
-  @override
-  String get settingsCharactersToolAccessTabSkill => 'Skill';
-
-  @override
-  String get settingsCharactersToolAccessTabMcp => 'MCP';
-
-  @override
-  String get settingsCharactersToolAccessSearchPlaceholder => '搜索名称、描述或标识';
-
-  @override
-  String get settingsCharactersToolAccessEmptySearch => '未找到匹配的工具';
-
-  @override
-  String get settingsCharactersToolAccessRequiresUsePackage =>
-      '选择工具包、技能或 MCP 时，需要同时允许内置工具 use_package。';
-
-  @override
-  String get settingsCharactersToolAccessEmptyBuiltin => '当前没有可配置的内建工具';
-
-  @override
-  String get settingsCharactersToolAccessEmptyPackages => '当前没有全局可用的包';
-
-  @override
-  String get settingsCharactersToolAccessEmptySkills => '当前没有对 AI 可见的 Skill';
-
-  @override
-  String get settingsCharactersToolAccessEmptyMcp => '当前没有已启用的 MCP 服务器';
-
-  @override
-  String get settingsCharactersBuiltinTools => '允许的内置工具';
-
-  @override
-  String get settingsCharactersAllowedPackages => '允许的工具包';
-
-  @override
-  String get settingsCharactersAllowedSkills => '允许的技能';
-
-  @override
-  String get settingsCharactersAllowedMcpServers => '允许的 MCP 服务';
-
-  @override
-  String get settingsCharactersGroupMembersTitle => '组内角色';
-
-  @override
-  String get settingsCharactersOpenMemoryGraph => '查看记忆图谱';
-
-  @override
-  String settingsCharactersMemoryGraphTitle(String profileName) {
-    return '$profileName 的记忆图谱';
-  }
-
-  @override
-  String get settingsCharactersMemoryGraphEmpty => '当前记忆库还没有节点';
-
-  @override
-  String settingsCharactersMemoryGraphStats(int nodes, int edges) {
-    return '$nodes 个节点 · $edges 条关系';
-  }
-
-  @override
-  String get settingsCharactersMemoryGraphLink => '记忆关系';
-
-  @override
-  String get settingsCharactersEditUserMarkdown => '编辑用户资料';
-
-  @override
-  String settingsCharactersUserMarkdownTitle(String profileName) {
-    return '$profileName 的用户资料';
-  }
-
-  @override
-  String get settingsCharactersUserMarkdownSaved => '用户资料已保存';
-
-  @override
-  String get settingsCharactersUserMarkdownContent => '用户资料内容';
-
-  @override
-  String get settingsCharactersMemoryAutoUpdate => '自动更新记忆库';
-
-  @override
-  String get settingsCharactersMemoryAutoUpdateDescription =>
-      '允许 AI 从对话中整理信息并写入记忆库。';
-
-  @override
-  String get settingsCharactersPreferenceDescription => '向模型提供用户资料';
-
-  @override
-  String get settingsCharactersPreferenceDescriptionSubtitle =>
-      '聊天时把当前用户资料写入提示词。';
-
-  @override
-  String get settingsCharactersCardsSection => '角色卡';
-
-  @override
-  String get settingsCharactersGroupsSection => '群组';
-
-  @override
-  String settingsCharactersGroupMembers(int count) {
-    return '$count 个成员';
-  }
 
   @override
   String get settingsToolsPermissionMode => 'AI 能力模式';
@@ -2413,6 +2505,12 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeRenameSpace => '重命名设备空间';
 
   @override
+  String get settingsRuntimeResetTransactions => '重置事务';
+
+  @override
+  String get settingsRuntimeResetTransactionsDone => '已按本机当前内容重建同步事务';
+
+  @override
   String get settingsRuntimeLeaveSpace => '退出设备空间';
 
   @override
@@ -2485,9 +2583,6 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeDiscoveredEdges => 'ESP32 设备';
 
   @override
-  String get settingsRuntimeEdgeEndpointTokenRequired => 'Edge 地址和 Token 不能为空';
-
-  @override
   String get settingsRuntimeEdgeEndpointRequired => 'Edge 地址不能为空';
 
   @override
@@ -2500,9 +2595,6 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeConnectionInitiatedByOtherDevice => '连接由对方设备发起';
 
   @override
-  String get settingsRuntimePairToken => '连接 Token';
-
-  @override
   String get settingsRuntimePairCode => '配对码';
 
   @override
@@ -2513,6 +2605,16 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsRuntimeBaseUrl => '设备地址';
+
+  @override
+  String get settingsRuntimeTcpAddressHint => 'host:端口，例如 192.168.1.10:37195';
+
+  @override
+  String get settingsRuntimeTransportAuto => '自动（推荐）';
+
+  @override
+  String get settingsRuntimeTransportAutoHint =>
+      '输入 IP:端口，自动识别 HTTP/WebSocket/TCP 协议';
 
   @override
   String settingsRuntimeConnectionFailed(String error) {
@@ -2587,7 +2689,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsRuntimeWebPairDescription =>
-      '输入其他设备的地址和配对令牌，让此浏览器作为主动配对方连接。';
+      '输入其他设备的地址并确认配对码，让此浏览器作为主动配对方连接。';
 
   @override
   String settingsRuntimeDiscoveredSpaceSummary(
@@ -2746,22 +2848,6 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsAppearanceThemeMode => '当前模式';
 
   @override
-  String get settingsAppearanceThemeTarget => '主题保存目标';
-
-  @override
-  String get settingsAppearanceThemeTargetGlobal => '全局';
-
-  @override
-  String settingsAppearanceThemeTargetCharacter(Object name) {
-    return '当前角色：$name';
-  }
-
-  @override
-  String settingsAppearanceThemeTargetGroup(Object name) {
-    return '当前群组：$name';
-  }
-
-  @override
   String get settingsAppearanceThemeSystem => '跟随系统';
 
   @override
@@ -2893,6 +2979,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsAppearanceFontMonospace => '等宽';
 
   @override
+  String get settingsAppearanceInterfaceScale => '界面缩放';
+
+  @override
   String get settingsAppearanceFontScale => '字体大小';
 
   @override
@@ -2932,7 +3021,10 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsAppearanceChatDisplaySection => '聊天显示';
 
   @override
-  String get settingsAppearanceMessageStyle => '消息样式';
+  String get settingsAppearanceUserMessageStyle => '用户消息样式';
+
+  @override
+  String get settingsAppearanceAiMessageStyle => 'AI 消息样式';
 
   @override
   String get settingsAppearanceMessageStyleClean => '命令式';
@@ -3034,10 +3126,33 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsAppearanceBubbleImageAdjustAi => '调整 AI 气泡图片';
 
   @override
-  String get settingsAppearanceBubbleImagePreview => '预览';
+  String get settingsAppearanceBubbleImagePreview => '实时预览';
 
   @override
-  String get settingsAppearanceBubbleImagePreviewText => '这是一条气泡预览，切线展示九宫格区域';
+  String get settingsAppearanceBubbleImagePreviewText =>
+      '这是一条气泡预览消息。\n可以查看边角和中间区域的实际效果。';
+
+  @override
+  String get settingsAppearanceBubbleImageSource => '原图';
+
+  @override
+  String get settingsAppearanceBubbleImageSourceHint =>
+      '原图 · 白框为裁切边界，蓝线分出九宫格；可双指缩放、拖动查看';
+
+  @override
+  String get settingsAppearanceBubbleImageFitSource => '完整显示原图';
+
+  @override
+  String get settingsAppearanceBubbleImageGrid => '九宫格';
+
+  @override
+  String get settingsAppearanceBubbleImageGridHint =>
+      '两横两竖分出九块：四角保留，上下边横向重复、左右边纵向重复，中间双向重复；拉伸模式则拉伸对应区域。起点和终点相对于裁切后的图片。';
+
+  @override
+  String settingsAppearanceBubbleImageImportFailed(String error) {
+    return '气泡图片没有生效：$error';
+  }
 
   @override
   String get settingsAppearanceBubbleImageCrop => '裁切';
@@ -3097,7 +3212,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsAppearanceShowThinkingProcess => '显示思考过程';
 
   @override
-  String get settingsAppearanceShowRoleName => '显示角色名';
+  String get settingsAppearanceShowRoleName => '显示自定义回复者名称';
 
   @override
   String get settingsAppearanceShowUserName => '显示用户名';
@@ -3170,6 +3285,34 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsAppearanceLivePreviewThinkingSample => '正在分析上下文与日程优先级...';
 
   @override
+  String get settingsDataLogsSection => '诊断日志';
+
+  @override
+  String get settingsDataLogsDescription =>
+      '将当前连接的 Core 与本客户端的日志按时间合并为一个 .log 文件，并标记 [CORE] / [CLIENT]。日志可能包含敏感信息，分享前请检查。';
+
+  @override
+  String get settingsDataExportLogs => '导出诊断日志';
+
+  @override
+  String get settingsDataLogsExporting => '正在导出日志…';
+
+  @override
+  String settingsDataLogsExportError(String error) {
+    return '日志导出失败：$error';
+  }
+
+  @override
+  String settingsDataLogsExportPartial(String path) {
+    return '已保存至 $path。部分日志读取失败，请查看文件中的警告。';
+  }
+
+  @override
+  String settingsDataOverviewLoadError(String error) {
+    return '数据概览加载失败：$error。仍可导出诊断日志。';
+  }
+
+  @override
   String get settingsDataRuntimeSection => '数据概览';
 
   @override
@@ -3198,6 +3341,19 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsDataStorageRootsRequired => '运行时目录和工作区目录都不能为空。';
 
   @override
+  String get storageDirectoryTermuxUnsupported =>
+      '不支持将 Termux 文档提供器中的目录用作本地存储路径。请选择共享存储中的目录（如 Download 或 Documents），而不是 Termux 私有目录。';
+
+  @override
+  String get storageDirectoryProviderUnsupported =>
+      '无法将所选目录解析为支持的本地存储路径。请选择共享存储中的目录（如 Download 或 Documents），或手动输入本应用有权限访问的本地路径。';
+
+  @override
+  String storageDirectorySelectionFailed(String error) {
+    return '选择目录失败：$error';
+  }
+
+  @override
   String get settingsDataStorageConfirmTitle => '更改储存路径';
 
   @override
@@ -3216,29 +3372,17 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
-  String get settingsDataTokenSection => '使用统计';
-
-  @override
   String get settingsDataInputTokens => '输入';
 
   @override
   String get settingsDataOutputTokens => '输出';
 
   @override
-  String get settingsDataOpenDetailedStats => '查看详细统计';
-
-  @override
-  String get settingsDataOpenDetailedStatsDescription =>
-      '打开每日趋势、输入输出 Token 变化、使用热力图，以及按供应商、模型、功能模型分类的使用明细。';
-
-  @override
-  String get settingsDataRefreshTokenStats => '刷新统计';
-
-  @override
   String get settingsDataResetTokenStats => '重置统计';
 
   @override
-  String get settingsDataDetailedStatsTitle => '详细统计';
+  String get settingsUsageReportResetConfirmation =>
+      '这将永久删除所有已保存的模型用量记录，聊天记录会保留。';
 
   @override
   String get settingsDataDetailedStatsDescription => '统计基于独立保存的模型请求明细计算。';
@@ -3302,9 +3446,6 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsDataDetailedStatsSourceTitleGeneration => '标题生成';
-
-  @override
-  String get settingsDataDetailedStatsSourceMemory => '记忆分析';
 
   @override
   String get settingsDataDetailedStatsTotalRequests => '总请求数';
@@ -3438,20 +3579,6 @@ class AppLocalizationsZh extends AppLocalizations {
       '备份全部聊天和消息；恢复时按聊天 ID 更新或新增。';
 
   @override
-  String get settingsDataCharacterCardsBackup => '角色卡数据';
-
-  @override
-  String get settingsDataCharacterCardsBackupDescription =>
-      '备份全部角色卡和已引用标签；恢复时按原 ID 更新或新增。';
-
-  @override
-  String get settingsDataCharacterGroupsBackup => '群组数据';
-
-  @override
-  String get settingsDataCharacterGroupsBackupDescription =>
-      '备份全部群组；恢复时保留组内角色引用和顺序。';
-
-  @override
   String get settingsDataModelConfigsBackup => '模型配置';
 
   @override
@@ -3492,14 +3619,87 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsDataSnapshotBackupTitle => '完整快照';
 
   @override
-  String get settingsDataExportRawSnapshot => '导出快照';
+  String get settingsDataExportRawSnapshot => '导出完整快照';
 
   @override
-  String get settingsDataImportRawSnapshot => '恢复快照';
+  String get settingsDataImportRawSnapshot => '恢复完整快照';
 
   @override
   String get settingsDataExportRawSnapshotDescription =>
-      '把聊天、角色、模型设置和本地文件打包成一个备份文件。恢复时会用备份里的数据覆盖当前数据。';
+      '将聊天、插件数据、模型设置和本地文件打包为 .opsnapshot 文件。';
+
+  @override
+  String get settingsDataDatabaseBackup => '数据库备份';
+
+  @override
+  String get settingsDataDatabaseBackupDescription =>
+      '每天保存一份数据库文件，保留最近 10 份自动备份。附件和工作区文件单独存放。';
+
+  @override
+  String get settingsDataBackupScheduled => '每日备份已开启';
+
+  @override
+  String get settingsDataBackupUnavailable => '请选择可用的文件夹以开启每日备份';
+
+  @override
+  String get settingsDataBackupNow => '立即备份';
+
+  @override
+  String get settingsDataBackupSaved => '数据库备份已保存。';
+
+  @override
+  String get settingsDataRecoverySection => '恢复数据';
+
+  @override
+  String get settingsDataRestoreDatabaseDescription =>
+      '从备份目录按日期选择一份数据库，恢复后以这份数据为准同步到其他设备。';
+
+  @override
+  String get settingsDataRestoreArchiveDescription =>
+      '用 Operit2 的完整快照替换当前运行数据，恢复后会重启应用。';
+
+  @override
+  String get settingsDataImportSection => '导入数据';
+
+  @override
+  String get settingsDataImportOperit1Description =>
+      '选择 Operit1 快照，预览后迁移聊天、模型配置和资源。';
+
+  @override
+  String get settingsDataImportChatJson => '导入聊天 JSON';
+
+  @override
+  String get settingsDataImportChatJsonDescription => '新增聊天，已有相同 ID 的聊天会更新。';
+
+  @override
+  String get settingsDataImportModelJson => '导入模型配置 JSON';
+
+  @override
+  String get settingsDataImportModelJsonDescription =>
+      '新增模型服务商配置，已有相同 ID 的配置会更新。';
+
+  @override
+  String get settingsDataImportAction => '确认导入';
+
+  @override
+  String get settingsDataReadingSnapshot => '正在读取快照';
+
+  @override
+  String get settingsDataPreparingPreview => '正在生成预览';
+
+  @override
+  String settingsDataOperit1ImportResult(int chatCount, int messageCount) {
+    return '已导入 $chatCount 个聊天、$messageCount 条消息。';
+  }
+
+  @override
+  String get settingsDataExportSection => '导出文件';
+
+  @override
+  String get settingsDataExportChatJson => '导出聊天 JSON';
+
+  @override
+  String get settingsDataExportModelJson => '导出模型配置 JSON';
 
   @override
   String settingsDataSnapshotBytes(int bytes) {
@@ -3572,7 +3772,10 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeNetworkControl => '网络控制';
 
   @override
-  String get settingsRuntimeNetworkControlDescription => '角色、身份、设备权限与审计';
+  String get settingsRuntimeNetworkControlDescription => '管理设备身份与权限，查看操作记录';
+
+  @override
+  String get settingsRuntimeIdentitiesAndPermissions => '身份与权限';
 
   @override
   String get settingsRuntimeControlInitialize => '初始化控制';
@@ -3584,10 +3787,34 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlIdentities => '身份';
 
   @override
-  String get settingsRuntimeControlAudit => '审计';
+  String get settingsRuntimeControlAuditAccepted => '已执行';
 
   @override
-  String get settingsRuntimeControlAddRole => '添加角色';
+  String get settingsRuntimeControlAuditRejected => '已拒绝';
+
+  @override
+  String get settingsRuntimeControlAuditIssuer => '操作设备';
+
+  @override
+  String get settingsRuntimeControlAuditDetails => '技术详情';
+
+  @override
+  String get settingsRuntimeControlAuditBootstrap => '初始化空间权限';
+
+  @override
+  String get settingsRuntimeControlAuditAdmit => '接纳设备';
+
+  @override
+  String get settingsRuntimeControlAuditMerge => '合并设备空间';
+
+  @override
+  String get settingsRuntimeControlAuditPolicy => '更新权限策略';
+
+  @override
+  String get settingsRuntimeControlAudit => '操作记录';
+
+  @override
+  String get settingsRuntimeControlAddRole => '新建身份';
 
   @override
   String get settingsRuntimeControlGrantRole => '授予角色';
@@ -3599,10 +3826,10 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlBindDevice => '绑定设备';
 
   @override
-  String get settingsRuntimeControlRoleName => '角色名称';
+  String get settingsRuntimeControlRoleName => '身份名称';
 
   @override
-  String get settingsRuntimeControlCapabilities => '这个角色可以做什么';
+  String get settingsRuntimeControlCapabilities => '允许这个身份执行的操作';
 
   @override
   String get settingsRuntimeControlManagedDevices => '这个角色可以管理哪些设备（不选表示全部）';
@@ -3611,13 +3838,15 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlIdentityName => '身份名称';
 
   @override
-  String get settingsRuntimeControlDevice => '设备';
-
-  @override
   String get settingsRuntimeControlDeviceId => '设备 ID';
 
   @override
-  String get settingsRuntimeControlNoAudit => '暂无控制命令记录';
+  String get settingsRuntimeControlNoAudit => '暂无操作记录，身份和设备的变更会显示在这里';
+
+  @override
+  String settingsRuntimeControlAuditCount(int count) {
+    return '$count 条记录';
+  }
 
   @override
   String get settingsRuntimeControlNoBindings => '暂无设备绑定';
@@ -3632,16 +3861,16 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlRemoveDevice => '移除设备';
 
   @override
-  String get settingsRuntimeControlDisconnectDevice => '断开设备';
+  String get settingsRuntimeControlDisconnectDevice => '隔离设备';
 
   @override
   String get settingsRuntimeControlRemoved => '已移除';
 
   @override
-  String get settingsRuntimeControlDisconnected => '已断开';
+  String get settingsRuntimeControlDisconnected => '已隔离';
 
   @override
-  String get settingsRuntimeControlAdmitDevice => '重新接纳设备';
+  String get settingsRuntimeControlAdmitDevice => '解除隔离设备';
 
   @override
   String get settingsRuntimeControlAllDevices => '全部设备';
@@ -3650,10 +3879,13 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlManages => '可管理';
 
   @override
+  String get settingsRuntimeControlLocalIdentity => '本机身份';
+
+  @override
   String get settingsRuntimeControlCurrentIdentity => '当前身份';
 
   @override
-  String get settingsRuntimeControlCurrentCapabilities => '当前能力';
+  String get settingsRuntimeControlCurrentCapabilities => '可用权限';
 
   @override
   String get settingsRuntimeControlManageIdentities => '管理身份';
@@ -3662,10 +3894,21 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlAssignIdentity => '设置设备身份';
 
   @override
-  String get settingsRuntimeControlClearIdentity => '清除设备身份';
+  String get settingsRuntimeControlClearIdentity => '重置为默认身份';
 
   @override
-  String get settingsRuntimeControlIdentityDefinitions => '身份定义';
+  String get settingsRuntimeControlDeviceAdmitted => '已解除隔离，等待设备重连';
+
+  @override
+  String get settingsRuntimeControlIdentityResetDone => '身份已重置为默认用户';
+
+  @override
+  String get settingsRuntimeControlIdentityDefinitions => '身份权限';
+
+  @override
+  String settingsRuntimeControlIdentityCount(int count) {
+    return '$count 个身份';
+  }
 
   @override
   String get settingsRuntimeControlIdentityAssignment => '身份分配';
@@ -3689,16 +3932,10 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlCapabilityNetworkRelay => '中继网络流量';
 
   @override
-  String get settingsRuntimeControlCapabilityStorageProvide => '提供存储空间';
+  String get settingsRuntimeControlCapabilityStorageProvide => '保存共享数据副本';
 
   @override
-  String get settingsRuntimeControlCapabilityRuntimeExecute => '执行任务';
-
-  @override
-  String get settingsRuntimeControlCapabilityNetworkUser => '使用网络';
-
-  @override
-  String get settingsRuntimeControlCapabilityChatRead => '读取聊天记录';
+  String get settingsRuntimeControlCapabilityRuntimeExecute => '承载 Core 执行';
 
   @override
   String get settingsRuntimeControlCapabilityViewDevices => '查看设备与当前身份';
@@ -3715,16 +3952,10 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsRuntimeControlRoleAdministrator => '管理员';
 
   @override
-  String get settingsRuntimeControlRoleAuditor => '审计员';
-
-  @override
   String get settingsRuntimeControlRoleRelay => '中继节点';
 
   @override
-  String get settingsRuntimeControlRoleStorage => '存储节点';
-
-  @override
-  String get settingsRuntimeControlRoleRunner => '执行节点';
+  String get settingsRuntimeControlRoleEdge => '边缘节点';
 
   @override
   String get settingsRuntimeControlRoleUser => '普通用户';
@@ -3761,6 +3992,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get pluginLoadingKindPackage => '包';
 
   @override
+  String get pluginLoadingKindPlugin => '插件';
+
+  @override
   String get pluginLoadingKindMcp => 'MCP';
 
   @override
@@ -3790,6 +4024,15 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get chatRouteUnknown => '运行设备状态未知';
+
+  @override
+  String get chatRouteClaimHostPrompt => '当前设备宿主未找到，是否切换为当前设备？';
+
+  @override
+  String get chatRouteClaimHostYes => '是';
+
+  @override
+  String get chatRouteClaimHostNo => '否';
 
   @override
   String edgePairingCodeTitle(String deviceName) {
@@ -3855,7 +4098,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String chatMessageRole(String roleName) {
-    return '角色: $roleName';
+    return '回复者: $roleName';
   }
 
   @override
@@ -3906,5 +4149,972 @@ class AppLocalizationsZh extends AppLocalizations {
   @override
   String chatMessageCacheHitRate(String rate) {
     return '缓存命中率: $rate';
+  }
+
+  @override
+  String get settingsPeerPortModeHelp =>
+      '默认由系统分配可用端口，并通过局域网发现公布。固定模式使用填写的监听地址和端口，端口被占用时会报错。';
+
+  @override
+  String get settingsPeerPortMode => '端口分配方式';
+
+  @override
+  String get settingsPeerPortModeFixed => '固定监听地址和端口';
+
+  @override
+  String get settingsPeerPortModeAutomatic => '自动分配端口';
+
+  @override
+  String get settingsPeerNetworkDiscoveryHelp =>
+      '跨网络发现需要共同的目录地址和组密钥。要由本机提供目录，请留空目录地址并设置组密钥。';
+
+  @override
+  String get settingsPeerDiscoveryDirectory => '发现目录地址（可选）';
+
+  @override
+  String get settingsPeerDiscoveryGroup => '发现组密钥';
+
+  @override
+  String get settingsPeerDiscoveryGenerateKey => '生成新的发现组密钥';
+
+  @override
+  String get settingsPeerDiscoveryCopyKey => '复制发现组密钥';
+
+  @override
+  String get settingsPeerDiscoveryPort => '目录监听端口';
+
+  @override
+  String get settingsPeerDiscoveryPortHelp => '仅目录设备使用此端口；其他设备使用目录地址中的端口。';
+
+  @override
+  String get settingsPeerNetworkDiscoveryInvalid =>
+      '请检查发现设置：目录为不含路径的 HTTP(S) 地址，密钥为 16–128 字节；本机提供目录时，监听端口应为 1–65535。';
+
+  @override
+  String get settingsPeerAdvanced => '高级选项';
+
+  @override
+  String get settingsPeerDiscoveryUnavailable =>
+      '当前 Host 不支持在局域网广播监听服务。支持的协议仍可通过地址直接连接。';
+
+  @override
+  String settingsPeerTransportUnavailable(String transport) {
+    return '当前 Host 不支持 $transport 监听。';
+  }
+
+  @override
+  String get settingsPeerTransportHelp =>
+      '暴露方式（可多选）。HTTP、WebSocket 和 TCP 共用同一个监听端口，可自由组合。蓝牙需要平台支持。关闭发现并取消全部选择可停止监听。修改设置会中断现有连接；仅关闭发现不会关闭直接连接。';
+
+  @override
+  String get settingsPeerBindAddress => '监听 IP 地址';
+
+  @override
+  String get settingsPeerBindAddressHelp => '例如 0.0.0.0，允许局域网访问；也支持 IPv6 地址。';
+
+  @override
+  String get settingsPeerBindPort => '监听端口';
+
+  @override
+  String get settingsPeerBindPortHelp => '固定模式使用此端口监听。';
+
+  @override
+  String get settingsPeerBindPortAutomaticHelp => '由系统分配可用端口；启动后显示实际端口。';
+
+  @override
+  String get settingsPeerDiscoveryNeedsTransport => '开启允许被搜索前，请至少选择一种暴露方式。';
+
+  @override
+  String get settingsPeerAddressRequired => '请输入监听 IP 地址。';
+
+  @override
+  String get settingsPeerPortRequired => '请输入 1 到 65535 之间的端口。';
+
+  @override
+  String get settingsPeerApplied => '监听设置已生效。';
+
+  @override
+  String settingsPeerRestoreFailed(String error) {
+    return '恢复原监听配置失败：$error';
+  }
+
+  @override
+  String get settingsPeerCodeInstructions =>
+      '在另一台设备上输入此验证码以完成配对。验证码五分钟内有效，请勿提供给陌生人。';
+
+  @override
+  String get settingsPeerSixDigitCode => '请输入接收设备上显示的六位配对码。';
+
+  @override
+  String get spaceJoinRequests => '空间加入申请';
+
+  @override
+  String spaceJoinReviewer(String name) {
+    return '审批人：$name';
+  }
+
+  @override
+  String get spaceJoinWaitingReviewer => '等待有审批权限的设备上线';
+
+  @override
+  String get spaceJoinPending => '等待批准';
+
+  @override
+  String get spaceJoinApproving => '正在处理审批结果';
+
+  @override
+  String get spaceJoinApproved => '已批准，正在完成加入';
+
+  @override
+  String get spaceJoinJoined => '已加入';
+
+  @override
+  String get spaceJoinRejected => '已拒绝';
+
+  @override
+  String get spaceJoinCancelled => '已取消';
+
+  @override
+  String get spaceJoinExpired => '已过期';
+
+  @override
+  String get spaceJoinSubmit => '提交申请';
+
+  @override
+  String get spaceJoinApprovalTitle => '空间加入申请';
+
+  @override
+  String spaceJoinApprovalDescription(String name, String space) {
+    return '$name 申请加入「$space」。批准前不会共享空间数据。';
+  }
+
+  @override
+  String get spaceJoinApprove => '批准';
+
+  @override
+  String get spaceJoinReject => '拒绝';
+
+  @override
+  String get spaceJoinRetry => '重新申请';
+
+  @override
+  String get spaceJoinKeepWaiting => '后台等待';
+
+  @override
+  String get spaceJoinCancel => '取消申请';
+
+  @override
+  String get spaceJoinCancelFailed => '未能确认申请已取消，请检查连接或稍后重试。';
+
+  @override
+  String get spaceJoinRefreshingFailed => '暂时无法联系设备。申请已保留，会继续重试。';
+
+  @override
+  String get spaceJoinAssignmentChanged => '该申请已转交或已处理。';
+
+  @override
+  String get spaceJoinProgressTitle => '申请加入空间';
+
+  @override
+  String get spaceJoinSending => '正在提交申请…';
+
+  @override
+  String get spaceJoinSubmitFailed => '申请暂时未能提交，请检查连接后重试。';
+
+  @override
+  String get spaceJoinNoDataYet => '批准前，你当前的空间不会改变。关闭窗口后，申请仍会在后台等待。';
+
+  @override
+  String get deviceSpaceAddDevice => '添加设备';
+
+  @override
+  String get deviceSpaceDevices => '设备';
+
+  @override
+  String get deviceSpaceMemberNotPaired => '空间成员 · 未直连';
+
+  @override
+  String get deviceSpaceMemberPaired => '空间成员 · 已配对';
+
+  @override
+  String get deviceSpacePairedOnly => '已配对';
+
+  @override
+  String get deviceSpaceDirectLink => '直连';
+
+  @override
+  String deviceSpaceRelayHops(int hops) {
+    return '经中继 $hops 跳';
+  }
+
+  @override
+  String get deviceSpaceRelayPath => '路径';
+
+  @override
+  String get deviceSpaceLocalDevice => '本机';
+
+  @override
+  String get deviceSpaceManageDevice => '管理设备';
+
+  @override
+  String get deviceSpaceConnectDirect => '建立直连';
+
+  @override
+  String get deviceSpaceConnectDirectHint =>
+      '该设备已是本空间成员。与它配对成功即建立直连，无需重新加入空间；配对需要对方显示、由你输入六位确认码。';
+
+  @override
+  String get deviceSpaceUpdateEndpoint => '更新直连地址';
+
+  @override
+  String get deviceSpaceUpdateEndpointLabel => '直连地址';
+
+  @override
+  String get deviceSpaceUpdateEndpointHint =>
+      '例如 ws://主机:端口/link 或 主机:端口 —— 填对方当前的监听端口';
+
+  @override
+  String get deviceSpaceUpdateEndpointSaved => '直连地址已更新';
+
+  @override
+  String deviceSpaceDirectLinkEstablished(String device) {
+    return '已建立直连：$device';
+  }
+
+  @override
+  String get deviceSpaceUnpair => '解除配对';
+
+  @override
+  String get deviceSpaceMore => '更多设备操作';
+
+  @override
+  String get deviceSpaceConnectionSettings => '连接设置';
+
+  @override
+  String get deviceSpaceViewRequest => '查看申请';
+
+  @override
+  String get devicePickerNearby => '附近设备';
+
+  @override
+  String devicePickerDiscoveryFailed(String error) {
+    return '附近设备发现失败：$error';
+  }
+
+  @override
+  String get devicePickerEmpty => '暂未发现附近设备';
+
+  @override
+  String get devicePickerHint => '请让两台设备连接同一网络，并在对方设备开启允许被搜索。';
+
+  @override
+  String get devicePickerManual => '通过地址连接';
+
+  @override
+  String get deviceSpaceMyRequests => '我发出的';
+
+  @override
+  String get deviceSpaceMyReviews => '待我审批';
+
+  @override
+  String get deviceSpaceNoRequests => '暂无申请';
+
+  @override
+  String get workspaceUndo => '撤销';
+
+  @override
+  String get workspaceRedo => '重做';
+
+  @override
+  String workspaceInsertSymbol(String symbol) {
+    return '插入 $symbol';
+  }
+
+  @override
+  String get settingsAppearanceThemeConfig => '主题配置';
+
+  @override
+  String get settingsAppearanceThemeConfigCustom => '未绑定的外观';
+
+  @override
+  String get settingsAppearanceThemeConfigCreate => '新建主题配置';
+
+  @override
+  String get settingsAppearanceThemeConfigRename => '重命名主题配置';
+
+  @override
+  String get settingsAppearanceThemeConfigDelete => '删除当前未启用的主题配置';
+
+  @override
+  String get settingsAppearanceThemeConfigName => '主题名称';
+
+  @override
+  String get settingsAppearanceThemeConfigNameRequired => '请输入主题名称';
+
+  @override
+  String get settingsAppearanceThemeConfigCustomHint =>
+      '创建主题保存你的外观。点击卡片切换，点击编辑调整细节。';
+
+  @override
+  String get settingsAppearanceThemeConfigEditingHint =>
+      '点击卡片切换主题；上方明暗切换仅修改当前主题。编辑后自动保存。';
+
+  @override
+  String settingsAppearanceThemeConfigFailed(String detail) {
+    return '主题操作失败：$detail';
+  }
+
+  @override
+  String get settingsRuntimeControlEditRole => '编辑角色';
+
+  @override
+  String get settingsRuntimeControlDeleteRole => '删除角色';
+
+  @override
+  String settingsRuntimeControlDeleteRoleTitle(String roleName) {
+    return '删除角色 $roleName？';
+  }
+
+  @override
+  String get settingsRuntimeControlDeleteRoleMessage =>
+      '持有该角色的设备将回退为默认的普通用户身份。';
+
+  @override
+  String get settingsAppearanceThemeConfigSource => '创建来源';
+
+  @override
+  String get settingsAppearanceThemeConfigFromDefaults => '默认外观';
+
+  @override
+  String get settingsAppearanceThemeConfigFromCurrent => '当前外观';
+
+  @override
+  String settingsAppearanceThemeConfigInherit(String name) {
+    return '继承：$name';
+  }
+
+  @override
+  String settingsAppearanceThemeConfigFromTemplate(String name) {
+    return '模板：$name';
+  }
+
+  @override
+  String get settingsAppearanceThemeConfigDefaultsHint => '从软件默认样式开始';
+
+  @override
+  String get settingsAppearanceThemeConfigCurrentHint => '复制现在的外观设置';
+
+  @override
+  String get settingsAppearanceThemeConfigSavedSources => '继承已有配置';
+
+  @override
+  String get settingsAppearanceThemeConfigPluginSources => '从插件模板新建';
+
+  @override
+  String get settingsAppearanceThemeConfigSourceHint =>
+      '模板来自已安装的插件。新建后可独立编辑，并沿用外观配置同步。';
+
+  @override
+  String get settingsAppearanceLoadFailed => '无法加载外观设置';
+
+  @override
+  String get settingsAppearanceRepairHint =>
+      '已保存的外观没有被替换。修复资源后可以重试，也可以主动重置外观。重置会保留头像和已保存的配置，并切换到自定义外观。';
+
+  @override
+  String settingsAppearanceAssetBackgroundFailed(String reference) {
+    return '背景图片无法加载，已使用默认背景（$reference）。';
+  }
+
+  @override
+  String settingsAppearanceAssetVideoFailed(String reference) {
+    return '背景视频无法播放，已使用默认背景（$reference）。';
+  }
+
+  @override
+  String settingsAppearanceAssetBubbleFailed(String reference) {
+    return '气泡图片无法加载，已使用默认气泡颜色（$reference）。';
+  }
+
+  @override
+  String settingsAppearanceAssetPreviousRetained(String reference) {
+    return '此主题资源无法加载，暂用上一张图片或媒体（$reference），其他主题设置仍有效。';
+  }
+
+  @override
+  String get settingsAppearanceAssetRetry => '重试';
+
+  @override
+  String get settingsAppearanceAssetReimportHint =>
+      '重试后仍无法加载时，请重新选择并导入可读取的图片或可播放的视频。';
+
+  @override
+  String settingsAppearanceAssetImportFailed(String reason) {
+    return '背景资源没有生效：$reason。请选择可读取的图片或可播放的视频。';
+  }
+
+  @override
+  String get settingsAppearanceRetry => '重试';
+
+  @override
+  String get settingsAppearanceResetAfterError => '重置外观';
+
+  @override
+  String get backgroundWorkIdle => '当前没有正在运行的工作';
+
+  @override
+  String get backgroundWorkRunningCount => '项工作正在运行';
+
+  @override
+  String get backgroundWorkWaiting => '等待你确认';
+
+  @override
+  String get backgroundWorkWaitingCount => '项待确认';
+
+  @override
+  String get backgroundWorkCompleted => '已完成';
+
+  @override
+  String get backgroundWorkFailed => '执行失败，打开查看详情';
+
+  @override
+  String get backgroundWorkCancelled => '已停止';
+
+  @override
+  String get backgroundWorkProcessing => '正在准备';
+
+  @override
+  String get backgroundWorkConnecting => '正在连接';
+
+  @override
+  String get backgroundWorkReceiving => '正在生成回复';
+
+  @override
+  String get backgroundWorkTool => '正在执行工具';
+
+  @override
+  String get backgroundWorkToolResult => '正在处理工具结果';
+
+  @override
+  String get backgroundWorkSummarizing => '正在整理上下文';
+
+  @override
+  String get backgroundWorkPlan => '正在执行计划';
+
+  @override
+  String get backgroundWorkOpen => '查看会话';
+
+  @override
+  String get backgroundWorkReview => '查看并确认';
+
+  @override
+  String get backgroundWorkStop => '停止';
+
+  @override
+  String get localModelsDeviceOnly => '保存在此设备';
+
+  @override
+  String get localModelsDeviceOnlyDescription =>
+      '模型权重、下载进度和安装记录仅保存在当前设备，不参与设备空间同步。聊天可通过路由使用安装了模型的设备。';
+
+  @override
+  String get localModelsRunChat => '推理与设置';
+
+  @override
+  String get localModelsUseForChat => '用于聊天';
+
+  @override
+  String get localModelsChatActivated => '已设为聊天模型';
+
+  @override
+  String get localModelsPrompt => '输入提示词';
+
+  @override
+  String get localModelsGenerate => '开始推理';
+
+  @override
+  String get localModelsGenerating => '正在推理…';
+
+  @override
+  String get localModelsThreads => 'CPU 线程数';
+
+  @override
+  String get localModelsContextSize => '上下文长度（token）';
+
+  @override
+  String get localModelsBatchSize => '批次大小';
+
+  @override
+  String get localModelsUnload => '释放模型内存';
+
+  @override
+  String get localModelsCpuBackend => '本机 CPU 推理';
+
+  @override
+  String get localModelsLlmDescription =>
+      '下载 GGUF 模型使用 llama.cpp，或下载 MNN 模型包。安装后可在这里试运行，或设为聊天模型。';
+
+  @override
+  String get localModelsInvalidSettings => '请检查线程数、上下文长度和批次大小。';
+
+  @override
+  String get localModelsFilterAll => '全部模型';
+
+  @override
+  String get localModelsFilterInstalled => '已安装';
+
+  @override
+  String get localModelsSearchCatalog => '搜索模型名称、标签或推理引擎';
+
+  @override
+  String get deviceSpaceSyncPeer => '空间设备';
+
+  @override
+  String deviceSpaceSyncActive(String device) {
+    return '正在与 $device 同步';
+  }
+
+  @override
+  String deviceSpaceSyncCompleted(String device) {
+    return '与 $device 同步完成';
+  }
+
+  @override
+  String get deviceSpaceSyncChecking => '正在检查数据差异';
+
+  @override
+  String get deviceSpaceSyncRecords => '正在交换数据记录';
+
+  @override
+  String deviceSpaceSyncRecordProgress(int completed, int total, int percent) {
+    return '$completed / $total 条 · $percent%';
+  }
+
+  @override
+  String deviceSpaceSyncPendingCount(int count) {
+    return '待应用 $count 条';
+  }
+
+  @override
+  String deviceSpaceSyncCounting(int count) {
+    return '正在统计总量 · 已处理 $count 条';
+  }
+
+  @override
+  String get deviceSpaceSyncFiles => '正在传输并校验文件';
+
+  @override
+  String get deviceSpaceSyncRetrying => '同步暂时中断，稍后自动重试';
+
+  @override
+  String get deviceSpaceSyncPending => '部分数据尚未处理完成';
+
+  @override
+  String deviceSpaceSyncCurrentFile(String done, String total) {
+    return '当前文件：$done / $total';
+  }
+
+  @override
+  String deviceSpaceSyncTransferred(int count, String bytes) {
+    return '已交换 $count 条记录 · 已传输 $bytes';
+  }
+
+  @override
+  String get deviceSpaceSyncBackground => '可以继续使用，同步会在后台完成';
+
+  @override
+  String get runtimeActivityTitle => '后台任务';
+
+  @override
+  String get runtimeActivitySyncing => '正在同步';
+
+  @override
+  String get runtimeActivitySyncCompleted => '同步完成';
+
+  @override
+  String get runtimeActivityWaiting => '等待重试';
+
+  @override
+  String get runtimeActivityExpand => '查看后台任务';
+
+  @override
+  String get runtimeActivityLoadingPackages => '加载扩展';
+
+  @override
+  String get peerQrTitle => '二维码连接';
+
+  @override
+  String get peerQrScan => '扫码连接';
+
+  @override
+  String get peerQrShow => '出示连接码';
+
+  @override
+  String get peerQrShowHint => '让另一台设备扫描此码，连接到这台设备。';
+
+  @override
+  String get peerQrScanHint => '扫描另一台设备的 Operit 连接码。';
+
+  @override
+  String get peerQrTrustHint =>
+      '二维码有效期为 5 分钟，请仅分享给可信设备。对方确认加入后即可连接；本机有管理员审批权限时会自动批准加入。';
+
+  @override
+  String get peerQrConfirmJoin => '确认加入';
+
+  @override
+  String get peerQrConfirmJoinHint => '是否确认加入此设备的空间？确认后将直接连接并提交加入，无需输入配对码。';
+
+  @override
+  String get peerQrListenerRequired => '请先在连接设置中开启接收连接，并连接到可用的网络。';
+
+  @override
+  String get peerQrCopy => '复制连接信息';
+
+  @override
+  String get peerQrCopied => '已复制';
+
+  @override
+  String get peerQrImport => '从图片识别';
+
+  @override
+  String get peerQrPaste => '或粘贴连接信息';
+
+  @override
+  String get peerQrRead => '识别连接信息';
+
+  @override
+  String get peerQrWrongDevice => '此连接码属于其他设备，请扫描当前所选设备的连接码。';
+
+  @override
+  String get peerPairTimeoutHint =>
+      '连接超时：未能与对方设备建立连接。常见原因是对方设备的防火墙拦截了入站连接。可改由对方设备发起连接，或在对方设备的防火墙中放行 Operit（公用网络尤其需要）。';
+
+  @override
+  String get peerQrImageInvalid => '未能从图片中识别二维码。请选择清晰的二维码图片（不超过 16 MB）。';
+
+  @override
+  String get peerQrCameraUnavailable => '此设备暂时无法使用相机扫码，你可以导入二维码图片或粘贴连接信息。';
+
+  @override
+  String get peerQrCameraPermission => '需要相机权限才能扫码。请在系统设置中允许相机访问，也可导入图片。';
+
+  @override
+  String get peerQrDevice => '连接设备';
+
+  @override
+  String get peerQrScanAgain => '重新扫码';
+
+  @override
+  String get peerQrMethodsHint => '发现不到设备？也可以使用连接码。';
+
+  @override
+  String get toolParametersLabel => '参数';
+
+  @override
+  String get toolResultLabel => '执行结果';
+
+  @override
+  String toolGroupThinkingCount(int count) {
+    return '$count 次思考';
+  }
+
+  @override
+  String toolGroupCallCount(int count) {
+    return '$count 次调用';
+  }
+
+  @override
+  String toolGroupSearchCount(int count) {
+    return '$count 次搜索';
+  }
+
+  @override
+  String toolEditedFileCount(int count) {
+    return '已编辑 $count 个文件';
+  }
+
+  @override
+  String get toolViewChanges => '查看变更';
+
+  @override
+  String toolViewFileDiff(String fileName) {
+    return '查看 $fileName 的变更';
+  }
+
+  @override
+  String get toolGroupCompleted => '已完成';
+
+  @override
+  String get toolGroupExecuting => '正在执行';
+
+  @override
+  String get settingsDataTimelineTitle => '模型使用时间线';
+
+  @override
+  String get settingsDataTimelineHint => '每个模型一条线。双指或滚轮缩放，拖动查看其他时段，点击查看具体用量。';
+
+  @override
+  String settingsDataTimelineHours(int hours) {
+    return '$hours 小时';
+  }
+
+  @override
+  String settingsDataTimelineBucket(int minutes) {
+    return '每 $minutes 分钟汇总';
+  }
+
+  @override
+  String settingsDataTimelineSecondsBucket(int seconds) {
+    return '每 $seconds 秒汇总';
+  }
+
+  @override
+  String get settingsDataTimelineEarlier => '更早时段';
+
+  @override
+  String get settingsDataTimelineLater => '更晚时段';
+
+  @override
+  String get settingsDataTimelineRecent => '最近 3 小时';
+
+  @override
+  String get settingsDataTimelineRange => '可见时间范围';
+
+  @override
+  String get settingsDataTimelineSelectModel => '点选下方模型以查看用量';
+
+  @override
+  String get settingsDataTimelineSpend => '消费金额（估算）';
+
+  @override
+  String get settingsDataTimelineCacheRate => '缓存命中率';
+
+  @override
+  String get settingsDataTimelineSpendHint => '按当前模型价格估算，与上方共用时间范围。';
+
+  @override
+  String get settingsDataTimelineCacheRateHint => '每个时间段的缓存输入 ÷ 总输入；空闲时段不计命中率。';
+
+  @override
+  String get settingsDataTimelineNoPrices => '未找到对应的模型价格';
+
+  @override
+  String get settingsDataTimelinePricesFailed => '读取模型价格失败，请刷新重试。';
+
+  @override
+  String settingsDataTimelineUnpriced(int count) {
+    return '$count 次请求的费用未知';
+  }
+
+  @override
+  String get settingsDataTimelineKnownSpend => '已知消费（估算）';
+
+  @override
+  String get settingsDataDetailedStatsRangeLastDay => '最近 24 小时';
+
+  @override
+  String get settingsDataTimelineAverageInput => '单次请求平均输入';
+
+  @override
+  String get settingsDataTimelineAverageInputHint =>
+      '每段总输入 ÷ 请求数，用来观察上下文是否越来越长；空闲时段留空。';
+
+  @override
+  String get settingsDataTimelineCacheSavings => '缓存节省金额（估算）';
+
+  @override
+  String get settingsDataTimelineCacheSavingsHint =>
+      '按当前价格，比较缓存输入与普通输入的费用差；按次计费节省为 0，负数表示缓存更贵。';
+
+  @override
+  String settingsDataTimelineTokensPerRequest(String tokens) {
+    return '$tokens tokens / 次';
+  }
+
+  @override
+  String settingsDataTimelineUnknownSavings(int count) {
+    return '$count 次请求无法估算节省金额';
+  }
+
+  @override
+  String get contextStatsSummaryLoadFailed => '无法加载上下文信息';
+
+  @override
+  String get contextStatsDevicesLoadFailed => '无法加载设备信息';
+
+  @override
+  String get settingsAppearanceThemeLibrary => '我的主题';
+
+  @override
+  String get settingsAppearanceThemeLibraryHint => '选一个喜欢的外观，再把它调成你的样子。';
+
+  @override
+  String get settingsAppearanceThemeActive => '使用中';
+
+  @override
+  String get settingsAppearanceThemeApply => '使用此主题';
+
+  @override
+  String get settingsAppearanceThemeMore => '更多主题操作';
+
+  @override
+  String get settingsAppearanceThemeDuplicate => '创建副本';
+
+  @override
+  String get settingsAppearanceThemeUnboundHint => '保留当前外观，自由调整，不绑定已保存的主题。';
+
+  @override
+  String get settingsAppearanceThemeDeleteTitle => '删除主题';
+
+  @override
+  String settingsAppearanceThemeDeleteConfirm(String name) {
+    return '确定删除「$name」？删除后无法恢复。';
+  }
+
+  @override
+  String get settingsAppearancePreviewCollapse => '收起';
+
+  @override
+  String get settingsAppearancePreviewExpand => '展开';
+
+  @override
+  String get settingsAppearanceThemeNew => '新建主题';
+
+  @override
+  String get settingsAppearanceDeviceFonts => '设备字体';
+
+  @override
+  String get settingsAppearanceChooseDeviceFont => '选择设备字体';
+
+  @override
+  String get settingsAppearanceNoDeviceFonts => '没有匹配的设备字体';
+
+  @override
+  String get settingsAppearanceDeviceFontPreview =>
+      '字体预览：你好，世界\nThe quick brown fox · 0123456789';
+
+  @override
+  String get workspaceFileRename => '重命名';
+
+  @override
+  String get workspaceFileCopy => '复制';
+
+  @override
+  String get workspaceFileCut => '剪切';
+
+  @override
+  String get workspaceFilePaste => '粘贴';
+
+  @override
+  String get workspaceFileName => '名称';
+
+  @override
+  String get workspaceFileInvalidName => '请输入有效名称，不能包含路径分隔符。';
+
+  @override
+  String get workspaceDeleteFolderTitle => '删除文件夹？';
+
+  @override
+  String workspaceDeleteFolderMessage(String name) {
+    return '确定删除“$name”及其全部内容？此操作无法撤销。';
+  }
+
+  @override
+  String workspaceFileOperationFailed(String error) {
+    return '文件操作失败：$error';
+  }
+
+  @override
+  String workspaceFileCopyName(String name, int index) {
+    return '$name（副本 $index）';
+  }
+
+  @override
+  String get workspaceFileSaving => '文件正在保存，请保存完成后重试。';
+
+  @override
+  String get chatBackupChooseTitle => '选择你的备份目录';
+
+  @override
+  String get chatBackupTitle => '每日聊天备份';
+
+  @override
+  String get chatBackupDescription =>
+      '应用运行时每天直接复制整个 SQLite 数据库文件，保留最近 10 份自动备份。包含数据库中的全部数据；附件文件、工作区和单独存储的配置文件不随之复制。';
+
+  @override
+  String get chatRestoreTitle => '从数据库备份恢复';
+
+  @override
+  String get chatRestoreDescription => '打开存有备份的文件夹，选择要恢复的日期。';
+
+  @override
+  String get chatRestoreChooseFolder => '选择恢复来源';
+
+  @override
+  String get chatRestoreRefresh => '刷新列表';
+
+  @override
+  String get chatRestoreSelected => '恢复所选备份';
+
+  @override
+  String get chatRestoreAction => '恢复';
+
+  @override
+  String get chatRestoreCancel => '取消';
+
+  @override
+  String get chatRestoreEmpty => '此文件夹中没有数据库备份。';
+
+  @override
+  String get chatRestoreConfirmTitle => '恢复这份数据库备份？';
+
+  @override
+  String chatRestoreConfirmDescription(String name) {
+    return '将用 $name 直接覆盖当前数据库文件，数据库中的全部数据都会被替换。请先停止正在运行的对话。恢复后将以这份数据库建立新的同步基线，覆盖其他设备的旧数据。';
+  }
+
+  @override
+  String get chatRestoreSuccess => '数据库已恢复。下次同步将以这份数据为准。';
+
+  @override
+  String get chatRestoreOnboardingTitle => '从以前的备份恢复';
+
+  @override
+  String get chatRestoreOnboardingDescription => '找回重装前或卸载前保存在外部目录的聊天记录';
+
+  @override
+  String get chatBackupExternalDescription =>
+      '请选择应用外的文件夹，确保卸载后备份仍保留。iPhone 和 iPad 请在 iCloud Drive 或其他外部文件提供者中选择目录。';
+
+  @override
+  String get chatBackupChoose => '选择备份目录';
+
+  @override
+  String get chatBackupLater => '稍后设置';
+
+  @override
+  String get chatBackupChange => '更改备份目录';
+
+  @override
+  String get chatBackupMissing => '尚未设置备份目录，或原目录已不存在、无法访问。请选择目录以开启每日聊天备份。';
+
+  @override
+  String get chatBackupDirectoryUnavailable =>
+      '无法使用所选文件夹。请在可用的文件夹（如“文档”或“下载”）下新建目录，并选择该目录。';
+
+  @override
+  String get chatBackupReady => '备份目录已就绪。应用启动、回到前台及运行期间会检查每日备份。';
+
+  @override
+  String get chatBackupNow => '立即备份聊天';
+
+  @override
+  String get chatBackupNever => '尚无成功备份';
+
+  @override
+  String chatBackupLastSuccess(String time) {
+    return '最近成功备份：$time';
   }
 }

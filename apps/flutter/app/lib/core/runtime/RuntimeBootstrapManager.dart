@@ -74,6 +74,7 @@ class RuntimeBootstrapManager extends ChangeNotifier {
   LocalRuntimeStorageConfig _config =
       LocalRuntimeStorageConfig.platformDefault();
   ThemeMode _startupThemeMode = ThemeMode.system;
+  Future<void> _bootstrapWriteTail = Future<void>.value();
 
   /// Returns the current local bootstrap configuration.
   LocalRuntimeStorageConfig get config => _config;
@@ -93,7 +94,11 @@ class RuntimeBootstrapManager extends ChangeNotifier {
   /// Loads persisted runtime storage configuration and applies local roots.
   Future<void> initialize() async {
     final stopwatch = Stopwatch()..start();
-    ClientLogger.i('initialize start', tag: _logTag);
+    ClientLogger.v(
+      'initialize start',
+      tag: _logTag,
+      verboseLevel: VerboseLevel.level1,
+    );
     try {
       final readStopwatch = Stopwatch()..start();
       final encoded = await platformCoreProxy.runtimeBootstrapRead();
@@ -109,26 +114,31 @@ class RuntimeBootstrapManager extends ChangeNotifier {
         );
         storedConfig = LocalRuntimeStorageConfig.fromJson(decoded);
       }
-      ClientLogger.i(
+      ClientLogger.v(
         'config read done localConfirmed=${storedConfig.confirmed} elapsedMs=${readStopwatch.elapsedMilliseconds}',
         tag: _logTag,
+        verboseLevel: VerboseLevel.level1,
       );
+      _config = storedConfig;
       if (storedConfig.confirmed) {
         final storageStopwatch = Stopwatch()..start();
-        ClientLogger.i(
+        ClientLogger.v(
           'local storage apply start runtimeRoot=${storedConfig.runtimeRoot} workspaceRoot=${storedConfig.workspaceRoot}',
           tag: _logTag,
+          verboseLevel: VerboseLevel.level1,
         );
         await LocalRuntimeStorageBridge.apply(storedConfig);
-        ClientLogger.i(
+        ClientLogger.v(
           'local storage apply done elapsedMs=${storageStopwatch.elapsedMilliseconds}',
           tag: _logTag,
+          verboseLevel: VerboseLevel.level1,
         );
       }
       await _apply(storedConfig, persist: false);
-      ClientLogger.i(
+      ClientLogger.v(
         'initialize done elapsedMs=${stopwatch.elapsedMilliseconds}',
         tag: _logTag,
+        verboseLevel: VerboseLevel.level1,
       );
     } catch (error, stackTrace) {
       ClientLogger.e(
@@ -241,9 +251,10 @@ class RuntimeBootstrapManager extends ChangeNotifier {
       throw StateError('runtime identity does not exist: $identityId');
     }
     final sourceIdentityId = activeIdentity.id;
-    ClientLogger.i(
+    ClientLogger.v(
       'switch identity start sourceIdentityId=$sourceIdentityId targetIdentityId=$identityId',
       tag: _logTag,
+      verboseLevel: VerboseLevel.level1,
     );
     final now = DateTime.now().millisecondsSinceEpoch;
     final selectedConfig = _config.copyWith(
@@ -264,18 +275,33 @@ class RuntimeBootstrapManager extends ChangeNotifier {
     String runtimeRoot,
     String workspaceRoot,
   ) async {
+    final normalizedRuntimeRoot = runtimeRoot.trim();
+    final normalizedWorkspaceRoot = workspaceRoot.trim();
+    // Identity switches keep these base roots and only remount
+    // identities/<id> during startup. Confirming them again is not a change.
+    if (_config.confirmed &&
+        _config.runtimeRoot == normalizedRuntimeRoot &&
+        _config.workspaceRoot == normalizedWorkspaceRoot) {
+      ClientLogger.i(
+        'confirm local runtime storage skipped unchanged roots',
+        tag: _logTag,
+      );
+      return;
+    }
     final stopwatch = Stopwatch()..start();
-    ClientLogger.i(
-      'confirm local runtime storage start runtimeRoot=$runtimeRoot workspaceRoot=$workspaceRoot',
+    ClientLogger.v(
+      'confirm local runtime storage start runtimeRoot=$normalizedRuntimeRoot workspaceRoot=$normalizedWorkspaceRoot',
       tag: _logTag,
+      verboseLevel: VerboseLevel.level1,
     );
     final localStorage = LocalRuntimeStorageConfig(
       confirmed: true,
-      runtimeRoot: runtimeRoot.trim(),
-      workspaceRoot: workspaceRoot.trim(),
+      runtimeRoot: normalizedRuntimeRoot,
+      workspaceRoot: normalizedWorkspaceRoot,
       identities: identities,
       activeIdentityId: activeIdentity.id,
       updatedAt: DateTime.now().millisecondsSinceEpoch,
+      chatBackupDirectory: _config.chatBackupDirectory,
     );
     await LocalRuntimeStorageBridge.apply(localStorage);
     await _apply(localStorage, persist: true);
@@ -295,9 +321,10 @@ class RuntimeBootstrapManager extends ChangeNotifier {
     String workspaceRoot,
   ) async {
     final stopwatch = Stopwatch()..start();
-    ClientLogger.i(
+    ClientLogger.v(
       'persist migrated local runtime storage start runtimeRoot=$runtimeRoot workspaceRoot=$workspaceRoot',
       tag: _logTag,
+      verboseLevel: VerboseLevel.level1,
     );
     final localStorage = LocalRuntimeStorageConfig(
       confirmed: true,
@@ -306,6 +333,7 @@ class RuntimeBootstrapManager extends ChangeNotifier {
       identities: identities,
       activeIdentityId: activeIdentity.id,
       updatedAt: DateTime.now().millisecondsSinceEpoch,
+      chatBackupDirectory: _config.chatBackupDirectory,
     );
     await _apply(localStorage, persist: true);
     ClientLogger.attachPersistentStorage();
@@ -313,6 +341,14 @@ class RuntimeBootstrapManager extends ChangeNotifier {
       'persist migrated local runtime storage done elapsedMs=${stopwatch.elapsedMilliseconds}',
       tag: _logTag,
     );
+  }
+
+  /// Persists a machine-local backup directory without changing runtime or workspace roots.
+  Future<void> saveChatBackupDirectory(String directory) async {
+    final next = _config.copyWith(chatBackupDirectory: directory);
+    await _writeBootstrapConfig(next);
+    _config = next;
+    notifyListeners();
   }
 
   /// Persists the theme mode needed before Core preferences become available.
@@ -330,7 +366,11 @@ class RuntimeBootstrapManager extends ChangeNotifier {
     required bool persist,
   }) async {
     final stopwatch = Stopwatch()..start();
-    ClientLogger.d('apply start persist=$persist', tag: _logTag);
+    ClientLogger.v(
+      'apply start persist=$persist',
+      tag: _logTag,
+      verboseLevel: VerboseLevel.level1,
+    );
     _config = config;
     if (persist) {
       await _writeBootstrapConfig(config);
@@ -339,9 +379,10 @@ class RuntimeBootstrapManager extends ChangeNotifier {
       ClientLogger.attachPersistentStorage();
     }
     notifyListeners();
-    ClientLogger.i(
+    ClientLogger.v(
       'apply done persist=$persist elapsedMs=${stopwatch.elapsedMilliseconds}',
       tag: _logTag,
+      verboseLevel: VerboseLevel.level1,
     );
   }
 
@@ -349,13 +390,22 @@ class RuntimeBootstrapManager extends ChangeNotifier {
   Future<void> _writeBootstrapConfig(
     LocalRuntimeStorageConfig config, {
     ThemeMode? startupThemeMode,
-  }) async {
-    config.validate();
-    final encodedConfig = <String, Object?>{
-      ...config.toJson(),
-      _startupThemeModeKey: (startupThemeMode ?? _startupThemeMode).name,
-    };
-    await platformCoreProxy.runtimeBootstrapWrite(jsonEncode(encodedConfig));
+  }) {
+    // Serialize overlapping theme and identity updates.
+    final write = _bootstrapWriteTail.then((_) async {
+      config.validate();
+      final encodedConfig = <String, Object?>{
+        ...config.toJson(),
+        _startupThemeModeKey: (startupThemeMode ?? _startupThemeMode).name,
+      };
+      await platformCoreProxy.runtimeBootstrapWrite(jsonEncode(encodedConfig));
+      if (startupThemeMode != null) _startupThemeMode = startupThemeMode;
+    });
+    _bootstrapWriteTail = write.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return write;
   }
 }
 

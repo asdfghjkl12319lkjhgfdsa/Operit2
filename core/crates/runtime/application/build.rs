@@ -1,13 +1,17 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 const MANIFEST_FILENAMES: &[&str] = &["manifest.hjson", "manifest.json"];
 const SKILL_FILENAMES: &[&str] = &["SKILL.md", "skill.md"];
 const SKILL_INCLUDE_FILE: &str = "skill.include.json";
+const PLUGIN_ASSET_SYNC_HINT: &str =
+    "Run: python3 plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload";
 
 struct BuildinAsset {
     name: String,
@@ -28,12 +32,26 @@ struct SkillIncludeEntry {
     exclude_names: Vec<String>,
 }
 
+/// Declares one document or type definition bundled with a skill.
+struct SkillAsset {
+    skill_name: String,
+    source: PathBuf,
+    target: String,
+}
+
+/// Generates runtime asset indexes and verifies the prepared model catalog snapshot.
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-link-lib=advapi32");
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let catalog_bundle = manifest_dir.join("assets/models_dev/catalog.json.gz");
+    println!("cargo:rerun-if-changed={}", catalog_bundle.display());
+    assert!(catalog_bundle.is_file(),
+        "Bundled models.dev catalog is missing. Run: python3 tools/build_scripts/models_dev_bundle.py");
+    validate_plugin_assets(&manifest_dir, "buildin");
+    validate_plugin_assets(&manifest_dir, "external");
     let source_dir = manifest_dir.join("assets").join("plugins").join("buildin");
     emit_rerun_for_asset_tree(&source_dir);
 
@@ -81,11 +99,7 @@ fn main() {
     push_plugin_asset_struct(&mut code);
     code.push_str("pub static BUILTIN_PLUGIN_ASSETS: &[PluginAsset] = &[\n");
     for asset in &assets {
-        code.push_str(&format!(
-            "    PluginAsset {{ name: {:?}, bytes: include_bytes!({:?}) }},\n",
-            asset.name,
-            asset.path.to_string_lossy()
-        ));
+        push_plugin_asset(&mut code, asset);
     }
     code.push_str("];\n");
     code.push_str("\n");
@@ -95,11 +109,7 @@ fn main() {
     );
     code.push_str("pub static BUNDLED_EXTERNAL_PLUGIN_ASSETS: &[PluginAsset] = &[\n");
     for asset in &external_assets {
-        code.push_str(&format!(
-            "    PluginAsset {{ name: {:?}, bytes: include_bytes!({:?}) }},\n",
-            asset.name,
-            asset.path.to_string_lossy()
-        ));
+        push_plugin_asset(&mut code, asset);
     }
     code.push_str("];\n");
     fs::write(generated, code).expect("write builtin plugin asset list");
@@ -108,11 +118,23 @@ fn main() {
     generate_bundled_external_skill_assets(&manifest_dir, &out_dir);
 }
 
+/// Embeds each immutable package fingerprint alongside its exact compiled bytes.
+fn push_plugin_asset(code: &mut String, asset: &BuildinAsset) {
+    let bytes = fs::read(&asset.path).expect("read packaged plugin asset");
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    code.push_str(&format!(
+        "    PluginAsset {{ name: {:?}, bytes: include_bytes!({:?}), sha256: {:?} }},\n",
+        asset.name, asset.path.to_string_lossy(), sha256,
+    ));
+}
+
+/// Declares the compiled package metadata shared by both asset collections.
 fn push_plugin_asset_struct(code: &mut String) {
     code.push_str("#[derive(Clone, Copy)]\n");
     code.push_str("pub struct PluginAsset {\n");
     code.push_str("    pub name: &'static str,\n");
     code.push_str("    pub bytes: &'static [u8],\n");
+    code.push_str("    pub sha256: &'static str,\n");
     code.push_str("}\n\n");
 }
 
@@ -138,6 +160,114 @@ fn collect_packaged_plugin_assets(source_dir: &Path) -> Vec<BuildinAsset> {
         assets.push(BuildinAsset { name, path });
     }
     assets
+}
+
+/// Rejects builds whose generated plugin assets drifted from the package sources they mirror.
+fn validate_plugin_assets(manifest_dir: &Path, kind: &str) {
+    let plugins_root = pluginsSourceRoot(manifest_dir);
+    let source_dir = plugins_root.join("packages").join(kind);
+    let asset_dir = manifest_dir.join("assets").join("plugins").join(kind);
+    if !source_dir.is_dir() {
+        fail_or_warn(&format!(
+            "Plugin package sources are missing at {}; built-in ToolPkg assets cannot be verified. {}",
+            source_dir.display(),
+            PLUGIN_ASSET_SYNC_HINT,
+        ));
+        return;
+    }
+    let expected = expected_asset_names(&source_dir);
+    let actual = actual_asset_names(&asset_dir);
+    let missing = expected
+        .difference(&actual)
+        .cloned()
+        .collect::<Vec<_>>();
+    let stale = actual
+        .difference(&expected)
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() && stale.is_empty() {
+        return;
+    }
+    let mut details = Vec::new();
+    if !missing.is_empty() {
+        details.push(format!("missing assets: {}", missing.join(", ")));
+    }
+    if !stale.is_empty() {
+        details.push(format!("stale assets: {}", stale.join(", ")));
+    }
+    fail_or_warn(&format!(
+        "Generated plugin assets under {} do not match {} package sources ({}). {}",
+        asset_dir.display(),
+        source_dir.display(),
+        details.join("; "),
+        PLUGIN_ASSET_SYNC_HINT,
+    ));
+}
+
+/// Mirrors the sync tool's plan: compiled standalone scripts plus packed package folders.
+fn expected_asset_names(source_dir: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let Ok(entries) = fs::read_dir(source_dir) else {
+        return names;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            if has_manifest(&path) {
+                names.insert(format!("{file_name}.toolpkg"));
+            }
+            continue;
+        }
+        let lower_name = file_name.to_ascii_lowercase();
+        if lower_name.ends_with(".d.ts") {
+            continue;
+        }
+        if lower_name.ends_with(".ts") {
+            names.insert(format!("{}.js", &file_name[..file_name.len() - ".ts".len()]));
+        } else if lower_name.ends_with(".js") || lower_name.ends_with(".toolpkg") {
+            names.insert(file_name.to_string());
+        }
+    }
+    names
+}
+
+/// Reads the assets the compiler would embed, including legacy loose package folders.
+fn actual_asset_names(asset_dir: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let Ok(entries) = fs::read_dir(asset_dir) else {
+        return names;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            if has_manifest(&path) {
+                names.insert(format!("{file_name}.toolpkg"));
+            }
+            continue;
+        }
+        let lower_name = file_name.to_ascii_lowercase();
+        if lower_name.ends_with(".js")
+            || lower_name.ends_with(".hjson")
+            || lower_name.ends_with(".toolpkg")
+        {
+            names.insert(file_name.to_string());
+        }
+    }
+    names
+}
+
+/// Fails release builds and only warns debug builds so cargo check stays usable without Node.
+fn fail_or_warn(message: &str) {
+    if env::var("PROFILE").as_deref() == Ok("release") {
+        panic!("{}", message);
+    }
+    println!("cargo:warning={}", message.replace('\n', " "));
 }
 
 fn emit_rerun_for_asset_tree(path: &Path) {
@@ -252,39 +382,52 @@ fn generate_workspace_template_assets(manifest_dir: &Path, out_dir: &Path) {
     fs::write(generated, code).expect("write workspace template asset list");
 }
 
+/// Generates skill documents and type definitions without indexing plugin archives.
 fn generate_bundled_external_skill_assets(manifest_dir: &Path, out_dir: &Path) {
     let plugins_dir = pluginsSourceRoot(manifest_dir);
-    let source_dir = plugins_dir.join("skills").join("external");
-    println!("cargo:rerun-if-changed={}", source_dir.display());
-
-    let mut assets = Vec::<(String, PathBuf, String)>::new();
-    if source_dir.is_dir() {
-        let mut skill_dirs = fs::read_dir(&source_dir)
-            .expect("read plugins/skills/external")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .filter(|path| has_skill_file(path))
-            .collect::<Vec<_>>();
-        skill_dirs.sort_by_key(|path| path.file_name().map(|name| name.to_os_string()));
-        for skill_dir in skill_dirs {
-            let skill_name = skill_dir
-                .file_name()
-                .expect("bundled skill directory name")
-                .to_string_lossy()
-                .to_string();
-            let mut files = Vec::new();
-            collect_skill_source_files(&skill_dir, &skill_dir, &mut files);
-            files.sort_by_key(|(_, relative)| relative.clone());
-            for (path, relative) in files {
-                assets.push((skill_name.clone(), path, relative.replace('\\', "/")));
+    let mut assets = Vec::<SkillAsset>::new();
+    let mut builtin_names = Vec::<String>::new();
+    for kind in ["buildin", "external"] {
+        let source_dir = plugins_dir.join("skills").join(kind);
+        println!("cargo:rerun-if-changed={}", source_dir.display());
+        if source_dir.is_dir() {
+            let mut skill_dirs = fs::read_dir(&source_dir)
+                .expect("read bundled skill sources")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .filter(|path| has_skill_file(path))
+                .collect::<Vec<_>>();
+            skill_dirs.sort_by_key(|path| path.file_name().map(|name| name.to_os_string()));
+            for skill_dir in skill_dirs {
+                let skill_name = skill_dir
+                    .file_name()
+                    .expect("bundled skill directory name")
+                    .to_string_lossy()
+                    .to_string();
+                if kind == "buildin" {
+                    builtin_names.push(skill_name.clone());
+                }
+                let mut files = Vec::new();
+                collect_skill_source_files(&skill_dir, &skill_dir, &mut files);
+                files.sort_by_key(|(_, relative)| relative.clone());
+                for (path, relative) in files {
+                    assets.push(SkillAsset {
+                        skill_name: skill_name.clone(),
+                        source: path,
+                        target: relative.replace('\\', "/"),
+                    });
+                }
+                collect_skill_includes(&plugins_dir, &skill_dir, &skill_name, &mut assets);
             }
-            collect_skill_includes(&plugins_dir, &skill_dir, &skill_name, &mut assets);
         }
     }
 
     let generated = out_dir.join("bundled_external_skill_assets.rs");
     let mut code = String::new();
+    code.push_str(&format!(
+        "pub static BUILTIN_SKILL_NAMES: &[&str] = &{:?};\n", builtin_names,
+    ));
     code.push_str("#[derive(Clone, Copy)]\n");
     code.push_str("pub struct BundledExternalSkillAsset {\n");
     code.push_str("    pub skill_name: &'static str,\n");
@@ -292,12 +435,16 @@ fn generate_bundled_external_skill_assets(manifest_dir: &Path, out_dir: &Path) {
     code.push_str("    pub bytes: &'static [u8],\n");
     code.push_str("}\n\n");
     code.push_str("pub static BUNDLED_EXTERNAL_SKILL_ASSETS: &[BundledExternalSkillAsset] = &[\n");
-    for (skill_name, path, relative) in assets {
+    let mut destinations = BTreeSet::new();
+    for asset in &assets {
+        assert!(destinations.insert((&asset.skill_name, &asset.target)), "duplicate bundled skill destination: {}/{}", asset.skill_name, asset.target);
+    }
+    for asset in &assets {
         code.push_str(&format!(
             "    BundledExternalSkillAsset {{ skill_name: {:?}, path: {:?}, bytes: include_bytes!({:?}) }},\n",
-            skill_name,
-            relative,
-            path.to_string_lossy()
+            asset.skill_name,
+            asset.target,
+            asset.source.to_string_lossy()
         ));
     }
     code.push_str("];\n");
@@ -340,11 +487,12 @@ fn collect_skill_source_files(base: &Path, current: &Path, files: &mut Vec<(Path
     }
 }
 
+/// Collects declared skill documents and type definitions from their source directories.
 fn collect_skill_includes(
     plugins_dir: &Path,
     skill_dir: &Path,
     skill_name: &str,
-    assets: &mut Vec<(String, PathBuf, String)>,
+    assets: &mut Vec<SkillAsset>,
 ) {
     let include_file = skill_dir.join(SKILL_INCLUDE_FILE);
     if !include_file.is_file() {
@@ -371,11 +519,11 @@ fn collect_skill_includes(
         println!("cargo:rerun-if-changed={}", source.display());
         let target = normalize_asset_relative_path(&include.target);
         if source.is_file() {
-            assets.push((
-                skill_name.to_string(),
+            assets.push(SkillAsset {
+                skill_name: skill_name.to_string(),
                 source,
-                path_to_asset_string(&target),
-            ));
+                target: path_to_asset_string(&target),
+            });
             continue;
         }
 
@@ -388,11 +536,11 @@ fn collect_skill_includes(
         collect_include_files(&source, &source, &include.exclude_names, &mut include_files);
         include_files.sort_by_key(|(_, relative)| relative.clone());
         for (path, relative) in include_files {
-            assets.push((
-                skill_name.to_string(),
-                path,
-                path_to_asset_string(&target.join(relative)),
-            ));
+            assets.push(SkillAsset {
+                skill_name: skill_name.to_string(),
+                source: path,
+                target: path_to_asset_string(&target.join(relative)),
+            });
         }
     }
 }
@@ -459,6 +607,7 @@ fn is_path_inside(path: &Path, base: &Path) -> bool {
 #[allow(non_snake_case)]
 fn pluginsSourceRoot(manifest_dir: &Path) -> PathBuf {
     manifest_dir
+        .join("..")
         .join("..")
         .join("..")
         .join("..")

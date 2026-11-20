@@ -193,7 +193,13 @@ class _SttConfigDialogState extends State<_SttConfigDialog> {
                 _field(_nameController, '供应商名称', requiredField: true),
                 if (!localModel) ...<Widget>[
                   _field(_endpointController, 'Endpoint', requiredField: true),
-                  _field(_apiKeyController, 'API Key', obscureText: true),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: ApiKeyTextField(
+                      controller: _apiKeyController,
+                      labelText: 'API Key',
+                    ),
+                  ),
                 ],
                 _buildModelField(localModel),
                 if (!localModel)
@@ -213,7 +219,8 @@ class _SttConfigDialogState extends State<_SttConfigDialog> {
                       _field(
                         _modelFieldController,
                         '模型字段名',
-                        requiredField: true,
+                        helperText: '留空表示接口不接收模型参数',
+                        onChanged: (_) => setState(() {}),
                       ),
                       _field(_languageFieldController, '语言字段名'),
                       _field(
@@ -242,8 +249,14 @@ class _SttConfigDialogState extends State<_SttConfigDialog> {
     );
   }
 
-  /// Builds a catalog-backed or custom STT model selector.
+  /// Builds an editable remote model field or an installed local model selector.
   Widget _buildModelField(bool localModel) {
+    if (!localModel && _modelFieldController.text.trim().isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.only(bottom: 10),
+        child: Text('此接口无需指定模型'),
+      );
+    }
     if (_loadingModels) {
       return const Padding(
         padding: EdgeInsets.only(bottom: 10),
@@ -274,17 +287,37 @@ class _SttConfigDialogState extends State<_SttConfigDialog> {
         ),
       );
     }
+    if (!localModel) {
+      return _field(
+        _modelController,
+        '模型',
+        requiredField: true,
+        helperText: '填写供应商支持的模型 ID，也可从预设中选择',
+        suffixIcon: _availableModels.isEmpty
+            ? null
+            : PopupMenuButton<String>(
+                tooltip: '选择预设模型',
+                icon: const Icon(Icons.arrow_drop_down),
+                onSelected: (model) => _modelController.text = model,
+                itemBuilder: (context) => _availableModels
+                    .map(
+                      (model) => PopupMenuItem<String>(
+                        value: model.model,
+                        child: Text(model.displayName),
+                      ),
+                    )
+                    .toList(growable: false),
+              ),
+      );
+    }
     if (_availableModels.isEmpty) {
-      if (localModel) {
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 10),
-          child: InputDecorator(
-            decoration: const InputDecoration(labelText: '模型'),
-            child: const Text('没有已安装的 STT 本地模型'),
-          ),
-        );
-      }
-      return _field(_modelController, '模型', requiredField: true);
+      return const Padding(
+        padding: EdgeInsets.only(bottom: 10),
+        child: InputDecorator(
+          decoration: InputDecoration(labelText: '模型'),
+          child: Text('没有已安装的 STT 本地模型'),
+        ),
+      );
     }
     String? selectedModel;
     for (final model in _availableModels) {
@@ -326,18 +359,24 @@ class _SttConfigDialogState extends State<_SttConfigDialog> {
   Widget _field(
     TextEditingController controller,
     String label, {
-    bool obscureText = false,
     bool requiredField = false,
     int minLines = 1,
+    String? helperText,
+    Widget? suffixIcon,
+    ValueChanged<String>? onChanged,
   }) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: TextFormField(
         controller: controller,
-        decoration: InputDecoration(labelText: label),
-        obscureText: obscureText,
+        onChanged: onChanged,
+        decoration: InputDecoration(
+          labelText: label,
+          helperText: helperText,
+          suffixIcon: suffixIcon,
+        ),
         minLines: minLines,
-        maxLines: obscureText ? 1 : (minLines == 1 ? 1 : 8),
+        maxLines: minLines == 1 ? 1 : 8,
         validator: (value) {
           if (requiredField && (value?.trim().isEmpty ?? true)) {
             return '$label不能为空';
@@ -353,13 +392,14 @@ class _SttConfigDialogState extends State<_SttConfigDialog> {
     if (!(_formKey.currentState?.validate() ?? false)) {
       return;
     }
-    if (_modelController.text.trim().isEmpty) {
+    final localModel = _isLocalSttProviderType(_providerType);
+    if ((localModel || _modelFieldController.text.trim().isNotEmpty) &&
+        _modelController.text.trim().isEmpty) {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('请选择 STT 模型')));
       return;
     }
-    final localModel = _isLocalSttProviderType(_providerType);
     late final List<core_proxy.SttHttpHeader> headers;
     try {
       headers = localModel

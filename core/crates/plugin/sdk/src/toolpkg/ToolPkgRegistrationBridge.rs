@@ -7,6 +7,8 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
         "false"
     };
     r#"
+    __OPERIT_TOOLPKG_MODULE_EXPORTS__
+    __OPERIT_TOOLPKG_WASM_API__
     (function() {
         var root = typeof globalThis !== 'undefined'
             ? globalThis
@@ -28,8 +30,12 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             chatInputHooks: [],
             chatViewHooks: [],
             chatMessageHooks: [],
+            messageTransformHooks: [],
+            messageStreamTransforms: [],
+            chatLifecycleHooks: [],
             chatMessageMenuItems: [],
             chatRuntimeHooks: [],
+            chatResponseHooks: [],
             hostEventHooks: [],
             toolLifecycleHooks: [],
             promptInputHooks: [],
@@ -67,24 +73,93 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             return output;
         }
 
+        /** Requires exact supported navigation surfaces instead of coercing casing or whitespace. */
+        function validateNavigationSurface(surface) {
+            switch (surface) {
+                case 'toolbox':
+                case 'main_sidebar_plugins':
+                case 'app_bar':
+                case 'chat_attachments':
+                case 'chat_sidebar_tabs':
+                case 'chat_input_menu':
+                case 'chat_input_menu_sections':
+                case 'chat_message_after':
+                case 'workspace':
+                case 'workspace_file':
+                case 'workspace_home':
+                    return;
+                default:
+                    throw new Error('registerNavigationEntry.surface is unsupported: ' + String(surface));
+            }
+        }
+
+        /** Identifies surfaces rendered by a package-owned Compose DSL route. */
+        function isEmbeddedUiSurface(surface) {
+            return surface === 'chat_sidebar_tabs' || surface === 'chat_input_menu' ||
+                surface === 'chat_input_menu_sections' || surface === 'chat_message_after' ||
+                surface === 'workspace' || surface === 'workspace_file' || surface === 'workspace_home';
+        }
+
+        /** Requires one already registered package-owned Compose DSL route for an embedded surface. */
+        function validateEmbeddedRoute(definition) {
+            var owner = resolveCurrentToolPkgTarget();
+            if (!owner) throw new Error('registerNavigationEntry.route owner is unavailable for ' + definition.surface);
+            if (!definition.route.startsWith('toolpkg:' + owner + ':ui:')) {
+                throw new Error('registerNavigationEntry.route must belong to this package for ' + definition.surface + ': ' + definition.route);
+            }
+            var registeredRoutes = capture.uiRoutes.concat(capture.toolboxUiModules);
+            var matches = 0;
+            for (var index = 0; index < registeredRoutes.length; index += 1) {
+                var registered = JSON.parse(registeredRoutes[index]);
+                var generatedRoute = typeof registered.id === 'string' ? 'toolpkg:' + owner + ':ui:' + registered.id.trim() : null;
+                var explicitMatch = registered.route === definition.route;
+                var generatedMatch = registered.route === undefined && generatedRoute === definition.route;
+                if (!explicitMatch && !generatedMatch) continue;
+                matches += 1;
+                if (registered.runtime !== undefined && registered.runtime !== 'compose_dsl') {
+                    throw new Error('registerNavigationEntry.route must use compose_dsl for ' + definition.surface + ': ' + definition.route);
+                }
+            }
+            if (matches === 0) throw new Error('registerNavigationEntry.route is not registered for ' + definition.surface + ': ' + definition.route);
+            if (matches !== 1) throw new Error('registerNavigationEntry.route is duplicated for ' + definition.surface + ': ' + definition.route);
+        }
+
+        /** Rejects non-JSON route input before serialization can silently drop or replace values. */
+        function validateNavigationParams(value, ancestors) {
+            if (value === null) return;
+            var kind = typeof value;
+            if (kind === 'string' || kind === 'boolean') return;
+            if (kind === 'number') {
+                if (!Number.isFinite(value)) throw new Error('registerNavigationEntry.params requires finite JSON numbers');
+                return;
+            }
+            if (kind !== 'object') throw new Error('registerNavigationEntry.params must be JSON');
+            if (ancestors.indexOf(value) !== -1) throw new Error('registerNavigationEntry.params must not be cyclic');
+            var prototype = Object.getPrototypeOf(value);
+            if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+                throw new Error('registerNavigationEntry.params requires plain JSON objects');
+            }
+            if (Object.getOwnPropertySymbols(value).length !== 0) {
+                throw new Error('registerNavigationEntry.params must not have symbol properties');
+            }
+            ancestors.push(value);
+            if (Array.isArray(value)) {
+                for (var index = 0; index < value.length; index += 1) {
+                    validateNavigationParams(value[index], ancestors);
+                }
+            } else {
+                var keys = Object.keys(value);
+                for (var index = 0; index < keys.length; index += 1) {
+                    validateNavigationParams(value[keys[index]], ancestors);
+                }
+            }
+            ancestors.pop();
+        }
+
         function getActiveExports() {
             return typeof root.__operitGetActiveModuleExports === 'function'
                 ? root.__operitGetActiveModuleExports()
                 : null;
-        }
-
-        function resolveExportedFunctionName(fn) {
-            var exportsRef = getActiveExports();
-            if (!exportsRef || typeof exportsRef !== 'object') {
-                return '';
-            }
-            var keys = Object.keys(exportsRef);
-            for (var i = 0; i < keys.length; i += 1) {
-                if (exportsRef[keys[i]] === fn) {
-                    return keys[i];
-                }
-            }
-            return '';
         }
 
         function buildGeneratedFunctionName(definition) {
@@ -96,7 +171,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
 
         function activeModulePath() {
             var exportsRef = getActiveExports();
-            if (!exportsRef || typeof exportsRef !== 'object') {
+            if (!exportsRef || (typeof exportsRef !== 'object' && typeof exportsRef !== 'function')) {
                 return '';
             }
             return typeof exportsRef.__operit_toolpkg_module_path === 'string'
@@ -130,37 +205,25 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
 
         function buildModuleRefFunctionSource(requirePath, exportName) {
             return 'function() {' +
-                'var moduleRef = require(' + JSON.stringify(requirePath) + ');' +
-                'var fn = moduleRef && moduleRef[' + JSON.stringify(exportName) + '];' +
-                'if (typeof fn !== "function") {' +
-                    'throw new Error("ToolPkg registered function export not found: ' + exportName.replace(/"/g, '\\"') + '");' +
-                '}' +
-                'return fn.apply(null, arguments);' +
+                'return OperitToolPkgExports.require(require(' + JSON.stringify(requirePath) + '), ' +
+                    JSON.stringify(exportName) + ').apply(null, arguments);' +
             '}';
         }
 
         function resolveDurableFunctionRef(fn, definition, label) {
-            var exportedName = resolveExportedFunctionName(fn);
+            var exportedName = OperitToolPkgExports.nameOf(getActiveExports(), fn);
             if (exportedName) {
                 return {
                     name: exportedName,
                     source: ''
                 };
             }
-            var modulePath = typeof fn.__operit_toolpkg_module_path === 'string'
-                ? fn.__operit_toolpkg_module_path.trim().replace(/\\/g, '/')
-                : '';
-            var exportName = typeof fn.__operit_toolpkg_export_name === 'string'
-                ? fn.__operit_toolpkg_export_name.trim()
-                : '';
-            if (!modulePath || !exportName) {
-                throw new Error(label + ' function must be exported from a toolpkg module');
-            }
+            var reference = OperitToolPkgExports.reference(fn, label + ' function');
             var fromModulePath = activeModulePath();
             var functionName = buildGeneratedFunctionName(definition);
             return {
                 name: functionName,
-                source: buildModuleRefFunctionSource(relativeRequirePath(fromModulePath, modulePath), exportName)
+                source: buildModuleRefFunctionSource(relativeRequirePath(fromModulePath, reference.path), reference.name)
             };
         }
 
@@ -217,6 +280,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             return normalized;
         }
 
+        /** Preserves the exact exported entry when a UI route is registered with a function. */
         function normalizeScreenField(definition, label) {
             if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
                 throw new Error(label + ' expects an object');
@@ -224,47 +288,16 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             var normalized = copyObject(definition, 'screen');
             var screen = definition.screen;
             var path = '';
+            var exportName = null;
             if (typeof screen === 'string') {
                 path = screen.trim().replace(/\\/g, '/');
-            } else if (typeof screen === 'function' && typeof screen.__operit_toolpkg_module_path === 'string') {
-                path = screen.__operit_toolpkg_module_path.trim().replace(/\\/g, '/');
-            } else if (
-                screen &&
-                typeof screen === 'object' &&
-                typeof screen.default === 'function' &&
-                typeof screen.default.__operit_toolpkg_module_path === 'string'
-            ) {
-                path = screen.default.__operit_toolpkg_module_path.trim().replace(/\\/g, '/');
+            } else {
+                var reference = OperitToolPkgExports.reference(screen, label + ' screen');
+                path = reference.path;
+                exportName = reference.name;
             }
-            if (!path) {
-                throw new Error(label + ' requires a serializable screen reference');
-            }
-            normalized.screen = path;
-            return normalized;
-        }
-
-        function normalizeDialogScreenField(definition, label) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error(label + ' expects an object');
-            }
-            var normalized = copyObject(definition, 'screen');
-            var screen = definition.screen;
-            var path = '';
-            if (typeof screen === 'string') {
-                path = screen.trim().replace(/\\/g, '/');
-            } else if (typeof screen === 'function' && typeof screen.__operit_toolpkg_module_path === 'string') {
-                path = screen.__operit_toolpkg_module_path.trim().replace(/\\/g, '/');
-            } else if (
-                screen &&
-                typeof screen === 'object' &&
-                typeof screen.default === 'function' &&
-                typeof screen.default.__operit_toolpkg_module_path === 'string'
-            ) {
-                path = screen.default.__operit_toolpkg_module_path.trim().replace(/\\/g, '/');
-            }
-            if (!path) {
-                throw new Error(label + ' requires a serializable screen reference');
-            }
+            if (!path) throw new Error(label + ' requires a serializable screen reference');
+            if (exportName !== null) normalized.screenExport = exportName;
             normalized.screen = path;
             return normalized;
         }
@@ -275,7 +308,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                 if (typeof definition.dialog !== 'object' || Array.isArray(definition.dialog)) {
                     throw new Error(label + '.dialog expects an object');
                 }
-                normalized.dialog = normalizeDialogScreenField(definition.dialog, label + '.dialog');
+                normalized.dialog = normalizeScreenField(definition.dialog, label + '.dialog');
             }
             return normalized;
         }
@@ -370,6 +403,8 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             return '';
         }
 
+        /** Materializes a resource through the required structured host Promise. */
+
         function readToolPkgResource(key, outputFileName, internal) {
             if (registrationOnly) {
                 throw new Error('ToolPkg.readResource is unavailable during ToolPkg registration');
@@ -382,24 +417,14 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             if (!target) {
                 return Promise.reject(new Error('package/toolpkg runtime target is empty'));
             }
-            if (
-                typeof NativeInterface === 'undefined' ||
-                !NativeInterface ||
-                typeof NativeInterface.readToolPkgResource !== 'function'
-            ) {
-                return Promise.reject(new Error('NativeInterface.readToolPkgResource is unavailable'));
-            }
-            var path = NativeInterface.readToolPkgResource(
-                target,
-                resourceKey,
+            return __operitInvokeHostAsync(__operitNativeReadToolPkgResource, [
+                target, resourceKey,
                 outputFileName == null ? '' : String(outputFileName).trim(),
-                internal === true ? 'true' : ''
-            );
-            if (typeof path === 'string' && path.trim()) {
-                return Promise.resolve(path);
-            }
-            return Promise.reject(new Error('resource not found: ' + resourceKey));
+                internal === true
+            ]);
         }
+
+        /** Materializes a targeted package resource without parsing result text. */
 
         function readToolPkgResourceFromPackage(packageNameOrSubpackageId, key, outputFileName, internal) {
             if (registrationOnly) {
@@ -413,162 +438,58 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             if (!resourceKey) {
                 return Promise.reject(new Error('resource key is required'));
             }
-            if (
-                typeof NativeInterface === 'undefined' ||
-                !NativeInterface ||
-                typeof NativeInterface.readToolPkgResource !== 'function'
-            ) {
-                return Promise.reject(new Error('NativeInterface.readToolPkgResource is unavailable'));
-            }
-            var raw = NativeInterface.readToolPkgResource(
-                target,
-                resourceKey,
+            return __operitInvokeHostAsync(__operitNativeReadToolPkgResource, [
+                target, resourceKey,
                 outputFileName == null ? '' : String(outputFileName).trim(),
-                internal === true ? 'true' : ''
-            );
-            if (typeof raw !== 'string' || !raw.trim()) {
-                return Promise.reject(new Error('resource not found: ' + target + '/' + resourceKey));
-            }
-            try {
-                var parsed = JSON.parse(raw);
-                if (parsed && parsed.success === false) {
-                    return Promise.reject(new Error(String(parsed.message || 'resource read failed')));
-                }
-            } catch (_error) {}
-            return Promise.resolve(raw);
+                internal === true
+            ]);
         }
+
+        /** Reads and validates the direct absolute VFS configuration path. */
 
         function getToolPkgConfigDir(pluginId) {
             var explicitId = String(pluginId || '').trim();
-            var target = explicitId || resolveCurrentToolPkgTarget();
+            var owner = resolveCurrentToolPkgTarget();
+            var target = explicitId || owner;
             if (!target) {
                 throw new Error('package/toolpkg runtime target is empty');
             }
-            if (
-                typeof NativeInterface === 'undefined' ||
-                !NativeInterface ||
-                typeof NativeInterface.getPluginConfigDir !== 'function'
-            ) {
-                throw new Error('NativeInterface.getPluginConfigDir is unavailable');
-            }
-            var path = NativeInterface.getPluginConfigDir(target);
-            if (typeof path === 'string' && path.trim()) {
+            var path = __operitNativeGetScopedPluginConfigDir(owner, target);
+            if (typeof path === 'string' && path.startsWith('/')) {
                 return path;
             }
-            throw new Error('plugin config dir is unavailable for ' + target);
+            throw new Error('Plugin configuration directory must be an absolute VFS path');
         }
 
-        function normalizeToolPkgWasmValueType(valueType) {
-            var normalizedType = String(valueType || '').trim().toLowerCase();
-            if (
-                normalizedType !== 'i32' &&
-                normalizedType !== 'i64' &&
-                normalizedType !== 'f32' &&
-                normalizedType !== 'f64'
-            ) {
-                throw new Error('ToolPkg.wasm arg type is invalid: ' + normalizedType);
+        /** Resolves the executing container's stable local data through its Host. */
+        function getToolPkgLocalDataDir() {
+            var owner = resolveCurrentToolPkgTarget();
+            if (!owner) {
+                throw new Error('package/toolpkg runtime target is empty');
             }
-            return normalizedType;
+            var path = __operitNativeGetPluginLocalDataDir(owner);
+            if (typeof path !== 'string' || !path.startsWith('/')) {
+                throw new Error('Plugin local data directory must be an absolute VFS path');
+            }
+            return path;
         }
 
-        function normalizeToolPkgWasmArgs(args) {
-            if (args == null) {
-                return [];
+        /** Resolves persistent shared data without changing the plugin's installation scope. */
+        function getToolPkgSpaceDataDir() {
+            var owner = resolveCurrentToolPkgTarget();
+            if (!owner) { throw new Error('package/toolpkg runtime target is empty'); }
+            var path = __operitNativeGetPluginSpaceDataDir(owner);
+            if (typeof path !== 'string' || !path.startsWith('/')) {
+                throw new Error('Plugin shared data directory must be an absolute VFS path');
             }
-            if (!Array.isArray(args)) {
-                throw new Error('ToolPkg.wasm args must be an array');
-            }
-            var normalizedArgs = [];
-            for (var i = 0; i < args.length; i += 1) {
-                var arg = args[i];
-                if (!arg || typeof arg !== 'object' || Array.isArray(arg)) {
-                    throw new Error('ToolPkg.wasm arg ' + i + ' must be an object');
-                }
-                var valueType = normalizeToolPkgWasmValueType(arg.type);
-                if (!Object.prototype.hasOwnProperty.call(arg, 'value')) {
-                    throw new Error('ToolPkg.wasm arg ' + i + ' value is required');
-                }
-                var value = arg.value;
-                if (valueType === 'i32' && typeof value !== 'number') {
-                    throw new Error('ToolPkg.wasm arg ' + i + ' i32 value must be a number');
-                }
-                if (valueType === 'i64' && typeof value !== 'number' && typeof value !== 'string') {
-                    throw new Error('ToolPkg.wasm arg ' + i + ' i64 value must be a number or string');
-                }
-                if (
-                    (valueType === 'f32' || valueType === 'f64') &&
-                    typeof value !== 'number' &&
-                    typeof value !== 'string'
-                ) {
-                    throw new Error('ToolPkg.wasm arg ' + i + ' float value must be a number or string');
-                }
-                normalizedArgs.push({ type: valueType, value: value });
-            }
-            return normalizedArgs;
+            return path;
         }
 
-        function callToolPkgWasm(moduleId, exportName, args) {
-            if (registrationOnly) {
-                throw new Error('ToolPkg.wasm.call is unavailable during ToolPkg registration');
-            }
-            var normalizedModuleId = String(moduleId || '').trim();
-            if (!normalizedModuleId) {
-                return Promise.reject(new Error('ToolPkg.wasm module id is required'));
-            }
-            var normalizedExportName = String(exportName || '').trim();
-            if (!normalizedExportName) {
-                return Promise.reject(new Error('ToolPkg.wasm export name is required'));
-            }
-            var normalizedArgs;
-            try {
-                normalizedArgs = normalizeToolPkgWasmArgs(args);
-            } catch (error) {
-                return Promise.reject(error);
-            }
-            var target = resolveCurrentToolPkgTarget();
-            if (!target) {
-                return Promise.reject(new Error('package/toolpkg runtime target is empty'));
-            }
-            if (
-                typeof NativeInterface === 'undefined' ||
-                !NativeInterface ||
-                typeof NativeInterface.callToolPkgWasm !== 'function'
-            ) {
-                return Promise.reject(new Error('NativeInterface.callToolPkgWasm is unavailable'));
-            }
-            var resultJson;
-            try {
-                resultJson = NativeInterface.callToolPkgWasm(
-                    target,
-                    normalizedModuleId,
-                    normalizedExportName,
-                    JSON.stringify(normalizedArgs)
-                );
-            } catch (error) {
-                return Promise.reject(error);
-            }
-            var parsed;
-            try {
-                parsed = JSON.parse(String(resultJson || 'null'));
-            } catch (error) {
-                return Promise.reject(
-                    new Error('ToolPkg.wasm returned invalid JSON: ' + String(error && error.message ? error.message : error))
-                );
-            }
-            if (parsed && parsed.success === true) {
-                return Promise.resolve(
-                    Object.prototype.hasOwnProperty.call(parsed, 'value') ? parsed.value : null
-                );
-            }
-            return Promise.reject(
-                new Error(
-                    parsed && typeof parsed.message === 'string' && parsed.message.trim().length > 0
-                        ? parsed.message.trim()
-                        : 'ToolPkg.wasm call failed'
-                )
-            );
+        function windowCommand(operation, options) {
+            if (registrationOnly) throw new Error('Floating windows cannot be used during registration');
+            var request = Object.assign({}, options || {}, {operation:operation});
+            return root.__operitInvokeHostAsync(root.__operitNativeFloatingWindowCommand, [request]);
         }
-
         function requireToolPkgApiRuntime() {
             var runtime = root.__operitToolPkgApi;
             if (!runtime || typeof runtime !== 'object') {
@@ -582,6 +503,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
 
         var toolPkgApi = requireToolPkgApiRuntime();
         var api = toolPkgApi.namespace('ToolPkg', {
+            ipc: root.__operitToolPkgIpc,
             _m: captureMarketOrigin,
             // Captures only explicitly published methods using durable exported function references.
             registerApi: function(definition) {
@@ -594,15 +516,51 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                 capture.publicApis.push(normalizeSpec(normalized));
             },
             callDependency: toolPkgApi.callDependency,
-            registerToolboxUiModule: registerScreen('toolboxUiModules', 'registerToolPkgToolboxUiModule'),
-            registerUiRoute: registerScreen('uiRoutes', 'registerToolPkgUiRoute'),
-            registerChatComposerSlot: registerScreen('chatComposerSlots', 'registerToolPkgChatComposerSlot'),
-            /// Encodes navigation callbacks using the nested runtime action contract.
+            ui: {
+              floatingWindows: {
+                capabilities: function() { return windowCommand('capabilities', {}); },
+                requestPermission: function() { return windowCommand('requestPermission', {}); },
+                open: function(options) { return windowCommand('open', options); },
+                update: function(id, options, state) { var request = {id:id, options:options}; if (state !== undefined) request.state = state; return windowCommand('update', request); },
+                show: function(id) { return windowCommand('show', {id:id}); },
+                hide: function(id) { return windowCommand('hide', {id:id}); },
+                close: function(id) { return windowCommand('close', {id:id}); },
+                list: function() { return windowCommand('list', {}); }
+              }
+            },
+            registerToolboxUiModule: registerScreen('toolboxUiModules', 'ToolPkg.registerToolboxUiModule'),
+            registerUiRoute: registerScreen('uiRoutes', 'ToolPkg.registerUiRoute'),
+            registerChatComposerSlot: registerScreen('chatComposerSlots', 'ToolPkg.registerChatComposerSlot'),
+            /** Captures validated navigation metadata, opaque route input, and durable optional callbacks. */
             registerNavigationEntry: function(definition) {
+                if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
+                    throw new Error('registerNavigationEntry requires an object');
+                }
+                validateNavigationSurface(definition.surface);
+                if (definition.surface === 'workspace_file') {
+                    var extensions = definition.params && definition.params.extensions;
+                    if (!Array.isArray(extensions) || !extensions.length ||
+                        extensions.some(function(ext) { return typeof ext !== 'string' || !/^[a-z0-9]+(?:[._+-][a-z0-9]+)*$/.test(ext); }) ||
+                        new Set(extensions).size !== extensions.length) {
+                        throw new Error('workspace_file requires unique lowercase params.extensions without leading dots');
+                    }
+                }
+                if (definition.surface === 'chat_attachments' || isEmbeddedUiSurface(definition.surface)) {
+                    if (definition.action !== undefined && definition.action !== null) {
+                        throw new Error('registerNavigationEntry.action is unsupported for ' + definition.surface);
+                    }
+                    if (typeof definition.route !== 'string' || !definition.route.trim()) {
+                        throw new Error('registerNavigationEntry.route is required for ' + definition.surface);
+                    }
+                }
+                if (isEmbeddedUiSurface(definition.surface)) validateEmbeddedRoute(definition);
+                if (Object.prototype.hasOwnProperty.call(definition, 'params')) {
+                    validateNavigationParams(definition.params, []);
+                }
                 var normalized = copyObject(definition, '');
                 if (definition && typeof definition.action === 'function') {
                     var ref = resolveDurableFunctionRef(
-                        definition.action, definition, 'registerToolPkgNavigationEntry'
+                        definition.action, definition, 'ToolPkg.registerNavigationEntry'
                     );
                     normalized.action = { function: ref.name };
                     if (ref.source) {
@@ -619,6 +577,21 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             registerChatInputHook: registerFunction('chatInputHooks', 'registerChatInputHook'),
             registerChatViewHook: registerFunction('chatViewHooks', 'registerChatViewHook'),
             registerChatMessageHook: registerFunction('chatMessageHooks', 'registerChatMessageHook'),
+            registerMessageTransformHook: registerFunction('messageTransformHooks', 'registerMessageTransformHook'),
+            registerMessageStreamTransform: registerFunction('messageStreamTransforms', 'registerMessageStreamTransform'),
+            /** Captures exactly one exported creation handler for this authenticated package owner. */
+            registerChatLifecycleHook: function(definition) {
+                var owner = resolveCurrentToolPkgTarget();
+                if (!owner) throw new Error('registerChatLifecycleHook owner is unavailable');
+                if (!definition || typeof definition.id !== 'string' || !definition.id.trim()) {
+                    throw new Error('registerChatLifecycleHook.id is required');
+                }
+                if (capture.chatLifecycleHooks.length !== 0) {
+                    throw new Error('Duplicate chat lifecycle hook owner: ' + owner);
+                }
+                var normalized = normalizeFunctionField(definition, 'function', 'registerChatLifecycleHook');
+                capture.chatLifecycleHooks.push(normalizeSpec(normalized));
+            },
             registerChatMessageMenuItem: toolPkgApi.method()
                 .between('1.0.1', '2.0.0')
                 .since('2.0.0')
@@ -637,6 +610,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                 .between('1.0.1', '2.0.0')
                 .since('2.0.0')
                 .implement(registerFunction('chatRuntimeHooks', 'registerChatRuntimeHook')),
+            registerChatResponseHook: registerFunction('chatResponseHooks', 'registerChatResponseHook'),
             registerHostEventHook: registerFunction('hostEventHooks', 'registerHostEventHook'),
             registerToolLifecycleHook: registerFunction('toolLifecycleHooks', 'registerToolLifecycleHook'),
             registerPromptInputHook: registerFunction('promptInputHooks', 'registerPromptInputHook'),
@@ -651,67 +625,20 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             readResource: readToolPkgResource,
             readResourceFromPackage: readToolPkgResourceFromPackage,
             getConfigDir: getToolPkgConfigDir,
-            wasm: {
-                call: callToolPkgWasm
-            },
+            getLocalDataDir: getToolPkgLocalDataDir,
+            getSpaceDataDir: getToolPkgSpaceDataDir,
+            wasm: root.__operitCreateToolPkgWasmApi(resolveCurrentToolPkgTarget, registrationOnly),
             registerAiProvider: function(definition) {
                 capture.aiProviders.push(normalizeSpec(normalizeAiProviderDefinition(definition, 'registerAiProvider')));
             },
             registerManifestExtension: registerFunction('manifestExtensions', 'registerManifestExtension')
         });
 
-        root.registerToolPkgToolboxUiModule = api.registerToolboxUiModule;
-        root.registerToolPkgUiRoute = api.registerUiRoute;
-        root.registerToolPkgChatComposerSlot = api.registerChatComposerSlot;
-        root.registerToolPkgNavigationEntry = api.registerNavigationEntry;
-        root.registerToolPkgDesktopWidget = api.registerDesktopWidget;
-        root.registerToolPkgAppLifecycleHook = api.registerAppLifecycleHook;
-        root.registerToolPkgMessageProcessingPlugin = api.registerMessageProcessingPlugin;
-        root.registerToolPkgXmlRenderPlugin = api.registerXmlRenderPlugin;
-        root.registerToolPkgInputMenuTogglePlugin = api.registerInputMenuTogglePlugin;
-        root.registerToolPkgChatInputHook = api.registerChatInputHook;
-        root.registerToolPkgChatViewHook = api.registerChatViewHook;
-        root.registerToolPkgChatMessageHook = api.registerChatMessageHook;
-        root.registerToolPkgChatMessageMenuItem = api.registerChatMessageMenuItem;
-        root.registerToolPkgChatRuntimeHook = api.registerChatRuntimeHook;
-        root.registerToolPkgHostEventHook = api.registerHostEventHook;
-        root.registerToolPkgToolLifecycleHook = api.registerToolLifecycleHook;
-        root.registerToolPkgPromptInputHook = api.registerPromptInputHook;
-        root.registerToolPkgPromptHistoryHook = api.registerPromptHistoryHook;
-        root.registerToolPkgPromptEstimateHistoryHook = api.registerPromptEstimateHistoryHook;
-        root.registerToolPkgSystemPromptComposeHook = api.registerSystemPromptComposeHook;
-        root.registerToolPkgToolPromptComposeHook = api.registerToolPromptComposeHook;
-        root.registerToolPkgPromptFinalizeHook = api.registerPromptFinalizeHook;
-        root.registerToolPkgPromptEstimateFinalizeHook = api.registerPromptEstimateFinalizeHook;
-        root.registerToolPkgSummaryGenerateHook = api.registerSummaryGenerateHook;
-        root.registerToolPkgCoreCommand = api.registerCoreCommand;
-        root.registerToolPkgAiProvider = api.registerAiProvider;
-        root.registerToolPkgManifestExtension = api.registerManifestExtension;
-
-        root.registerAppLifecycleHook = api.registerAppLifecycleHook;
-        root.registerMessageProcessingPlugin = api.registerMessageProcessingPlugin;
-        root.registerXmlRenderPlugin = api.registerXmlRenderPlugin;
-        root.registerInputMenuTogglePlugin = api.registerInputMenuTogglePlugin;
-        root.registerChatInputHook = api.registerChatInputHook;
-        root.registerChatViewHook = api.registerChatViewHook;
-        root.registerChatMessageHook = api.registerChatMessageHook;
-        root.registerChatMessageMenuItem = api.registerChatMessageMenuItem;
-        root.registerChatRuntimeHook = api.registerChatRuntimeHook;
-        root.registerHostEventHook = api.registerHostEventHook;
-        root.registerToolLifecycleHook = api.registerToolLifecycleHook;
-        root.registerPromptInputHook = api.registerPromptInputHook;
-        root.registerPromptHistoryHook = api.registerPromptHistoryHook;
-        root.registerPromptEstimateHistoryHook = api.registerPromptEstimateHistoryHook;
-        root.registerSystemPromptComposeHook = api.registerSystemPromptComposeHook;
-        root.registerToolPromptComposeHook = api.registerToolPromptComposeHook;
-        root.registerPromptFinalizeHook = api.registerPromptFinalizeHook;
-        root.registerPromptEstimateFinalizeHook = api.registerPromptEstimateFinalizeHook;
-        root.registerSummaryGenerateHook = api.registerSummaryGenerateHook;
-        root.registerCoreCommand = api.registerCoreCommand;
-
         installGlobal('ToolPkg', api);
     })();
     "#
+    .replace("__OPERIT_TOOLPKG_MODULE_EXPORTS__", include_str!("ModuleExports.js"))
+    .replace("__OPERIT_TOOLPKG_WASM_API__", include_str!("ToolPkgWasmApi.js"))
     .replace("__OPERIT_TOOLPKG_REGISTRATION_ONLY__", registrationOnly)
 }
 
@@ -719,17 +646,47 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
 mod tests {
     use super::buildToolPkgRegistrationBridgeScript;
     use crate::toolpkg::ToolPkgApiRuntimeScript::buildToolPkgApiRuntimeScript;
-    use rquickjs::{Context, Runtime};
+    use operit_host_api::HostJavaScriptRuntime;
+
+    /// Captures durable text handlers without exposing manual display invalidation.
+    #[test]
+    fn captures_message_transform_registration() {
+        let mut context = crate::javascript_test::runtime();
+        context.evaluateHostJavaScriptVoid("test", r#"
+            globalThis.__operitExpose = function(name, value) { globalThis[name] = value; };
+        "#).unwrap();
+        context.evaluateHostJavaScriptVoid("test", &buildToolPkgApiRuntimeScript()).unwrap();
+        context.evaluateHostJavaScriptVoid("test", &buildToolPkgRegistrationBridgeScript(false)).unwrap();
+        context.evaluateHostJavaScriptVoid("test", r#"
+            function transformText(event) { return event.eventPayload.text.replace(/secret/g, ''); }
+            globalThis.__operitGetActiveModuleExports = function() { return { transformText: transformText }; };
+            ToolPkg.registerMessageTransformHook({ id: 'redact', function: transformText });
+            ToolPkg.registerMessageStreamTransform({ id: 'native', function: transformText });
+        "#).unwrap();
+        let capture = context.evaluateHostJavaScriptString("test",
+            "JSON.stringify(globalThis.__operitToolPkgRegistrationCapture.messageTransformHooks.map(JSON.parse))").unwrap();
+        let hooks: serde_json::Value = serde_json::from_str(&capture).unwrap();
+        assert_eq!(hooks[0]["id"], "redact");
+        assert_eq!(hooks[0]["function"], "transformText");
+        let capture = context.evaluateHostJavaScriptString("test",
+            "JSON.stringify(globalThis.__operitToolPkgRegistrationCapture.messageStreamTransforms.map(JSON.parse))").unwrap();
+        let hooks: serde_json::Value = serde_json::from_str(&capture).unwrap();
+        assert_eq!(hooks[0]["id"], "native");
+        assert_eq!(hooks[0]["function"], "transformText");
+        assert_eq!(context.evaluateHostJavaScriptString("test", "typeof ToolPkg.invalidateMessageTransforms").unwrap(), "undefined");
+        assert!(context.evaluateHostJavaScriptVoid("test",
+            "ToolPkg.registerMessageTransformHook({ id: 'invalid', function: 42 })").is_err());
+    }
 
     /// Verifies runtime marketplace markers can be evaluated repeatedly without capture side effects.
     #[test]
     fn runtime_marketplace_marker_is_repeatable_noop() {
-        let runtime = Runtime::new().expect("QuickJS runtime should start");
-        let context = Context::full(&runtime).expect("QuickJS context should start");
+        let mut context = crate::javascript_test::runtime();
 
-        context.with(|context| {
+        {
             context
-                .eval::<(), _>(
+                .evaluateHostJavaScriptVoid(
+                    "test",
                     r#"
                     globalThis.__operitExpose = function(name, value) {
                         globalThis[name] = value;
@@ -738,33 +695,34 @@ mod tests {
                 )
                 .expect("runtime expose should evaluate");
             context
-                .eval::<(), _>(buildToolPkgApiRuntimeScript())
+                .evaluateHostJavaScriptVoid("test", &buildToolPkgApiRuntimeScript())
                 .expect("toolpkg api runtime should evaluate");
             context
-                .eval::<(), _>(buildToolPkgRegistrationBridgeScript(false))
+                .evaluateHostJavaScriptVoid("test", &buildToolPkgRegistrationBridgeScript(false))
                 .expect("runtime bridge should evaluate");
             context
-                .eval::<(), _>("ToolPkg._m([], 0); ToolPkg._m([], 0);")
+                .evaluateHostJavaScriptVoid("test", "ToolPkg._m([], 0); ToolPkg._m([], 0);")
                 .expect("runtime marker calls should not throw");
             let capturedOrigin = context
-                .eval::<String, _>(
+                .evaluateHostJavaScriptString(
+                    "test",
                     "String(globalThis.__operitToolPkgRegistrationCapture.marketOrigin)",
                 )
                 .expect("runtime capture should be readable");
 
             assert_eq!(capturedOrigin, "null");
-        });
+        }
     }
 
     /// Verifies Core command registrations retain their metadata and durable callback reference.
     #[test]
     fn captures_core_command_registration() {
-        let runtime = Runtime::new().expect("QuickJS runtime should start");
-        let context = Context::full(&runtime).expect("QuickJS context should start");
+        let mut context = crate::javascript_test::runtime();
 
-        context.with(|context| {
+        {
             context
-                .eval::<(), _>(
+                .evaluateHostJavaScriptVoid(
+                    "test",
                     r#"
                     globalThis.__operitExpose = function(name, value) {
                         globalThis[name] = value;
@@ -773,13 +731,14 @@ mod tests {
                 )
                 .expect("runtime expose should evaluate");
             context
-                .eval::<(), _>(buildToolPkgApiRuntimeScript())
+                .evaluateHostJavaScriptVoid("test", &buildToolPkgApiRuntimeScript())
                 .expect("toolpkg api runtime should evaluate");
             context
-                .eval::<(), _>(buildToolPkgRegistrationBridgeScript(false))
+                .evaluateHostJavaScriptVoid("test", &buildToolPkgRegistrationBridgeScript(false))
                 .expect("runtime bridge should evaluate");
             context
-                .eval::<(), _>(
+                .evaluateHostJavaScriptVoid(
+                    "test",
                     r#"
                     function runHello(event) {
                         return { stdout: event.eventPayload.commandName };
@@ -799,18 +758,63 @@ mod tests {
                 )
                 .expect("Core command registration should evaluate");
             let command_name = context
-                .eval::<String, _>(
+                .evaluateHostJavaScriptString("test",
                     "JSON.parse(globalThis.__operitToolPkgRegistrationCapture.coreCommands[0]).name",
                 )
                 .expect("captured command should be readable");
             let function_name = context
-                .eval::<String, _>(
+                .evaluateHostJavaScriptString("test",
                     "JSON.parse(globalThis.__operitToolPkgRegistrationCapture.coreCommands[0]).function",
                 )
                 .expect("captured function should be readable");
 
             assert_eq!(command_name, "hello");
             assert_eq!(function_name, "runHello");
-        });
+        }
+    }
+
+    /// Verifies the unexported-handler error names the constraint and explains the fix.
+    #[test]
+    fn unexported_core_command_handler_error_guides_export() {
+        let mut context = crate::javascript_test::runtime();
+        context
+            .evaluateHostJavaScriptVoid(
+                "test",
+                r#"
+                globalThis.__operitExpose = function(name, value) {
+                    globalThis[name] = value;
+                };
+                "#,
+            )
+            .expect("runtime expose should evaluate");
+        context
+            .evaluateHostJavaScriptVoid("test", &buildToolPkgApiRuntimeScript())
+            .expect("toolpkg api runtime should evaluate");
+        context
+            .evaluateHostJavaScriptVoid("test", &buildToolPkgRegistrationBridgeScript(false))
+            .expect("runtime bridge should evaluate");
+        let error = context
+            .evaluateHostJavaScriptVoid(
+                "test",
+                r#"
+                function localHandler(event) { return { stdout: 'hi' }; }
+                globalThis.__operitGetActiveModuleExports = function() { return {}; };
+                ToolPkg.registerCoreCommand({
+                    id: 'bad',
+                    name: 'bad',
+                    function: localHandler
+                });
+                "#,
+            )
+            .expect_err("unexported handler should fail registration");
+        let message = format!("{error}");
+        assert!(
+            message.contains("exported ToolPkg function reference"),
+            "error should name the constraint: {message}"
+        );
+        assert!(
+            message.contains("export the handler"),
+            "error should explain the fix: {message}"
+        );
     }
 }

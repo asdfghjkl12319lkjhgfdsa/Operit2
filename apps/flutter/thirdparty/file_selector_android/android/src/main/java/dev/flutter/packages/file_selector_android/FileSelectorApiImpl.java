@@ -23,9 +23,6 @@ import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
 import io.flutter.plugin.common.PluginRegistry;
-import java.io.DataInputStream;
-import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -47,6 +44,8 @@ public class FileSelectorApiImpl implements FileSelectorApi {
 
   private final @NonNull NativeObjectFactory objectFactory;
   private final @NonNull AndroidSdkChecker sdkChecker;
+  private final List<PluginRegistry.ActivityResultListener> pendingListeners =
+      new ArrayList<>();
   @Nullable ActivityPluginBinding activityPluginBinding;
 
   private abstract static class OnResultListener {
@@ -60,11 +59,6 @@ public class FileSelectorApiImpl implements FileSelectorApi {
     @NonNull
     Intent newIntent(@NonNull String action) {
       return new Intent(action);
-    }
-
-    @NonNull
-    DataInputStream newDataInputStream(InputStream inputStream) {
-      return new DataInputStream(inputStream);
     }
   }
 
@@ -243,7 +237,18 @@ public class FileSelectorApiImpl implements FileSelectorApi {
   }
 
   public void setActivityPluginBinding(@Nullable ActivityPluginBinding activityPluginBinding) {
+    final ActivityPluginBinding previous = this.activityPluginBinding;
+    if (previous != null) {
+      for (PluginRegistry.ActivityResultListener listener : pendingListeners) {
+        previous.removeActivityResultListener(listener);
+      }
+    }
     this.activityPluginBinding = activityPluginBinding;
+    if (activityPluginBinding != null) {
+      for (PluginRegistry.ActivityResultListener listener : pendingListeners) {
+        activityPluginBinding.addActivityResultListener(listener);
+      }
+    }
   }
 
   // Setting the mimeType with `setType` is required when opening files. This handles setting the
@@ -298,20 +303,35 @@ public class FileSelectorApiImpl implements FileSelectorApi {
     if (activityPluginBinding == null) {
       throw new Exception("No activity is available.");
     }
-    activityPluginBinding.addActivityResultListener(
+    final PluginRegistry.ActivityResultListener listener =
         new PluginRegistry.ActivityResultListener() {
           @Override
           public boolean onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
-            if (requestCode == attemptRequestCode) {
-              resultListener.onResult(resultCode, data);
-              activityPluginBinding.removeActivityResultListener(this);
-              return true;
+            if (requestCode != attemptRequestCode) {
+              return false;
             }
-
-            return false;
+            pendingListeners.remove(this);
+            final ActivityPluginBinding binding = activityPluginBinding;
+            if (binding != null) {
+              binding.removeActivityResultListener(this);
+            }
+            try {
+              resultListener.onResult(resultCode, data);
+            } catch (RuntimeException exception) {
+              Log.e(TAG, "Opening the selected file failed", exception);
+            }
+            return true;
           }
-        });
-    activityPluginBinding.getActivity().startActivityForResult(intent, attemptRequestCode);
+        };
+    pendingListeners.add(listener);
+    activityPluginBinding.addActivityResultListener(listener);
+    try {
+      activityPluginBinding.getActivity().startActivityForResult(intent, attemptRequestCode);
+    } catch (RuntimeException exception) {
+      pendingListeners.remove(listener);
+      activityPluginBinding.removeActivityResultListener(listener);
+      throw exception;
+    }
   }
 
   @Nullable
@@ -325,7 +345,6 @@ public class FileSelectorApiImpl implements FileSelectorApi {
         activityPluginBinding.getActivity().getContentResolver();
 
     String name = null;
-    Integer size = null;
     try (Cursor cursor = contentResolver.query(uri, null, null, null, null, null)) {
       if (cursor != null && cursor.moveToFirst()) {
         // Note it's called "Display Name". This is
@@ -334,28 +353,7 @@ public class FileSelectorApiImpl implements FileSelectorApi {
         if (nameIndex >= 0) {
           name = cursor.getString(nameIndex);
         }
-
-        final int sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE);
-        // If the size is unknown, the value stored is null. This will
-        // happen often: The storage API allows for remote files, whose
-        // size might not be locally known.
-        if (!cursor.isNull(sizeIndex)) {
-          size = cursor.getInt(sizeIndex);
-        }
       }
-    }
-
-    if (size == null) {
-      return null;
-    }
-
-    final byte[] bytes = new byte[size];
-    try (InputStream inputStream = contentResolver.openInputStream(uri)) {
-      final DataInputStream dataInputStream = objectFactory.newDataInputStream(inputStream);
-      dataInputStream.readFully(bytes);
-    } catch (IOException exception) {
-      Log.w(TAG, exception.getMessage());
-      return null;
     }
 
     String uriPath;
@@ -363,26 +361,27 @@ public class FileSelectorApiImpl implements FileSelectorApi {
 
     try {
       uriPath = FileUtils.getPathFromCopyOfFileFromUri(activityPluginBinding.getActivity(), uri);
-    } catch (IOException e) {
-      // If closing the output stream fails, we cannot be sure that the
-      // target file was written in full. Flushing the stream merely moves
-      // the bytes into the OS, not necessarily to the file.
-      uriPath = null;
-    } catch (SecurityException e) {
-      // Calling `ContentResolver#openInputStream()` has been reported to throw a
-      // `SecurityException` on some devices in certain circumstances. Instead of crashing, we
-      // return `null`.
-      //
-      // See https://github.com/flutter/flutter/issues/100025 for more details.
-      uriPath = null;
     } catch (IllegalArgumentException e) {
       uriPath = FILE_SELECTOR_EXCEPTION_PLACEHOLDER_PATH;
       nativeError =
           new FileSelectorNativeException(
               FileSelectorExceptionCode.ILLEGAL_ARGUMENT_EXCEPTION,
               e.getMessage() == null ? "" : e.getMessage());
+    } catch (Exception e) {
+      // A provider with no display name, a dropped read grant, or a failed copy must
+      // complete the Dart callback. An exception escaping this method leaves the
+      // activity-result listener registered, so later selections never arrive.
+      Log.w(TAG, "Failed to copy the selected file", e);
+      uriPath = null;
     }
 
-    return new FileResponse(uriPath, contentResolver.getType(uri), name, size, bytes, nativeError);
+    if (uriPath == null) {
+      return null;
+    }
+    // The cache copy is already file-backed and bounded. Never also materialize its bytes
+    // in Java or serialize the complete file through Pigeon. Use the actual copied length
+    // so unknown/provider-stale metadata does not prevent selecting a file.
+    final long copiedSize = nativeError == null ? new java.io.File(uriPath).length() : 0;
+    return new FileResponse(uriPath, contentResolver.getType(uri), name, copiedSize, nativeError);
   }
 }

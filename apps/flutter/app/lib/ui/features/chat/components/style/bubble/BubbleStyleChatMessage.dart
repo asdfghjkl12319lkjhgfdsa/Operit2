@@ -24,11 +24,12 @@ class BubbleStyleChatMessage extends StatelessWidget {
     this.aiBubbleImageStyle,
     this.bubbleUserRoundedCornersEnabled = true,
     this.bubbleAiRoundedCornersEnabled = true,
-    this.bubbleUserContentPaddingLeft = 12,
-    this.bubbleUserContentPaddingRight = 12,
-    this.bubbleAiContentPaddingLeft = 12,
-    this.bubbleAiContentPaddingRight = 12,
-    this.currentCharacterCardAvatarUri,
+    this.bubbleUserContentPaddingLeft = 8,
+    this.bubbleUserContentPaddingRight = 8,
+    this.bubbleAiContentPaddingLeft = 8,
+    this.bubbleAiContentPaddingRight = 8,
+    this.identityAvatarUri,
+    this.onIdentityTap,
     this.initialThinkingExpanded = false,
     this.allowExpandedThinkingFullHeight = false,
     this.expandThinkToolsGroups = false,
@@ -57,7 +58,8 @@ class BubbleStyleChatMessage extends StatelessWidget {
   final double bubbleUserContentPaddingRight;
   final double bubbleAiContentPaddingLeft;
   final double bubbleAiContentPaddingRight;
-  final String? currentCharacterCardAvatarUri;
+  final String? identityAvatarUri;
+  final VoidCallback? onIdentityTap;
   final bool initialThinkingExpanded;
   final bool allowExpandedThinkingFullHeight;
   final bool expandThinkToolsGroups;
@@ -82,7 +84,7 @@ class BubbleStyleChatMessage extends StatelessWidget {
           bubbleRoundedCornersEnabled: bubbleUserRoundedCornersEnabled,
           bubbleContentPaddingLeft: bubbleUserContentPaddingLeft,
           bubbleContentPaddingRight: bubbleUserContentPaddingRight,
-          proxyAvatarImagePath: currentCharacterCardAvatarUri,
+          proxyAvatarImagePath: identityAvatarUri,
           enableDialogs: enableDialogs,
         );
       case 'ai':
@@ -95,7 +97,8 @@ class BubbleStyleChatMessage extends StatelessWidget {
           bubbleRoundedCornersEnabled: bubbleAiRoundedCornersEnabled,
           bubbleContentPaddingLeft: bubbleAiContentPaddingLeft,
           bubbleContentPaddingRight: bubbleAiContentPaddingRight,
-          avatarImagePath: currentCharacterCardAvatarUri,
+          avatarImagePath: identityAvatarUri,
+          onIdentityTap: enableDialogs ? onIdentityTap : null,
           initialThinkingExpanded: initialThinkingExpanded,
           allowExpandedThinkingFullHeight: allowExpandedThinkingFullHeight,
           expandThinkToolsGroups: expandThinkToolsGroups,
@@ -113,6 +116,7 @@ class BubbleStyleChatMessage extends StatelessWidget {
               : () => onDeleteMessage!(message.timestamp),
           onEdit: onEditSummary,
           enableDialog: enableDialogs,
+          splitMarkdownContent: splitMarkdownContent,
         );
     }
     return _SystemMessageComposable(

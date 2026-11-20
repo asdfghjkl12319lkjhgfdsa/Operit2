@@ -1,13 +1,19 @@
 // ignore_for_file: file_names
 
 import 'dart:async';
-import 'dart:io';
-import 'dart:ui' show FontFeature;
 
 import 'package:flutter/material.dart';
+import 'package:operit2/core/proxy/generated/CoreProxyModels.g.dart'
+    show MessagePartKind;
 import 'package:operit2/l10n/generated/app_localizations.dart';
+import 'package:operit_ui/operit_ui.dart'
+    show
+        resolveThemeBubbleMaxWidth,
+        themeBubbleAvatarGap,
+        themeBubbleAvatarSize;
 
-import '../../../../../common/CharacterAvatar.dart';
+import '../../../../../common/ChatAvatarImage.dart';
+import '../../../../../common/markdown/MarkdownImageRenderer.dart';
 import '../../../../../common/markdown/MarkdownNodeGrouper.dart';
 import '../../../../../common/markdown/StreamMarkdownRenderer.dart';
 import '../../../../../common/markdown/StreamMarkdownRendererState.dart';
@@ -29,8 +35,8 @@ class BubbleAiMessageComposable extends StatefulWidget {
     this.transparentSurface = false,
     this.bubbleImageStyle,
     this.bubbleRoundedCornersEnabled = true,
-    this.bubbleContentPaddingLeft = 12,
-    this.bubbleContentPaddingRight = 12,
+    this.bubbleContentPaddingLeft = 8,
+    this.bubbleContentPaddingRight = 8,
     this.avatarImagePath,
     this.initialThinkingExpanded = false,
     this.allowExpandedThinkingFullHeight = false,
@@ -40,6 +46,7 @@ class BubbleAiMessageComposable extends StatefulWidget {
     this.isHidden = false,
     this.enableDialogs = true,
     this.onAvatarLongPressMention,
+    this.onIdentityTap,
     this.splitMarkdownContent,
   });
 
@@ -60,6 +67,7 @@ class BubbleAiMessageComposable extends StatefulWidget {
   final bool isHidden;
   final bool enableDialogs;
   final void Function(String roleName)? onAvatarLongPressMention;
+  final VoidCallback? onIdentityTap;
   final MarkdownContentSplitter? splitMarkdownContent;
 
   @override
@@ -123,12 +131,13 @@ class _BubbleAiMessageComposableState extends State<BubbleAiMessageComposable> {
     final textColor = widget.textColor;
     final showThinkingProcess =
         widget.forceShowThinkingProcess || snapshot.showThinkingProcess;
-    final roleNameText =
-        snapshot.showRoleName && widget.message.roleName.isNotEmpty
-        ? widget.message.roleName
-        : '';
+    final roleNameText = bubbleAiPrimaryTitle(widget.message, snapshot);
     final metadataText = _metadataText(widget.message, snapshot, l10n: l10n);
-    final tooltipText = formatMessageMetadataTooltip(widget.message, snapshot, l10n: l10n);
+    final tooltipText = formatMessageMetadataTooltip(
+      widget.message,
+      snapshot,
+      l10n: l10n,
+    );
     final avatarImagePath = widget.avatarImagePath;
     final messageFontFamily = operitMessageFontFamily(snapshot, isUser: false);
     final messageFontFamilyFallback = operitMessageFontFamilyFallback(
@@ -140,14 +149,16 @@ class _BubbleAiMessageComposableState extends State<BubbleAiMessageComposable> {
         fontFamily: messageFontFamily,
         fontFamilyFallback: messageFontFamilyFallback,
       ),
+      primaryTextTheme: theme.primaryTextTheme.apply(
+        fontFamily: messageFontFamily,
+        fontFamilyFallback: messageFontFamilyFallback,
+      ),
     );
     final nodeGrouper = ThinkToolsXmlNodeGrouper(
       showThinkingProcess: showThinkingProcess,
       forceExpandGroups: widget.expandThinkToolsGroups,
     );
-    final effectiveBubbleImageStyle = widget.transparentSurface
-        ? null
-        : widget.bubbleImageStyle;
+    final effectiveBubbleImageStyle = widget.bubbleImageStyle;
     final bubbleShape = widget.bubbleRoundedCornersEnabled
         ? const BorderRadius.all(Radius.circular(16))
         : BorderRadius.zero;
@@ -157,7 +168,7 @@ class _BubbleAiMessageComposableState extends State<BubbleAiMessageComposable> {
       widget.bubbleContentPaddingRight,
       12,
     );
-    final imageUrl = _singleMarkdownImageUrl(widget.message);
+    final imageMarkdown = _singleMarkdownImage(widget.message);
     final renderIdentity = _messageRenderIdentity(widget.message);
 
     final messageBody = Theme(
@@ -197,11 +208,13 @@ class _BubbleAiMessageComposableState extends State<BubbleAiMessageComposable> {
             avatarShape: snapshot.avatarShape,
             avatarCornerRadius: snapshot.avatarCornerRadius,
             onAvatarLongPress: _avatarLongPressCallback(),
+            onIdentityTap: widget.enableDialogs ? widget.onIdentityTap : null,
             roleNameText: roleNameText,
             metadataText: metadataText,
             tooltipText: tooltipText,
             isInteracting: isInteracting,
-            imageUrl: imageUrl,
+            imageMarkdown: imageMarkdown,
+            enableImagePreview: widget.enableDialogs,
             bubbleShape: bubbleShape,
             backgroundColor: backgroundColor,
             textColor: textColor,
@@ -217,10 +230,16 @@ class _BubbleAiMessageComposableState extends State<BubbleAiMessageComposable> {
             avatarShape: snapshot.avatarShape,
             avatarCornerRadius: snapshot.avatarCornerRadius,
             onAvatarLongPress: _avatarLongPressCallback(),
-            displayText: _normalDisplayText(widget.message, snapshot, l10n: l10n),
+            onIdentityTap: widget.enableDialogs ? widget.onIdentityTap : null,
+            displayText: _normalDisplayText(
+              widget.message,
+              snapshot,
+              l10n: l10n,
+            ),
             tooltipText: tooltipText,
             isInteracting: isInteracting,
-            imageUrl: imageUrl,
+            imageMarkdown: imageMarkdown,
+            enableImagePreview: widget.enableDialogs,
             bubbleShape: bubbleShape,
             backgroundColor: backgroundColor,
             textColor: textColor,
@@ -315,11 +334,13 @@ class _WideAiBubbleLayout extends StatelessWidget {
     required this.avatarShape,
     required this.avatarCornerRadius,
     required this.onAvatarLongPress,
+    required this.onIdentityTap,
     required this.roleNameText,
     required this.metadataText,
     required this.tooltipText,
     required this.isInteracting,
-    required this.imageUrl,
+    required this.imageMarkdown,
+    required this.enableImagePreview,
     required this.bubbleShape,
     required this.backgroundColor,
     required this.textColor,
@@ -335,11 +356,13 @@ class _WideAiBubbleLayout extends StatelessWidget {
   final String avatarShape;
   final double avatarCornerRadius;
   final VoidCallback? onAvatarLongPress;
+  final VoidCallback? onIdentityTap;
   final String roleNameText;
   final String metadataText;
   final String tooltipText;
   final bool isInteracting;
-  final String? imageUrl;
+  final String? imageMarkdown;
+  final bool enableImagePreview;
   final BorderRadius bubbleShape;
   final Color backgroundColor;
   final Color textColor;
@@ -353,7 +376,7 @@ class _WideAiBubbleLayout extends StatelessWidget {
   Widget build(BuildContext context) {
     final headerVisible = bubbleShowAvatar || roleNameText.isNotEmpty;
     return Padding(
-      padding: EdgeInsets.fromLTRB(bubbleShowAvatar ? 0 : 8, 4, 0, 4),
+      padding: const EdgeInsets.symmetric(vertical: 4),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
@@ -367,25 +390,29 @@ class _WideAiBubbleLayout extends StatelessWidget {
                     avatarShape: avatarShape,
                     cornerRadius: avatarCornerRadius,
                     onLongPress: onAvatarLongPress,
+                    onTap: onIdentityTap,
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: themeBubbleAvatarGap),
                 ],
                 Flexible(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
                       if (roleNameText.isNotEmpty)
-                        Text(
-                          roleNameText,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.titleSmall
-                              ?.copyWith(
-                                fontWeight: FontWeight.w600,
-                                color: Theme.of(context).colorScheme.onSurface,
-                              ),
+                        InkWell(
+                          onTap: onIdentityTap,
+                          child: Text(
+                            roleNameText,
+                            softWrap: true,
+                            style: Theme.of(context).textTheme.titleSmall
+                                ?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurface,
+                                ),
+                          ),
                         ),
-
                     ],
                   ),
                 ),
@@ -395,15 +422,21 @@ class _WideAiBubbleLayout extends StatelessWidget {
           ],
           LayoutBuilder(
             builder: (context, constraints) {
-              if (imageUrl != null) {
+              final maxBubbleWidth = resolveThemeBubbleMaxWidth(
+                constraints.maxWidth,
+                wideLayout: true,
+              );
+              if (imageMarkdown != null) {
                 return _AiImageOnlyBubble(
-                  imageUrl: imageUrl!,
-                  maxWidth: constraints.maxWidth,
+                  imageMarkdown: imageMarkdown!,
+                  textColor: textColor,
+                  enablePreview: enableImagePreview,
+                  maxWidth: maxBubbleWidth,
                 );
               }
               return ConstrainedBox(
                 constraints: BoxConstraints(
-                  maxWidth: constraints.maxWidth,
+                  maxWidth: maxBubbleWidth,
                   minHeight: 44,
                 ),
                 child: _AiBubbleBody(
@@ -440,10 +473,12 @@ class _NormalAiBubbleLayout extends StatelessWidget {
     required this.avatarShape,
     required this.avatarCornerRadius,
     required this.onAvatarLongPress,
+    required this.onIdentityTap,
     required this.displayText,
     required this.tooltipText,
     required this.isInteracting,
-    required this.imageUrl,
+    required this.imageMarkdown,
+    required this.enableImagePreview,
     required this.bubbleShape,
     required this.backgroundColor,
     required this.textColor,
@@ -459,10 +494,12 @@ class _NormalAiBubbleLayout extends StatelessWidget {
   final String avatarShape;
   final double avatarCornerRadius;
   final VoidCallback? onAvatarLongPress;
+  final VoidCallback? onIdentityTap;
   final String displayText;
   final String tooltipText;
   final bool isInteracting;
-  final String? imageUrl;
+  final String? imageMarkdown;
+  final bool enableImagePreview;
   final BorderRadius bubbleShape;
   final Color backgroundColor;
   final Color textColor;
@@ -486,21 +523,27 @@ class _NormalAiBubbleLayout extends StatelessWidget {
               avatarShape: avatarShape,
               cornerRadius: avatarCornerRadius,
               onLongPress: onAvatarLongPress,
+              onTap: onIdentityTap,
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: themeBubbleAvatarGap),
           ],
           Expanded(
             child: Padding(
-              padding: EdgeInsets.only(left: bubbleShowAvatar ? 0 : 8),
+              padding: EdgeInsets.zero,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   LayoutBuilder(
                     builder: (context, constraints) {
-                      final maxBubbleWidth = constraints.maxWidth * 0.85;
-                      if (imageUrl != null) {
+                      final maxBubbleWidth = resolveThemeBubbleMaxWidth(
+                        constraints.maxWidth,
+                        wideLayout: false,
+                      );
+                      if (imageMarkdown != null) {
                         return _AiImageOnlyBubble(
-                          imageUrl: imageUrl!,
+                          imageMarkdown: imageMarkdown!,
+                          textColor: textColor,
+                          enablePreview: enableImagePreview,
                           maxWidth: maxBubbleWidth,
                         );
                       }
@@ -527,10 +570,13 @@ class _NormalAiBubbleLayout extends StatelessWidget {
                   if (displayText.isNotEmpty)
                     Padding(
                       padding: const EdgeInsets.only(top: 4, left: 4),
-                      child: _BubbleMetadataLabel(
-                        text: displayText,
-                        tooltip: tooltipText,
-                        externalActive: isInteracting,
+                      child: InkWell(
+                        onTap: onIdentityTap,
+                        child: _BubbleMetadataLabel(
+                          text: displayText,
+                          tooltip: tooltipText,
+                          externalActive: isInteracting,
+                        ),
                       ),
                     ),
                 ],
@@ -566,9 +612,12 @@ class _AiBubbleBody extends StatelessWidget {
   Widget build(BuildContext context) {
     final body = Padding(
       padding: contentPadding,
-      child: forceExpandedWidth
-          ? SizedBox(width: double.infinity, child: messageBody)
-          : messageBody,
+      // Kotlin changes the width modifier without replacing the content owner.
+      // Keep the same Flutter element path when parsed XML requests full width.
+      child: SizedBox(
+        width: forceExpandedWidth ? double.infinity : null,
+        child: messageBody,
+      ),
     );
     return BubbleSurface(
       color: backgroundColor,
@@ -580,25 +629,29 @@ class _AiBubbleBody extends StatelessWidget {
   }
 }
 
+/// Pure-image messages bypass BubbleSurface, but keep the normal image caption.
 class _AiImageOnlyBubble extends StatelessWidget {
-  const _AiImageOnlyBubble({required this.imageUrl, required this.maxWidth});
+  const _AiImageOnlyBubble({
+    required this.imageMarkdown,
+    required this.maxWidth,
+    required this.textColor,
+    required this.enablePreview,
+  });
 
-  final String imageUrl;
+  final String imageMarkdown;
   final double maxWidth;
+  final Color textColor;
+  final bool enablePreview;
 
   @override
   Widget build(BuildContext context) {
-    final uri = Uri.parse(imageUrl);
-    final image = switch (uri.scheme) {
-      'http' || 'https' => Image.network(imageUrl, fit: BoxFit.contain),
-      'file' => Image.file(File(uri.toFilePath()), fit: BoxFit.contain),
-      _ => Image.file(File(imageUrl), fit: BoxFit.contain),
-    };
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(16),
-      child: ConstrainedBox(
-        constraints: BoxConstraints(maxWidth: maxWidth, maxHeight: 80),
-        child: image,
+    return SizedBox(
+      width: maxWidth,
+      child: MarkdownImageRenderer(
+        imageMarkdown: imageMarkdown,
+        textColor: textColor,
+        maxImageHeight: 320,
+        enablePreview: enablePreview,
       ),
     );
   }
@@ -611,27 +664,30 @@ class _MessageAvatar extends StatelessWidget {
     required this.avatarShape,
     required this.cornerRadius,
     this.onLongPress,
+    this.onTap,
   });
 
   final String? imagePath;
   final String avatarShape;
   final double cornerRadius;
   final VoidCallback? onLongPress;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     final square = avatarShape == UserPreferencesManager.AVATAR_SHAPE_SQUARE;
     return GestureDetector(
       onLongPress: onLongPress,
+      onTap: onTap,
       child: Container(
-        width: 32,
-        height: 32,
+        width: themeBubbleAvatarSize,
+        height: themeBubbleAvatarSize,
         decoration: BoxDecoration(
           shape: square ? BoxShape.rectangle : BoxShape.circle,
           borderRadius: square ? BorderRadius.circular(cornerRadius) : null,
         ),
         clipBehavior: Clip.antiAlias,
-        child: CharacterAvatarImage(avatarUri: imagePath, fit: BoxFit.cover),
+        child: ChatAvatarImage(avatarUri: imagePath, fit: BoxFit.cover),
       ),
     );
   }
@@ -652,8 +708,7 @@ class _BubbleMetadataLabel extends StatelessWidget {
   Widget build(BuildContext context) {
     final label = Text(
       text,
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
+      softWrap: true,
       style: Theme.of(context).textTheme.labelSmall?.copyWith(
         color: Theme.of(context).colorScheme.onSurfaceVariant,
         fontFeatures: const <FontFeature>[FontFeature.tabularFigures()],
@@ -684,14 +739,16 @@ String _metadataText(
   return parts.join(' · ');
 }
 
+/// Combines the explicit participant or model name with the enabled secondary metadata.
 String _normalDisplayText(
   ChatUiMessage message,
   ThemePreferenceSnapshot snapshot, {
   AppLocalizations? l10n,
 }) {
   final parts = <String>[];
-  if (snapshot.showRoleName && message.roleName.isNotEmpty) {
-    parts.add(message.roleName);
+  final title = bubbleAiPrimaryTitle(message, snapshot);
+  if (title.isNotEmpty) {
+    parts.add(title);
   }
   final modelProvider = formatModelProviderLabel(message, snapshot);
   if (modelProvider.isNotEmpty) {
@@ -704,10 +761,14 @@ String _normalDisplayText(
   return parts.join(' · ');
 }
 
-String? _singleMarkdownImageUrl(ChatUiMessage message) {
-  return RegExp(
-    r'^\s*!\[[^\]]*\]\(([^)]+)\)\s*$',
-  ).firstMatch(message.displayText)?.group(1);
+String? _singleMarkdownImage(ChatUiMessage message) {
+  // Never drop structured thinking/tool/status parts via the image shortcut.
+  if (message.contentStream != null ||
+      message.parts.any((part) => part.kind != MessagePartKind.markdown)) {
+    return null;
+  }
+  final text = message.displayText.trim();
+  return isStandaloneMarkdownImage(text) ? text : null;
 }
 
 bool _shouldUseExpandedBubbleLayout(StreamMarkdownRendererState state) {

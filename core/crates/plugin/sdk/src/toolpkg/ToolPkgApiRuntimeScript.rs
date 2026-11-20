@@ -299,49 +299,49 @@ pub fn buildToolPkgApiRuntimeScript() -> String {
             return output;
         }
 
-        // Calls a published dependency method; caller identity is attached by the native engine.
+        /** Calls a published dependency method using host-owned structured Promise handles. */
         async function callDependency(packageName, methodName, payload) {
             if (typeof packageName !== 'string' || !packageName.trim() ||
                 typeof methodName !== 'string' || !methodName.trim()) {
-                return Promise.reject(new Error('Dependency package and method names are required.'));
+                throw new Error('Dependency package and method names are required.');
             }
             var callId = currentCallId();
             var state = currentCallState();
             if (state.params.__operit_registration_mode === true) {
-                return Promise.reject(new Error('Dependency calls are not allowed during registration.'));
+                throw new Error('Dependency calls are not allowed during registration.');
             }
-            if (typeof root.__operitNativeCallDependencyAsync !== 'function') {
-                return Promise.reject(new Error('Dependency API transport is unavailable.'));
-            }
-            var serialized = JSON.stringify(payload === undefined ? null : payload);
-            if (serialized === undefined) {
-                return Promise.reject(new Error('Dependency payload must be JSON serializable.'));
-            }
-            var callbackId = '__operit_dependency_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-            // Keeps the owner call alive until the native dependency result has arrived.
             return new Promise(function(resolve, reject) {
                 root.__operitRetainCallReference(callId);
-                // Releases the exact retained reference on both submission and completion errors.
+                /** Releases the owner after the public completion's microtask. */
                 function cleanup() {
-                    delete root[callbackId];
                     Promise.resolve().then(function() { root.__operitReleaseCallReference(callId); });
                 }
-                // Decodes the transport envelope without rewriting application results.
-                root[callbackId] = function(result, isError) {
-                    try {
-                        root.__operitActivateCall(callId);
-                        if (isError) throw new Error(result);
-                        var response = JSON.parse(result);
-                        if (response.success !== true) throw new Error(response.message);
-                        resolve(response.value);
-                    } catch (error) {
-                        reject(error);
-                    } finally {
-                        cleanup();
-                    }
-                };
                 try {
-                    root.__operitNativeCallDependencyAsync(callbackId, packageName.trim(), methodName.trim(), serialized);
+                    root.__operitNativeCallDependency(
+                        callId, packageName.trim(), methodName.trim(), payload === undefined ? null : payload
+                    ).then(function(response) {
+                        try {
+                            root.__operitActivateCall(callId);
+                            if (!response || typeof response !== 'object' || typeof response.success !== 'boolean') {
+                                throw new TypeError('Dependency host returned an invalid result envelope');
+                            }
+                            if (!response.success) throw new Error(response.message);
+                            resolve(response.value);
+                        } catch (error) {
+                            reject(error);
+                        } finally {
+                            cleanup();
+                        }
+                    }, function(error) {
+                        try {
+                            root.__operitActivateCall(callId);
+                            reject(error);
+                        } catch (activationError) {
+                            reject(activationError);
+                        } finally {
+                            cleanup();
+                        }
+                    });
                 } catch (error) {
                     cleanup();
                     reject(error);
@@ -364,13 +364,14 @@ pub fn buildToolPkgApiRuntimeScript() -> String {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::buildToolPkgApiRuntimeScript;
-    use rquickjs::{Context, Runtime};
+    use operit_host_api::HostJavaScriptRuntime;
 
-    /// Installs the ToolPkg API runtime into a QuickJS test context.
-    fn install_runtime(context: &Context) {
-        context.with(|context| {
+    /// Installs the ToolPkg API runtime into a Host test context.
+    fn install_runtime(context: &mut dyn HostJavaScriptRuntime) {
+        {
             context
-                .eval::<(), _>(
+                .evaluateHostJavaScriptVoid(
+                    "test",
                     r#"
                     globalThis.__operitExpose = function(name, value) {
                         globalThis[name] = value;
@@ -387,21 +388,21 @@ mod tests {
                 )
                 .expect("ToolPkg API runtime globals should evaluate");
             context
-                .eval::<(), _>(buildToolPkgApiRuntimeScript())
+                .evaluateHostJavaScriptVoid("test", &buildToolPkgApiRuntimeScript())
                 .expect("ToolPkg API runtime should evaluate");
-        });
+        }
     }
 
     /// Verifies method implementations can be selected by explicit API version ranges.
     #[test]
     fn selects_explicit_api_version_ranges() {
-        let runtime = Runtime::new().expect("QuickJS runtime should start");
-        let context = Context::full(&runtime).expect("QuickJS context should start");
-        install_runtime(&context);
+        let mut context = crate::javascript_test::runtime();
+        install_runtime(context.as_mut());
 
-        context.with(|context| {
+        {
             context
-                .eval::<(), _>(
+                .evaluateHostJavaScriptVoid(
+                    "test",
                     r#"
                     globalThis.TestApi = __operitToolPkgApi.namespace('Test.Api', {
                         call: __operitToolPkgApi.method()
@@ -414,47 +415,47 @@ mod tests {
                 .expect("versioned API fixture should evaluate");
 
             context
-                .eval::<(), _>("globalThis.__testToolPkgApiVersion = '2.0.5';")
+                .evaluateHostJavaScriptVoid("test", "globalThis.__testToolPkgApiVersion = '2.0.5';")
                 .expect("test API version should set");
             assert_eq!(
                 context
-                    .eval::<String, _>("TestApi.call();")
+                    .evaluateHostJavaScriptString("test", "TestApi.call();")
                     .expect("2.0 range should invoke"),
                 "v200"
             );
 
             context
-                .eval::<(), _>("globalThis.__testToolPkgApiVersion = '2.1.0';")
+                .evaluateHostJavaScriptVoid("test", "globalThis.__testToolPkgApiVersion = '2.1.0';")
                 .expect("test API version should set");
             assert_eq!(
                 context
-                    .eval::<String, _>("TestApi.call();")
+                    .evaluateHostJavaScriptString("test", "TestApi.call();")
                     .expect("2.1 range should invoke"),
                 "v210"
             );
 
             context
-                .eval::<(), _>("globalThis.__testToolPkgApiVersion = '2.3.0';")
+                .evaluateHostJavaScriptVoid("test", "globalThis.__testToolPkgApiVersion = '2.3.0';")
                 .expect("test API version should set");
             assert_eq!(
                 context
-                    .eval::<String, _>("TestApi.call();")
+                    .evaluateHostJavaScriptString("test", "TestApi.call();")
                     .expect("2.3 range should invoke"),
                 "v230"
             );
-        });
+        }
     }
 
     /// Verifies version gaps remain unavailable instead of selecting a neighboring implementation.
     #[test]
     fn rejects_api_version_range_gaps() {
-        let runtime = Runtime::new().expect("QuickJS runtime should start");
-        let context = Context::full(&runtime).expect("QuickJS context should start");
-        install_runtime(&context);
+        let mut context = crate::javascript_test::runtime();
+        install_runtime(context.as_mut());
 
-        context.with(|context| {
+        {
             context
-                .eval::<(), _>(
+                .evaluateHostJavaScriptVoid(
+                    "test",
                     r#"
                     globalThis.TestApi = __operitToolPkgApi.namespace('Test.Api', {
                         call: __operitToolPkgApi.method()
@@ -466,20 +467,22 @@ mod tests {
                 )
                 .expect("version gap fixture should evaluate");
 
-            assert!(context.eval::<String, _>("TestApi.call();").is_err());
-        });
+            assert!(context
+                .evaluateHostJavaScriptString("test", "TestApi.call();")
+                .is_err());
+        }
     }
 
     /// Verifies overlapping version ranges are rejected when a method is created.
     #[test]
     fn rejects_overlapping_api_version_ranges() {
-        let runtime = Runtime::new().expect("QuickJS runtime should start");
-        let context = Context::full(&runtime).expect("QuickJS context should start");
-        install_runtime(&context);
+        let mut context = crate::javascript_test::runtime();
+        install_runtime(context.as_mut());
 
-        context.with(|context| {
+        {
             assert!(context
-                .eval::<(), _>(
+                .evaluateHostJavaScriptVoid(
+                    "test",
                     r#"
                         __operitToolPkgApi.namespace('Test.Api', {
                             call: __operitToolPkgApi.method()
@@ -489,6 +492,6 @@ mod tests {
                         "#,
                 )
                 .is_err());
-        });
+        }
     }
 }

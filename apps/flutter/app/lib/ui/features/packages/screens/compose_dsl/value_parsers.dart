@@ -79,10 +79,12 @@ EdgeInsets? _commonPaddingFromProps(Map<String, Object?> props) {
   if (props['padding'] != null) {
     return _edgeInsetsFromValue(props['padding']);
   }
-  final start = _number(props['paddingStart']);
-  final top = _number(props['paddingTop']);
-  final end = _number(props['paddingEnd']);
-  final bottom = _number(props['paddingBottom']);
+  final horizontal = _number(props['paddingHorizontal']);
+  final vertical = _number(props['paddingVertical']);
+  final start = _number(props['paddingStart']) ?? horizontal;
+  final top = _number(props['paddingTop']) ?? vertical;
+  final end = _number(props['paddingEnd']) ?? horizontal;
+  final bottom = _number(props['paddingBottom']) ?? vertical;
   if (start != null || top != null || end != null || bottom != null) {
     return EdgeInsets.only(
       left: start ?? 0,
@@ -91,21 +93,15 @@ EdgeInsets? _commonPaddingFromProps(Map<String, Object?> props) {
       bottom: bottom ?? 0,
     );
   }
-  final horizontal = _number(props['paddingHorizontal']);
-  final vertical = _number(props['paddingVertical']);
-  if (horizontal != null || vertical != null) {
-    return EdgeInsets.symmetric(
-      horizontal: horizontal ?? 0,
-      vertical: vertical ?? 0,
-    );
-  }
   return null;
 }
 
-/// Uses spaced-by gap only when the arrangement is the Compose start default.
+/// Preserves fixed gaps in aligned groups; distributed arrangements own their gaps.
 double _flexSpacing(Object? arrangement, Object? spacing) {
   final token = _normalizeToken(_string(arrangement));
-  if (token.isNotEmpty && token != 'start') {
+  if (token == 'spacebetween' ||
+      token == 'spacearound' ||
+      token == 'spaceevenly') {
     return 0;
   }
   return _number(spacing) ?? 0;
@@ -214,6 +210,7 @@ Offset _offset(List<Object?> args) {
 
 /// Resolves text style for the Compose DSL renderer.
 TextStyle? _textStyle(BuildContext context, Map<String, Object?> props) {
+  if (props['inheritStyle'] == true) return _inlineTextStyle(context, props);
   final theme = Theme.of(context).textTheme;
   final style = switch (_string(props['style'])) {
     'headlineSmall' => theme.headlineSmall,
@@ -231,14 +228,35 @@ TextStyle? _textStyle(BuildContext context, Map<String, Object?> props) {
   return _scaledTextStyle(style!, _number(props['fontSize'])).copyWith(
     color: _color(context, props['color']),
     fontWeight: _fontWeight(_string(props['fontWeight'])),
+    fontFamily: props['fontFamily'] as String?,
+    fontFamilyFallback: (props['fontFamilyFallback'] as List?)?.cast<String>(),
+    height: _number(props['lineHeight']),
+    backgroundColor: _color(context, props['textBackgroundColor']),
+    letterSpacing: _number(props['letterSpacing']),
   );
 }
+
+/// Applies only explicit overrides, retaining the enclosing native text metrics.
+TextStyle _inlineTextStyle(BuildContext context, Map<String, Object?> props) =>
+    TextStyle(
+      color: _color(context, props['color']),
+      fontSize: _number(props['fontSize']),
+      fontWeight: _fontWeight(_string(props['fontWeight'])),
+      fontFamily: props['fontFamily'] as String?,
+      fontFamilyFallback: (props['fontFamilyFallback'] as List?)
+          ?.cast<String>(),
+      height: _number(props['lineHeight']),
+      backgroundColor: _color(context, props['textBackgroundColor']),
+      letterSpacing: _number(props['letterSpacing']),
+    );
 
 /// Resolves text field style for the Compose DSL renderer.
 TextStyle? _textFieldStyle(BuildContext context, Object? raw) {
   if (raw is! Map) {
     return null;
   }
+  if (raw['inheritStyle'] == true)
+    return _inlineTextStyle(context, _stringMap(raw));
   final style = Theme.of(context).textTheme.bodyMedium!;
   return _scaledTextStyle(style, _number(raw['fontSize'])).copyWith(
     color: _color(context, raw['color']),
@@ -246,6 +264,38 @@ TextStyle? _textFieldStyle(BuildContext context, Object? raw) {
     fontFamily: _string(raw['fontFamily']).trim().isEmpty
         ? null
         : _string(raw['fontFamily']).trim(),
+  );
+}
+
+/// Resolves optional plugin-owned input decoration without changing theme defaults.
+InputDecoration? _textFieldDecoration(BuildContext context, Object? raw) {
+  if (raw is! Map) return null;
+  final radius = _number(raw['cornerRadius']);
+  final borderColor = _color(context, raw['borderColor']);
+  final focusedColor = _color(context, raw['focusedBorderColor']);
+  final border = raw['borderless'] == true
+      ? InputBorder.none
+      : radius == null && borderColor == null && focusedColor == null
+      ? null
+      : OutlineInputBorder(
+          borderRadius: BorderRadius.circular(radius ?? 4),
+          borderSide: borderColor == null
+              ? BorderSide.none
+              : BorderSide(color: borderColor),
+        );
+  return InputDecoration(
+    isDense: raw['isDense'] == null ? null : _bool(raw['isDense']),
+    filled: raw['filled'] == null ? null : _bool(raw['filled']),
+    fillColor: _color(context, raw['fillColor']),
+    contentPadding: raw['contentPadding'] == null
+        ? null
+        : _edgeInsetsFromValue(raw['contentPadding']),
+    hintStyle: _textFieldStyle(context, raw['hintStyle']),
+    border: border,
+    enabledBorder: border,
+    focusedBorder: focusedColor == null
+        ? null
+        : border!.copyWith(borderSide: BorderSide(color: focusedColor)),
   );
 }
 
@@ -297,11 +347,11 @@ Alignment _alignment(Object? raw) {
     'center' => Alignment.center,
     'topCenter' || 'centerTop' => Alignment.topCenter,
     'topEnd' || 'endTop' => Alignment.topRight,
-    'centerEnd' || 'endCenter' => Alignment.centerRight,
+    'end' || 'centerEnd' || 'endCenter' => Alignment.centerRight,
     'bottomEnd' || 'endBottom' => Alignment.bottomRight,
     'bottomCenter' || 'centerBottom' => Alignment.bottomCenter,
     'bottomStart' || 'startBottom' => Alignment.bottomLeft,
-    'centerStart' || 'startCenter' => Alignment.centerLeft,
+    'start' || 'centerStart' || 'startCenter' => Alignment.centerLeft,
     _ => Alignment.topLeft,
   };
 }
@@ -337,23 +387,80 @@ OutlinedBorder? _shapeBorder(Object? raw, {BorderRadius? defaultBorderRadius}) {
 
 /// Resolves color for the Compose DSL renderer.
 Color? _color(BuildContext context, Object? raw) {
-  final colorScheme = Theme.of(context).colorScheme;
+  return _colorForScheme(Theme.of(context).colorScheme, raw);
+}
+
+/// Shares concrete colors, theme tokens and alpha composition with native canvas paint.
+Color? _colorForScheme(ColorScheme colorScheme, Object? raw) {
   if (raw is String && raw.trim().isNotEmpty) {
     final value = raw.trim();
     if (value.startsWith('#')) {
       final hex = value.substring(1);
-      final parsed = int.tryParse(hex.length == 6 ? 'ff$hex' : hex, radix: 16);
-      return parsed == null ? null : Color(parsed);
+      if (!_composeHexColorPattern.hasMatch(hex)) return null;
+      // Eight digits retain the existing Android-style AARRGGBB contract.
+      final argb = switch (hex.length) {
+        3 => 'ff${hex.split('').map((digit) => '$digit$digit').join()}',
+        6 => 'ff$hex',
+        8 => hex,
+        _ => null,
+      };
+      return argb == null ? null : Color(int.parse(argb, radix: 16));
     }
-    return _colorToken(colorScheme, value);
+    return _rgbColor(value) ?? _colorToken(colorScheme, value);
   }
   if (raw is Map) {
-    final token = raw['__colorToken']?.toString();
-    final color = _colorToken(colorScheme, token ?? '');
+    final color = raw['value'] is String
+        ? _colorForScheme(colorScheme, raw['value'])
+        : _colorToken(colorScheme, _string(raw['__colorToken']));
     final alpha = _number(raw['alpha']);
-    return alpha == null ? color : color?.withValues(alpha: alpha);
+    final foreground = alpha == null ? color : color?.withValues(alpha: alpha);
+    if (raw['over'] == null) return foreground;
+    final background = _colorForScheme(colorScheme, raw['over']);
+    if (foreground == null || background == null) {
+      throw const FormatException(
+        'Color compositing requires two valid colors',
+      );
+    }
+    return Color.alphaBlend(foreground, background);
   }
   return null;
+}
+
+final _composeHexColorPattern = RegExp(r'^[0-9a-fA-F]+$');
+final _composeRgbColorPattern = RegExp(
+  r'^(rgb|rgba)\(([^()]*)\)$',
+  caseSensitive: false,
+);
+
+/// Resolves comma-separated RGB channels and RGBA opacity used by legacy plugins.
+Color? _rgbColor(String value) {
+  final match = _composeRgbColorPattern.firstMatch(value);
+  if (match == null) return null;
+  final hasAlpha = match.group(1)!.toLowerCase() == 'rgba';
+  final parts = match.group(2)!.split(',');
+  if (parts.length != (hasAlpha ? 4 : 3)) return null;
+  final channels = <int>[];
+  for (final part in parts.take(3)) {
+    final channel = _rgbColorComponent(part, 255);
+    if (channel == null) return null;
+    channels.add(channel.round());
+  }
+  final alpha = hasAlpha ? _rgbColorComponent(parts[3], 1) : 1.0;
+  if (alpha == null) return null;
+  return Color.fromRGBO(channels[0], channels[1], channels[2], alpha);
+}
+
+/// Accepts finite numeric or percentage components and clamps their valid range.
+double? _rgbColorComponent(String raw, double maximum) {
+  final value = raw.trim();
+  final percentage = value.endsWith('%');
+  final number = double.tryParse(
+    percentage ? value.substring(0, value.length - 1) : value,
+  );
+  if (number == null || !number.isFinite) return null;
+  return percentage
+      ? number.clamp(0, 100).toDouble() / 100 * maximum
+      : number.clamp(0, maximum).toDouble();
 }
 
 /// Resolves color with alpha for the Compose DSL renderer.
@@ -410,6 +517,7 @@ WidgetStateProperty<Color?>? _buttonStateColor({
 /// Resolves color token for the Compose DSL renderer.
 Color? _colorToken(ColorScheme scheme, String token) {
   return switch (token) {
+    'transparent' => Colors.transparent,
     'primary' => scheme.primary,
     'onPrimary' => scheme.onPrimary,
     'primaryContainer' => scheme.primaryContainer,
@@ -424,6 +532,26 @@ Color? _colorToken(ColorScheme scheme, String token) {
     'onTertiaryContainer' => scheme.onTertiaryContainer,
     'surface' => scheme.surface,
     'onSurface' => scheme.onSurface,
+    'surfaceDim' => scheme.surfaceDim,
+    'surfaceBright' => scheme.surfaceBright,
+    'surfaceContainerLowest' => scheme.surfaceContainerLowest,
+    'surfaceContainerLow' => scheme.surfaceContainerLow,
+    'surfaceContainer' => scheme.surfaceContainer,
+    'surfaceContainerHigh' => scheme.surfaceContainerHigh,
+    'surfaceContainerHighest' => scheme.surfaceContainerHighest,
+    'shadow' => scheme.shadow,
+    'primaryFixed' => scheme.primaryFixed,
+    'primaryFixedDim' => scheme.primaryFixedDim,
+    'onPrimaryFixed' => scheme.onPrimaryFixed,
+    'onPrimaryFixedVariant' => scheme.onPrimaryFixedVariant,
+    'secondaryFixed' => scheme.secondaryFixed,
+    'secondaryFixedDim' => scheme.secondaryFixedDim,
+    'onSecondaryFixed' => scheme.onSecondaryFixed,
+    'onSecondaryFixedVariant' => scheme.onSecondaryFixedVariant,
+    'tertiaryFixed' => scheme.tertiaryFixed,
+    'tertiaryFixedDim' => scheme.tertiaryFixedDim,
+    'onTertiaryFixed' => scheme.onTertiaryFixed,
+    'onTertiaryFixedVariant' => scheme.onTertiaryFixedVariant,
     'surfaceVariant' => scheme.surfaceContainerHighest,
     'onSurfaceVariant' => scheme.onSurfaceVariant,
     'background' => scheme.surface,
@@ -535,25 +663,6 @@ List<Map<String, Object?>> _canvasCommands(Object? raw) {
     return const <Map<String, Object?>>[];
   }
   return raw.whereType<Map>().map(_stringMap).toList(growable: false);
-}
-
-/// Resolves node list for the Compose DSL renderer.
-List<_ComposeDslNode> _nodeList(Object? raw) {
-  if (raw is List) {
-    return raw
-        .map(_ComposeDslNode.parse)
-        .whereType<_ComposeDslNode>()
-        .toList(growable: false);
-  }
-  return const <_ComposeDslNode>[];
-}
-
-/// Resolves slot map for the Compose DSL renderer.
-Map<String, List<_ComposeDslNode>> _slotMap(Object? raw) {
-  if (raw is Map) {
-    return raw.map((key, value) => MapEntry(key.toString(), _nodeList(value)));
-  }
-  return const <String, List<_ComposeDslNode>>{};
 }
 
 /// Resolves string for the Compose DSL renderer.

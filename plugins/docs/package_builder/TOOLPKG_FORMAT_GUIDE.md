@@ -2,6 +2,8 @@
 
 ## 1. 简介
 
+开发、路径核验、安装、同 ID 更新和发布的当前流程见 [插件创作流程](./PLUGIN_CREATION_WORKFLOW.md)。本指南中的包名和目录树是格式示例，具体 API 以 Operit 插件开发套件 的当前版本 `types/` 为准。
+
 **ToolPkg** 是 Operit 项目中用于打包和分发工具包的标准格式。它允许开发者将多个相关的工具脚本、资源文件和 UI 模块打包成一个单一的、易于分发和管理的文件。
 
 ### 1.1 什么是 ToolPkg？
@@ -22,6 +24,20 @@
 | UI 模块 | 不支持 | 支持 Compose DSL UI |
 | 多语言 | 需手动实现 | 内置支持 |
 | 版本管理 | 无标准 | 内置版本字段 |
+
+### 1.3 ToolPkg API 版本与跨平台要求
+
+| 应用 | ToolPkg API 版本 | 支持范围 |
+|------|-----------------|----------|
+| Operit2 | `2.0.0` | 当前支持的 API 版本，面向多平台开发 |
+| Operit2 | `1.0.0`、`1.0.1` | 旧版兼容加载支持并不完整，需要逐项验证 |
+| Operit1 | `1.0.0`、`1.0.1` | 完整支持，主要面向 Android 的旧版 API 形式 |
+
+Operit2 的 ToolPkg API 支持版本为 `2.0.0`；对 `1.0.0` 和 `1.0.1` 的加载支持并不完整。Operit1 完整支持 ToolPkg API `1.0.0` 和 `1.0.1`，这两个版本主要面向 Android，是旧版 API 形式。
+
+Operit2 新建 ToolPkg 显式声明 `"api_version": "2.0.0"`。接受某个版本号、成功导入包和完整支持该版本的接口是不同的事情；旧包迁移不能只改版本号，还需检查接口、路径与平台行为。
+
+ToolPkg API `2.0.0` 面向多平台开发，基本所有公共接口都通过统一 host 能力提供跨平台兼容。常规功能直接使用当前版本接口即可，不必为每个平台重复实现。作者仍需注重跨平台兼容性：遇到平台特异接口时，明确其适用范围，考虑并验证其他平台的安装、界面与核心功能；不能把某个平台的专用能力当作所有平台都具备的接口。
 
 ## 2. ToolPkg 文件结构
 
@@ -71,6 +87,7 @@ windows_control.toolpkg (ZIP 压缩包)
 ```json
 {
   "schema_version": 1,
+  "api_version": "2.0.0",
   "toolpkg_id": "com.operit.windows_bundle",
   "version": "0.2.0",
   "author": ["Operit Team", "Alice"],
@@ -152,9 +169,10 @@ windows_control.toolpkg (ZIP 压缩包)
 
 | 字段 | 类型 | 必需 | 说明 |
 |------|------|------|------|
-| `schema_version` | number | 是 | 清单架构版本，当前为 `1` |
+| `schema_version` | number | 是 | 清单格式版本，当前为 `1`；不是 ToolPkg API 版本 |
+| `api_version` | string | 否 | ToolPkg API 契约版本。Operit2 新建包显式填写 `2.0.0`；省略时按旧版 `1.0.0` 契约加载，启用对应适配和运行依赖。`1.0.0`、`1.0.1` 的兼容加载支持并不完整 |
 | `toolpkg_id` | string | 是 | 包的唯一标识符，建议使用反向域名格式（如 `com.operit.windows_bundle`） |
-| `version` | string | 否 | 包的版本号，建议使用语义化版本（如 `0.2.0`） |
+| `version` | string | 否 | 插件自身的发布版本，建议使用语义化版本（如 `0.2.0`）；与 `api_version`、`schema_version` 分别声明 |
 | `author` | string \| string[] | 否 | 作者信息，支持单个作者字符串或作者字符串数组 |
 | `main` | string | 是 | ToolPkg 主入口脚本路径（相对于 ZIP 根目录），用于执行注册函数 |
 | `display_name` | LocalizedText | 否 | 包的显示名称，支持多语言 |
@@ -488,6 +506,8 @@ exports.onInputMenuToggle = onInputMenuToggle;
 | `ToolPkg.registerInputMenuTogglePlugin` | `id` | 是 | 输入菜单开关插件唯一标识 |
 | `ToolPkg.registerInputMenuTogglePlugin` | `function` | 是 | 函数引用（支持箭头函数） |
 
+> **函数引用必须来自模块导出**：上表的 `function`（以及 `registerCoreCommand` 等注册的 `function`）必须传一个**已导出的函数**——可以是当前入口模块的导出（先 `exports.onX = onX`，再传 `onX`），也可以是 `require(...)` 引入模块的导出。直接传未导出的局部函数或内联箭头函数会报 `requires an exported ToolPkg function reference`。箭头函数本身可用，但同样要先导出再传入。
+
 `ToolPkg.registerAppLifecycleHook` 支持的 `event`：
 
 - `application_on_create`
@@ -754,9 +774,7 @@ resources/
         ...
 ```
 
-最小可参考示例：
-- `examples/template_try/`
-- 里面同时演示了 `workflow_templates`、`workspace_templates`、目录资源和最小 `main.ts`
+参考实现应按 [插件创作流程](./PLUGIN_CREATION_WORKFLOW.md) 提供的 VFS 入口查找当前已安装插件。选择实际声明了 `workflow_templates`、`workspace_templates` 或目录资源的包，读取其 manifest 和随包源码；没有对应安装包时，以本指南的格式和当前类型定义为准。
 
 ## 4. 创建 ToolPkg
 
@@ -784,47 +802,32 @@ my_toolpkg/
 
 子包脚本必须包含 `METADATA` 块，参考 [SCRIPT_DEV_GUIDE.md](./SCRIPT_DEV_GUIDE.md)。
 
-**步骤 4：打包成 ZIP**
+**步骤 4：创建根目录正确的 ToolPkg 归档**
 
-使用任意 ZIP 工具将整个目录打包，并重命名为 `.toolpkg` 扩展名：
+通过统一文件工具创建 ZIP 格式的 `.toolpkg` 成品。下列参数是经核验的 VFS 地址，不是未经映射的终端或本机路径：
 
-```bash
-# Linux/macOS
-cd my_toolpkg
-zip -r ../my_toolpkg.toolpkg *
-
-# Windows (PowerShell)
-Compress-Archive -Path my_toolpkg\* -DestinationPath my_toolpkg.toolpkg
+```typescript
+// Both paths must be verified VFS addresses; the output stays outside the source.
+await Tools.Files.zip(sourceVfsPath, artifactVfsPath, false);
 ```
 
-### 4.2 使用 Python 脚本自动打包
+第三个参数 `false` 表示不保留源码目录自身作为顶层目录，保证 `manifest.json` 或 `manifest.hjson` 位于归档根目录。归档包含清单引用的 JavaScript、UI 和资源，同时保留 TypeScript 源码、tsconfig 与必要的开发说明。输出文件放在源码目录之外，检查成品扩展名与内容。
 
-项目提供了 `sync_example_packages.py` 脚本，可以自动将 `examples/` 目录下的包打包成 `.toolpkg` 文件。
+### 4.2 主仓库的内置资源同步
 
-**使用方法**：
+以下仅适用于贡献 Operit 主仓库，不是安装后的 Skill 自带命令。源码位于 `plugins/packages/buildin/` 和 `plugins/packages/external/`；资源同步脚本为 `plugins/tools/sync_plugin_packages.py`。
+
+在已经配置的项目 Python 虚拟环境中，从仓库根目录运行：
 
 ```bash
-# 打包所有白名单中的包
-python sync_example_packages.py
+# 查看计划，不写入资源
+python plugins/tools/sync_plugin_packages.py --source runtime --dry-run --no-hot-reload
 
-# 以“非白名单附加”的方式打包特定包
-python sync_example_packages.py --include windows_control
-
-# 例如只额外同步 template_try 这个示例
-python sync_example_packages.py --include template_try
-
-# 查看打包结果（不实际写入）
-python sync_example_packages.py --dry-run
-
-# 删除不在白名单中的包
-python sync_example_packages.py --delete-extra
+# 构建并同步内置与 external 资源
+python plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload
 ```
 
-**工作原理**：
-1. 扫描 `examples/` 目录
-2. 查找包含 `manifest.json` 或 `manifest.hjson` 的文件夹
-3. 将整个文件夹打包成 `.toolpkg` ZIP 文件
-4. 输出到 `app/src/main/assets/packages/` 目录
+同步脚本会生成当前 SDK 类型、按包的构建契约处理源码，并更新 `core/crates/runtime/application/assets/plugins/buildin/` 与 `external/`。此步骤服务于应用资源构建，不等于向正在运行的应用安装插件。独立插件项目按自身的构建契约生成成品，再使用 `package import` 安装。
 
 ## 5. 子包脚本开发
 
@@ -836,6 +839,7 @@ python sync_example_packages.py --delete-extra
 /* METADATA
 {
     "name": "windows_control",
+    "api_version": "2.0.0",
     "description": {
         "zh": "通过 HTTP 调用 Operit PC Agent 控制 Windows 电脑",
         "en": "Control a Windows PC through Operit PC Agent over HTTP"
@@ -931,6 +935,8 @@ exports.windows_exec = WindowsControl.windows_exec;
 
 ### 5.4 Java / Kotlin Bridge 返回值与自动类型转换
 
+本节仅适用于已提供 Java Bridge 的 host，不代表所有宿主都具备 Java 或 Android 类。
+
 如果子包里用到了 `Java.type(...)` / `Java.xxx.yyy` 这一套桥接，最需要记住的是：
 
 - **桥接会把很多 Java 类型自动归一成 JS 常用结构。**
@@ -973,15 +979,15 @@ items[0];     // 对
 - `obj.call('method', ...)` 仍然可用，但主要用于极少数字段/方法同名冲突或调试场景。
 - `Java.implement(...)` 的 JS 回调会回到 QuickJS 运行时线程执行，不等于把 JS 逻辑真正挪到 Java 子线程。
 
-详细规则见：
-
-- [README.md](../app/src/main/java/com/ai/assistance/operit/core/tools/javascript/README.md)
+调用签名见 Skill 的 `types/java-bridge.d.ts`。Java/Kotlin Bridge 需要对应 host 支持，不是跨平台文件、网络或终端接口。
 
 ## 6. UI 模块开发
 
 ### 6.1 Compose DSL 简介
 
 Compose DSL 是一种基于 JavaScript 的声明式 UI 框架，灵感来自 Jetpack Compose。
+
+UI 模块分发普通、可读的 CommonJS JavaScript，保留 `ctx.UI.*` 声明、业务函数与事件回调。TypeScript 只需转换为这种 JS，Compose 编译与缓存由运行时负责。不要将 Compose 内部预编译产物作为插件示例或用户编辑入口；用户修改 JS 后按插件更新流程重新打包和导入。
 
 **特点**：
 - 声明式语法
@@ -1167,6 +1173,22 @@ const images = await ctx.openFilePicker({
 
 该 API 通过 Flutter `file_selector` 在 Android、iOS、Linux、macOS、Windows、Web 和 OpenHarmony 使用各平台的文件选择器。不适用于该 `picker` 的选项会直接报错。结果提供平台文件路径或浏览器对象 URL。
 
+#### 文件保存
+
+`ctx.saveFile(options)` 将 UTF-8 文本交给宿主的跨平台文件保存服务，由用户在系统保存界面选择位置。
+
+```javascript
+const saved = await ctx.saveFile({
+    suggestedName: 'character.json',
+    content: characterJson,
+    mimeType: 'application/json',
+    extensions: ['json']
+});
+if (saved.cancelled) return;
+```
+
+`suggestedName` 是文件名，不能包含目录；`extensions` 不带点号。只有文件保存完成才会返回 `cancelled: false`。用户取消返回 `cancelled: true`、`path: null`，保存失败直接拒绝 Promise。插件不需要获取或写入目标 VFS 路径。
+
 兼容说明：
 
 - `ToolPkg.registerToolboxUiModule(...)` 仍然保留。
@@ -1216,22 +1238,27 @@ const iconPath = await ToolPkg.readResource('icon');
 
 如果 `icon` 对应的是目录资源，返回值会是运行时临时生成的 zip 文件路径。
 
-**在子包脚本中**：
-```javascript
-// 通过 PackageManager API 访问（需要原生桥接）
-```
+**在子包脚本中**：通过本 Skill 的 `types/toolpkg.d.ts` 查看该执行上下文允许使用的 `ToolPkg` 接口；不要假定所有上下文共享主入口的全局状态。
 
 ## 8. 部署和分发
 
 ### 8.1 内置包
 
-将 `.toolpkg` 文件放入 `app/src/main/assets/packages/` 目录，会被打包到 APK 中。
+贡献主项目时，通过第 4.2 节的同步脚本生成 `core/crates/runtime/application/assets/plugins/buildin/` 和 `external/` 中的资源。应用构建会嵌入这些资源；内置资源同步不是运行时安装命令。
 
 ### 8.2 外部包
 
-用户可以通过以下方式导入外部包：
-1. 将 `.toolpkg` 文件复制到设备的 `Android/data/com.ai.assistance.operit/files/packages/` 目录
-2. 在应用中使用"导入包"功能
+用户可在包管理中选择“导入包”并选择成品文件。AI 或脚本可通过当前 core command 执行：
+
+```json
+["package", "import", "<artifact_host_path>"]
+["package", "enable", "<package_id>"]
+["package", "list"]
+```
+
+路径必须由当前 runtime 的 FileSystemHost 实际可读，不指定应用私有目录或某个平台的存储目录。核对导入结果、真实启用状态和对应应用场景。普通本地外部 `.toolpkg` 可按相同 ID 直接再次导入更新；流程见 [插件创作流程第 5 节](./PLUGIN_CREATION_WORKFLOW.md#5-同-id-的修改与更新)。
+
+更新保留原配置、安装位置及既有成员启用状态，新增子包默认关闭。其他容器、独立包或子包的重名冲突仍拒绝；固定安装范围与已有 scope 冲突时不能更新。内置、市场及随应用包继续使用各自既有流程。正常更新不先执行 `package delete`，显式卸载仍按现有规则删除普通本地安装的配置。
 
 ### 8.3 版本管理
 
@@ -1324,171 +1351,54 @@ my_toolpkg/
 - 确认 `screen` 传的是已导入的模块函数（例如 `const ui = require(...).default`）
 - 验证 UI 脚本语法正确
 
+**问题 5：注册命令/钩子报 `requires an exported ToolPkg function reference`**
+- 原因：传给 `function` 的处理函数没有从模块导出（传了未导出的局部函数或内联箭头函数）。
+- 修复：先把处理函数导出，再传入该导出引用：
+  ```javascript
+  function onHello(event) { return { stdout: "hi" }; }
+  exports.onHello = onHello;
+  ToolPkg.registerCoreCommand({ id: "hello", name: "hello", function: onHello });
+  ```
+- 箭头函数同样要先导出（`exports.onHello = (event) => { ... }`）再传入。
+
 ### 10.2 调试技巧
 
-1. **使用 dry-run 模式**：
-   ```bash
-   python sync_example_packages.py --dry-run
-   ```
+1. 核验归档根目录包含 manifest，清单中每个入口、资源与模块文件存在。解析 JSON/HJSON 并检查 API 版本，不把外层目录误打入归档。
+2. 在导入后查看 `package show` 和 `package list` 的实际结果，核对工具名与真实启用状态。
+3. 用 `["log", "package"]`、`["log", "show"]` 和 `["log", "path"]` 查看当前 runtime 日志；不要依赖某个平台的日志命令。
+4. 将不确定的工具逻辑隔离成最小测试包，通过正式的导入与执行入口验证。日志保留原始错误，不通过猜字符串宣称成功。
 
-2. **查看应用日志**：
-   ```bash
-   adb logcat -s PackageManager:* JsEngine:*
-   ```
+### 10.3 同 ID 的迭代测试
 
-3. **手动解压检查**：
-   ```bash
-   unzip -l my_toolpkg.toolpkg
-   ```
+普通本地外部 `.toolpkg` 可使用同一个 `package import` 命令原地更新；这不提供任意同名包覆盖或通用热更新。完整步骤见 [当前版本插件创作流程](./PLUGIN_CREATION_WORKFLOW.md#5-同-id-的修改与更新)：
 
-4. **验证 JSON 格式**：
-   使用在线 JSON 验证工具检查 `manifest.json`
+1. 完成新成品构建与归档核验，保存源码和需要保留的旧成品。
+2. 核对既有安装位置、容器与子包的名称及启用状态，并取得更新授权。
+3. 直接执行 `package import`，检查新版本导入结果；失败时核对旧版本回滚结果，保留错误，不自动删除重装。
+4. 确认原配置、安装位置及既有成员状态保持，新增子包仍关闭，再在对应应用场景重新测试。
 
-### 10.3 使用调试安装脚本快速烧录到手机
+ToolPkg 涉及 main、子包、UI、hook 与 provider 等上下文，单次执行一个函数不能替代安装与场景验证。任一步出现错误停止定位，不改包 id 或自动执行其他安装流程。
 
-普通 `.js` 包可以直接用 `tools/execute_js.bat` / `tools/execute_js.sh` 临时推送后单次执行；但 `toolpkg` 不适合这样调试。
+## 11. 按需查阅已安装插件
 
-原因是 `toolpkg` 不只是“跑一个函数”，它还涉及：
+本套件不复制插件示例或维护归档文件索引。AI 从 `/operitapp/data/extensions/device/packages/` 与 `/operitapp/data/extensions/space/packages/` 自行列举用户安装的插件，并按需读取 `/operitapp/data/cache/toolpkg/` 中已有的 ToolPkg 缓存。缓存可能不存在或过期，应与实际安装文件核验，不能当作完整安装列表。
 
-- 读取 `manifest.json` / `manifest.hjson`
-- 解析 `toolpkg_id`
-- 加载 `main` 脚本里的注册逻辑
-- 同步 UI 模块、消息处理插件、Prompt Hook、Tool Lifecycle Hook 等宿主级注册
-- 刷新 ToolPkg cache 与运行时 hook 映射
-
-因此，`toolpkg` 调试的正确思路不是“一次运行”，而是“快速重新安装”。
-
-项目现在提供了专门的调试安装脚本：
-
-- Windows：`tools/debug_toolpkg.bat`
-- Linux/macOS：`tools/debug_toolpkg.sh`
-- 共享实现：`tools/debug_toolpkg.py`
-
-它们会执行以下流程：
-
-1. 从 ToolPkg 目录或现成 `.toolpkg` 中读取 `manifest`
-2. 解析 `toolpkg_id` 与 `main`
-3. 如果输入是目录，则先临时打包成 `.toolpkg`
-4. 通过 `adb push` 将包推送到手机的 `Android/data/com.ai.assistance.operit/files/packages/`
-5. 发送调试广播，让 App 重新扫描外部 packages 目录
-6. 按 `toolpkg_id` 启用该 ToolPkg 容器
-7. 按 manifest 默认值重新应用 subpackage 启用状态（可选关闭）
-8. 刷新 ToolPkg cache、hook/runtime 映射，并尝试重新激活先前已注册过的 subpackage 工具
-
-这条链路更接近真实安装行为，适合调试：
-
-- `ToolPkg.registerToolboxUiModule(...)`
-- `ToolPkg.registerMessageProcessingPlugin(...)`
-- `ToolPkg.registerXmlRenderPlugin(...)`
-- `ToolPkg.registerInputMenuTogglePlugin(...)`
-- `ToolPkg.registerToolLifecycleHook(...)`
-- Prompt 相关 hook
-
-#### 10.3.1 用法
-
-直接传 ToolPkg 目录：
-
-```bash
-python tools/debug_toolpkg.py examples/windows_control
-```
-
-也可以传 `manifest.json`：
-
-```bash
-python tools/debug_toolpkg.py examples/windows_control/manifest.json
-```
-
-或者传现成 `.toolpkg`：
-
-```bash
-python tools/debug_toolpkg.py /path/to/windows_control.toolpkg
-```
-
-Windows 下可直接使用：
-
-```bat
-tools\debug_toolpkg.bat examples\windows_control
-tools\debug_toolpkg.bat examples\windows_control\manifest.json
-tools\debug_toolpkg.bat D:\tmp\windows_control.toolpkg --device emulator-5554
-```
-
-Linux/macOS 下可直接使用：
-
-```bash
-bash tools/debug_toolpkg.sh examples/windows_control
-bash tools/debug_toolpkg.sh examples/windows_control/manifest.json
-```
-
-#### 10.3.2 常用参数
-
-- `--device <serial>`：指定 adb 设备；不传时，若只连了一台设备则自动选中
-- `--no-reset-subpackage-states`：保留本机已有的 subpackage 开关状态，而不是按 manifest 默认值重置
-- `--log-wait-seconds <n>`：发送广播后等待多少秒再抓取日志；默认读取 `OPERIT_LOG_WAIT_SECONDS`，否则为 `6`
-
-#### 10.3.3 日志查看
-
-脚本默认会抓取这些日志标签：
-
-```bash
-adb logcat -d -s ToolPkgDebugInstallReceiver:* ToolPkg:* PackageManager:*
-```
-
-如果你怀疑是 JS 执行期问题，也可以再看：
-
-```bash
-adb logcat -d -s JsEngine:* ToolPkg:* PackageManager:*
-```
-
-#### 10.3.4 注意事项
-
-- 这个脚本依赖手机上的 Operit 已包含 `ToolPkgDebugInstallReceiver` 调试广播入口；如果手机装的是旧版本 App，广播不会生效。
-- 脚本会根据 `toolpkg_id` 处理同名外部 ToolPkg 的覆盖安装；调试时应保持 `toolpkg_id` 稳定，不要频繁改名。
-- 如果你调试的是 hook 行为，优先使用这套安装脚本，不要试图把 `toolpkg` 当普通 `.js` 包去跑。
-
-## 11. 示例项目
-
-### 11.1 Windows Control Bundle
-
-完整示例位于 `examples/windows_control/`：
-
-```
-windows_control/
-├── manifest.json
-├── packages/
-│   └── windows_control.js
-├── ui/
-│   └── windows_setup/
-│       └── index.ui.js
-├── resources/
-│   └── pc_agent/
-│       └── operit-pc-agent/
-└── i18n/
-    ├── zh-CN.js
-    └── en-US.js
-```
-
-**功能**：
-- 通过 HTTP 控制 Windows 电脑
-- 提供一键配置 UI
-- 包含 PC Agent 安装包资源
-- 支持中英文双语
-
-### 11.2 打包命令
-
-```bash
-# 打包 windows_control
-python sync_example_packages.py --include windows_control
-
-# 查看打包结果
-ls -lh app/src/main/assets/packages/windows_control.toolpkg
-```
+需要查看某个归档而没有可读缓存时，只将选中的 `.toolpkg` 解压到独立临时目录，不覆盖运行缓存或批量解压其他包。按所选插件实际附带的 manifest、`package.json` 和源码确定构建方式；成品未附带源码时明确说明，不把它当作完整开发项目。完整步骤见 [插件创作流程](./PLUGIN_CREATION_WORKFLOW.md)。
 
 ## 12. 参考资料
 
-- [脚本开发指南](./SCRIPT_DEV_GUIDE.md)：了解如何编写子包脚本
-- [PackageManager.kt](../app/src/main/java/com/ai/assistance/operit/core/tools/packTool/PackageManager.kt)：包管理器源码
-- [ToolPkgParser.kt](../app/src/main/java/com/ai/assistance/operit/core/tools/packTool/ToolPkgParser.kt)：解析器源码
-- [JsComposeDslBridge.kt](../app/src/main/java/com/ai/assistance/operit/core/tools/javascript/JsComposeDslBridge.kt)：Compose DSL 桥接
+安装后的 Skill 可直接阅读：
+
+- [当前版本插件创作流程](./PLUGIN_CREATION_WORKFLOW.md)：环境核验、首次安装、同 ID 更新、测试与发布。
+- [脚本开发指南](./SCRIPT_DEV_GUIDE.md)：元数据、工具接口与 TypeScript 项目配置。
+- Skill 的 `types/toolpkg.d.ts`、`types/compose-dsl.d.ts` 和其他 `types/*.d.ts`：当前公共接口。
+
+贡献主项目时，对应 Rust 源码位于：
+
+- `core/crates/command/core/src/commands/package.rs`：包命令。
+- `core/crates/tool/services/src/tools/packTool/RuntimePackageManager.rs`：运行时包管理。
+- `core/crates/plugin/sdk/src/toolpkg/ToolPkgParser.rs`：ToolPkg 解析。
+- `core/crates/runtime/application/build.rs`：内置包与 Skill 附件的资源嵌入。
 
 ## 13. 更新日志
 
@@ -1498,3 +1408,7 @@ ls -lh app/src/main/assets/packages/windows_control.toolpkg
 - 支持多语言
 - 提供 Compose DSL UI 框架
 
+
+## 桌面小部件与通用悬浮窗
+
+`ToolPkg.registerDesktopWidget` 是桌面小部件注册接口。桌宠和其他实时悬浮工具使用独立的 `ToolPkg.ui.floatingWindows` 窗口控制接口，内容复用已注册的 Compose UI 路由。方法、平台能力、权限与生命周期见 [通用悬浮窗](../FLOATING_WINDOWS.md)。

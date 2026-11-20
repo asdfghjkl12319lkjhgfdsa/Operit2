@@ -8,7 +8,7 @@ use crate::toolpkg::ToolPkgManager::{
 use crate::toolpkg::ToolPkgParser::{
     ToolPkgContainerRuntime, ToolPkgLoadResult, ToolPkgSubpackageRuntime,
 };
-use operit_host_api::FileSystemHost;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 
 /// Resolves the active conditional state for one package.
 pub trait PackageStateResolver: Send + Sync {
@@ -21,10 +21,10 @@ pub trait PackageStateResolver: Send + Sync {
 #[derive(Clone)]
 #[allow(non_snake_case)]
 pub struct PluginPackageManager {
-    activatedPackages: BTreeSet<String>,
-    availablePackages: BTreeMap<String, ToolPackage>,
-    enabledPackageNames: BTreeSet<String>,
-    activePackageStateIds: BTreeMap<String, Option<String>>,
+    activatedPackages: Arc<BTreeSet<String>>,
+    availablePackages: Arc<BTreeMap<String, ToolPackage>>,
+    enabledPackageNames: Arc<BTreeSet<String>>,
+    activePackageStateIds: Arc<BTreeMap<String, Option<String>>>,
     toolPkgManager: ToolPkgManager,
     packageStateResolver: Arc<dyn PackageStateResolver>,
 }
@@ -34,18 +34,18 @@ impl PluginPackageManager {
     pub fn new(
         executionEngineFactory: Arc<dyn ToolPkgExecutionEngineFactory>,
         assetSource: Arc<dyn ToolPkgAssetSource>,
-        fileSystemHost: Arc<dyn FileSystemHost>,
+        filesystem: Arc<VisualFileSystem>,
         packageStateResolver: Arc<dyn PackageStateResolver>,
     ) -> Self {
         Self {
-            activatedPackages: BTreeSet::new(),
-            availablePackages: BTreeMap::new(),
-            enabledPackageNames: BTreeSet::new(),
-            activePackageStateIds: BTreeMap::new(),
+            activatedPackages: Arc::new(BTreeSet::new()),
+            availablePackages: Arc::new(BTreeMap::new()),
+            enabledPackageNames: Arc::new(BTreeSet::new()),
+            activePackageStateIds: Arc::new(BTreeMap::new()),
             toolPkgManager: ToolPkgManager::new(
                 executionEngineFactory,
                 assetSource,
-                fileSystemHost,
+                filesystem,
             ),
             packageStateResolver,
         }
@@ -58,7 +58,7 @@ impl PluginPackageManager {
         packageStateResolver: Arc<dyn PackageStateResolver>,
     ) {
         self.packageStateResolver = packageStateResolver;
-        self.activePackageStateIds.clear();
+        Arc::make_mut(&mut self.activePackageStateIds).clear();
     }
 
     /// Returns the embedded ToolPkg manager.
@@ -77,7 +77,7 @@ impl PluginPackageManager {
     #[allow(non_snake_case)]
     pub fn registerPackage(&mut self, package: ToolPackage) {
         let packageName = normalizePackageName(&package.name);
-        self.availablePackages.insert(packageName, package);
+        Arc::make_mut(&mut self.availablePackages).insert(packageName, package);
     }
 
     /// Registers a loaded ToolPkg container and every executable subpackage.
@@ -89,13 +89,12 @@ impl PluginPackageManager {
         {
             return false;
         }
-        self.availablePackages.insert(
+        Arc::make_mut(&mut self.availablePackages).insert(
             loadResult.containerPackage.name.clone(),
             loadResult.containerPackage.clone(),
         );
         for subpackage in self.toolPkgManager.registerToolPkg(loadResult) {
-            self.availablePackages
-                .insert(subpackage.name.clone(), subpackage);
+            Arc::make_mut(&mut self.availablePackages).insert(subpackage.name.clone(), subpackage);
         }
         true
     }
@@ -118,7 +117,7 @@ impl PluginPackageManager {
     /// Returns all registered package definitions.
     #[allow(non_snake_case)]
     pub fn availablePackages(&self) -> BTreeMap<String, ToolPackage> {
-        self.availablePackages.clone()
+        self.availablePackages.as_ref().clone()
     }
 
     /// Returns a shared view of all registered package definitions.
@@ -130,28 +129,24 @@ impl PluginPackageManager {
     /// Returns a mutable view of all registered package definitions.
     #[allow(non_snake_case)]
     pub fn availablePackagesMut(&mut self) -> &mut BTreeMap<String, ToolPackage> {
-        &mut self.availablePackages
+        Arc::make_mut(&mut self.availablePackages)
     }
 
     /// Replaces all package definitions after an external source scan.
     #[allow(non_snake_case)]
     pub fn replaceAvailablePackages(&mut self, availablePackages: BTreeMap<String, ToolPackage>) {
-        self.availablePackages = availablePackages;
-        self.activatedPackages
-            .retain(|name| self.availablePackages.contains_key(name));
-        self.activePackageStateIds
-            .retain(|name, _| self.availablePackages.contains_key(name));
+        self.availablePackages = Arc::new(availablePackages);
+        Arc::make_mut(&mut self.activatedPackages).retain(|name| self.availablePackages.contains_key(name));
+        Arc::make_mut(&mut self.activePackageStateIds).retain(|name, _| self.availablePackages.contains_key(name));
     }
 
-    /// Replaces ToolPkg runtime maps after an external source scan.
+    /// Publishes precomputed runtime declarations without reading sources or destroying workers.
     #[allow(non_snake_case)]
-    pub fn replaceToolPkgRuntimes(
+    pub fn publishToolPkgRuntimes(
         &mut self,
-        containers: BTreeMap<String, ToolPkgContainerRuntime>,
-        subpackages: BTreeMap<String, ToolPkgSubpackageRuntime>,
-    ) {
-        self.toolPkgManager
-            .replaceRuntimeMaps(containers, subpackages);
+        prepared: crate::toolpkg::ToolPkgManager::PreparedToolPkgRuntimeMaps,
+    ) -> Vec<Arc<dyn crate::javascript::JsExecutionEngine>> {
+        self.toolPkgManager.publishRuntimeMaps(prepared)
     }
 
     /// Removes one package or an entire ToolPkg container.
@@ -160,36 +155,34 @@ impl PluginPackageManager {
         let packageName = normalizePackageName(packageName);
         let mut removed = false;
         if let Some(container) = self.toolPkgManager.removeToolPkgContainer(&packageName) {
-            removed = self.availablePackages.remove(&packageName).is_some();
-            self.enabledPackageNames.remove(&packageName);
-            self.activatedPackages.remove(&packageName);
-            self.activePackageStateIds.remove(&packageName);
+            removed = Arc::make_mut(&mut self.availablePackages).remove(&packageName).is_some();
+            Arc::make_mut(&mut self.enabledPackageNames).remove(&packageName);
+            Arc::make_mut(&mut self.activatedPackages).remove(&packageName);
+            Arc::make_mut(&mut self.activePackageStateIds).remove(&packageName);
             for subpackage in container.subpackages {
-                removed = self
-                    .availablePackages
-                    .remove(&subpackage.packageName)
+                removed = Arc::make_mut(&mut self.availablePackages).remove(&subpackage.packageName)
                     .is_some()
                     || removed;
-                self.enabledPackageNames.remove(&subpackage.packageName);
-                self.activatedPackages.remove(&subpackage.packageName);
-                self.activePackageStateIds.remove(&subpackage.packageName);
+                Arc::make_mut(&mut self.enabledPackageNames).remove(&subpackage.packageName);
+                Arc::make_mut(&mut self.activatedPackages).remove(&subpackage.packageName);
+                Arc::make_mut(&mut self.activePackageStateIds).remove(&subpackage.packageName);
             }
             return removed;
         }
-        self.enabledPackageNames.remove(&packageName);
-        self.activatedPackages.remove(&packageName);
-        self.activePackageStateIds.remove(&packageName);
-        self.availablePackages.remove(&packageName).is_some()
+        Arc::make_mut(&mut self.enabledPackageNames).remove(&packageName);
+        Arc::make_mut(&mut self.activatedPackages).remove(&packageName);
+        Arc::make_mut(&mut self.activePackageStateIds).remove(&packageName);
+        Arc::make_mut(&mut self.availablePackages).remove(&packageName).is_some()
     }
 
     /// Replaces the complete enabled package set.
     #[allow(non_snake_case)]
     pub fn setEnabledPackageNames(&mut self, packageNames: &[String]) {
-        self.enabledPackageNames = packageNames
+        self.enabledPackageNames = Arc::new(packageNames
             .iter()
             .map(|name| normalizePackageName(name))
             .filter(|name| !name.is_empty())
-            .collect();
+            .collect());
     }
 
     /// Returns enabled package names in stable order.
@@ -208,30 +201,27 @@ impl PluginPackageManager {
     /// Marks a package as enabled in memory.
     #[allow(non_snake_case)]
     pub fn enablePackage(&mut self, packageName: &str) -> bool {
-        self.enabledPackageNames
-            .insert(normalizePackageName(packageName))
+        Arc::make_mut(&mut self.enabledPackageNames).insert(normalizePackageName(packageName))
     }
 
     /// Marks a package as disabled in memory.
     #[allow(non_snake_case)]
     pub fn disablePackage(&mut self, packageName: &str) -> bool {
         let packageName = normalizePackageName(packageName);
-        self.activatedPackages.remove(&packageName);
-        self.enabledPackageNames.remove(&packageName)
+        Arc::make_mut(&mut self.activatedPackages).remove(&packageName);
+        Arc::make_mut(&mut self.enabledPackageNames).remove(&packageName)
     }
 
     /// Activates a package for the current request or prompt session.
     #[allow(non_snake_case)]
     pub fn activatePackage(&mut self, packageName: &str) -> bool {
-        self.activatedPackages
-            .insert(normalizePackageName(packageName))
+        Arc::make_mut(&mut self.activatedPackages).insert(normalizePackageName(packageName))
     }
 
     /// Deactivates a package for the current request or prompt session.
     #[allow(non_snake_case)]
     pub fn deactivatePackage(&mut self, packageName: &str) -> bool {
-        self.activatedPackages
-            .remove(&normalizePackageName(packageName))
+        Arc::make_mut(&mut self.activatedPackages).remove(&normalizePackageName(packageName))
     }
 
     /// Returns whether a package is active for the current request.
@@ -251,11 +241,10 @@ impl PluginPackageManager {
     #[allow(non_snake_case)]
     pub fn selectPackageState(&mut self, packageName: &str) -> Option<ToolPackage> {
         let packageName = normalizePackageName(packageName);
-        let package = self.availablePackages.get(&packageName)?.clone();
-        let stateId = self.packageStateResolver.resolvePackageStateId(&package);
-        self.activePackageStateIds
-            .insert(packageName, stateId.clone());
-        Some(applyPackageState(&package, stateId.as_deref()))
+        let package = self.availablePackages.get(&packageName)?;
+        let stateId = self.packageStateResolver.resolvePackageStateId(package);
+        Arc::make_mut(&mut self.activePackageStateIds).insert(packageName, stateId.clone());
+        Some(applyPackageState(package, stateId.as_deref()))
     }
 
     /// Returns one package with its currently resolvable conditional state applied.
@@ -266,6 +255,20 @@ impl PluginPackageManager {
             .get(&normalizePackageName(packageName))?;
         let stateId = self.packageStateResolver.resolvePackageStateId(package);
         Some(applyPackageState(package, stateId.as_deref()))
+    }
+
+    /// Selects only the executable requested by the caller, borrowing all other scripts.
+    #[allow(non_snake_case)]
+    pub fn effectiveTool(&self, packageName: &str, functionName: &str) -> Result<PackageTool, String> {
+        let package = self.availablePackages.get(packageName.trim())
+            .ok_or_else(|| format!("Package not registered: {packageName}"))?;
+        let stateId = self.packageStateResolver.resolvePackageStateId(package);
+        let state = stateId.as_deref().and_then(|id| package.states.iter().find(|state| state.id == id));
+        let tools = match state {
+            None => package.tools.iter().collect::<Vec<_>>(),
+            Some(state) => mergeToolRefsForState(&package.tools, state).into_values().collect(),
+        };
+        crate::javascript::select_registered_package_tool_ref(&package.name, tools, functionName).cloned()
     }
 
     /// Returns the last state id selected for one package.
@@ -280,8 +283,7 @@ impl PluginPackageManager {
     /// Clears the recorded state selection for one package.
     #[allow(non_snake_case)]
     pub fn clearActivePackageState(&mut self, packageName: &str) {
-        self.activePackageStateIds
-            .remove(&normalizePackageName(packageName));
+        Arc::make_mut(&mut self.activePackageStateIds).remove(&normalizePackageName(packageName));
     }
 }
 
@@ -289,31 +291,30 @@ impl PluginPackageManager {
 #[allow(non_snake_case)]
 fn applyPackageState(package: &ToolPackage, stateId: Option<&str>) -> ToolPackage {
     let state = stateId.and_then(|stateId| package.states.iter().find(|state| state.id == stateId));
-    let Some(state) = state else {
-        return package.clone();
-    };
+    let Some(state) = state else { return package.clone(); };
+    let tools = mergeToolRefsForState(&package.tools, state).into_values().cloned().collect();
     ToolPackage {
-        tools: mergeToolsForState(&package.tools, state),
-        ..package.clone()
+        tools,
+        name: package.name.clone(), description: package.description.clone(),
+        api_version: package.api_version.clone(),
+        states: package.states.clone(), env: package.env.clone(),
+        is_built_in: package.is_built_in, enabled_by_default: package.enabled_by_default,
+        display_name: package.display_name.clone(), category: package.category.clone(),
+        author: package.author.clone(),
     }
 }
 
-/// Merges base tools with one conditional package state.
+/// Resolves conditional overrides before copying any executable source.
 #[allow(non_snake_case)]
-fn mergeToolsForState(baseTools: &[PackageTool], state: &ToolPackageState) -> Vec<PackageTool> {
-    let mut toolMap = BTreeMap::new();
+fn mergeToolRefsForState<'a>(baseTools: &'a [PackageTool], state: &'a ToolPackageState)
+    -> BTreeMap<&'a str, &'a PackageTool> {
+    let mut tools = BTreeMap::new();
     if state.inherit_tools {
-        for tool in baseTools {
-            toolMap.insert(tool.name.clone(), tool.clone());
-        }
+        for tool in baseTools { tools.insert(tool.name.as_str(), tool); }
     }
-    for toolName in &state.exclude_tools {
-        toolMap.remove(toolName);
-    }
-    for tool in &state.tools {
-        toolMap.insert(tool.name.clone(), tool.clone());
-    }
-    toolMap.into_values().collect()
+    for name in &state.exclude_tools { tools.remove(name.as_str()); }
+    for tool in &state.tools { tools.insert(tool.name.as_str(), tool); }
+    tools
 }
 
 /// Normalizes a package name for map and set lookups.
@@ -324,6 +325,15 @@ fn normalizePackageName(packageName: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Asserts that an immediate mock completion is ready on its first poll.
+    fn pollReadyCompletion<T>(mut completion: crate::javascript::JsExecutionCompletion<T>) -> T {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::future::Future::poll(completion.as_mut(), &mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("immediate mock completion must be ready"),
+        }
+    }
+
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::Arc;
@@ -478,12 +488,14 @@ mod tests {
             _envOverrides: &BTreeMap<String, String>,
             _onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
             _dispatchIntermediateOnMain: bool,
-            _timeoutSec: u64,
-        ) -> JsExecutionResult<Option<String>> {
-            Ok(params
-                .get("event")
-                .and_then(Value::as_str)
-                .map(str::to_string))
+        ) -> crate::javascript::JsExecutionCompletion<JsExecutionResult<Option<String>>> {
+            let result = (|| {
+                Ok(params
+                    .get("event")
+                    .and_then(Value::as_str)
+                    .map(str::to_string))
+            })();
+            Box::pin(std::future::ready(result))
         }
 
         /// Returns the dispatched event name for exact-deadline hook tests.
@@ -497,11 +509,14 @@ mod tests {
             _onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
             _dispatchIntermediateOnMain: bool,
             _timeoutMillis: u64,
-        ) -> JsExecutionResult<Option<String>> {
-            Ok(params
-                .get("event")
-                .and_then(Value::as_str)
-                .map(str::to_string))
+        ) -> crate::javascript::JsExecutionCompletion<JsExecutionResult<Option<String>>> {
+            let result = (|| {
+                Ok(params
+                    .get("event")
+                    .and_then(Value::as_str)
+                    .map(str::to_string))
+            })();
+            Box::pin(std::future::ready(result))
         }
 
         /// Returns the dispatched event asynchronously for package manager tests.
@@ -513,7 +528,6 @@ mod tests {
             _env_overrides: BTreeMap<String, String>,
             _on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
             _dispatch_intermediate_on_main: bool,
-            _timeout_millis: u64,
         ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
             Box::pin(async move {
                 Ok(params
@@ -535,52 +549,25 @@ mod tests {
             Ok(ToolPkgMainRegistrationCapture::default())
         }
 
-        /// Returns the supplied Compose DSL script.
-        #[allow(non_snake_case)]
-        fn execute_compose_dsl_script(
-            &self,
-            script: &str,
-            _runtimeOptions: &BTreeMap<String, Value>,
-            _envOverrides: &BTreeMap<String, String>,
-            _textResources: Arc<BTreeMap<String, String>>,
-        ) -> JsExecutionResult<Option<String>> {
-            Ok(Some(script.to_string()))
-        }
-
-        /// Returns the supplied Compose DSL script asynchronously for tests.
-        fn execute_compose_dsl_script_async(
-            &self,
-            script: String,
-            _runtime_options: BTreeMap<String, Value>,
-            _env_overrides: BTreeMap<String, String>,
-            _text_resources: Arc<BTreeMap<String, String>>,
-        ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-            Box::pin(async move { Ok(Some(script)) })
-        }
-
-        /// Returns the dispatched action id.
-        #[allow(non_snake_case)]
-        fn dispatch_compose_dsl_action(
-            &self,
-            actionId: &str,
-            _payload: Option<Value>,
-            _runtimeOptions: &BTreeMap<String, Value>,
-            _envOverrides: &BTreeMap<String, String>,
-            _onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        ) -> JsExecutionResult<Option<String>> {
-            Ok(Some(actionId.to_string()))
+        /// Rejects live-session rendering in this recording-only engine.
+        fn execute_compose_dsl_script_stream_async(
+            &self, _script: String, _runtime_options: BTreeMap<String, Value>,
+            _env_overrides: BTreeMap<String, String>, _text_resources: Arc<BTreeMap<String, String>>,
+            _on_response: Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>,
+        ) -> crate::javascript::JsExecutionFuture<JsExecutionResult<Option<Value>>> {
+            Box::pin(async { Err(crate::execution_result::JsExecutionError::invalid_request("This recording engine does not execute live Compose sessions")) })
         }
 
         /// Returns the dispatched action id asynchronously for tests.
-        fn dispatch_compose_dsl_action_result_async(
+        fn dispatch_compose_dsl_action_stream_async(
             &self,
             actionId: String,
             _payload: Option<Value>,
             _runtimeOptions: BTreeMap<String, Value>,
             _envOverrides: BTreeMap<String, String>,
-            _on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-            Box::pin(async move { Ok(Some(actionId)) })
+            _on_intermediate_result: Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>,
+        ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>> {
+            Box::pin(async move { Ok(Some(Value::String(actionId))) })
         }
 
         /// Releases no resources for the test engine.
@@ -593,8 +580,8 @@ mod tests {
     impl ToolPkgExecutionEngineFactory for TestExecutionEngineFactory {
         /// Creates one generic test JavaScript engine.
         #[allow(non_snake_case)]
-        fn createExecutionEngine(&self) -> Arc<dyn JsExecutionEngine> {
-            Arc::new(TestExecutionEngine)
+        fn createExecutionEngine(&self) -> Result<Arc<dyn JsExecutionEngine>, String> {
+            Ok(Arc::new(TestExecutionEngine))
         }
 
         /// Creates one ToolPkg test JavaScript engine.
@@ -602,8 +589,17 @@ mod tests {
         fn createToolPkgExecutionEngine(
             &self,
             _context: ToolPkgExecutionContext,
-        ) -> Arc<dyn JsExecutionEngine> {
-            Arc::new(TestExecutionEngine)
+        ) -> Result<Arc<dyn JsExecutionEngine>, String> {
+            Ok(Arc::new(TestExecutionEngine))
+        }
+
+        /// Completes the asynchronous factory contract with this consumer's explicit engine implementation.
+        #[allow(non_snake_case)]
+        fn acquireToolPkgExecutionEngine(
+            &self, context: ToolPkgExecutionContext,
+        ) -> crate::javascript::JsExecutionFuture<Result<Arc<dyn JsExecutionEngine>, String>> {
+            let result = self.createToolPkgExecutionEngine(context);
+            Box::pin(async move { result })
         }
     }
 
@@ -647,9 +643,80 @@ mod tests {
         PluginPackageManager::new(
             Arc::new(TestExecutionEngineFactory),
             Arc::new(TestAssetSource),
-            Arc::new(RejectingFileSystemHost),
+            Arc::new(operit_vfs::VisualFileSystem::VisualFileSystem::builtinOnly(Arc::new(RejectingFileSystemHost), "/".into(), "/workspaces".into())),
             Arc::new(TestPackageStateResolver),
         )
+    }
+
+    /// Execution snapshots share script storage and detach only when the catalog changes.
+    #[test]
+    fn catalog_snapshots_share_scripts_and_isolate_writes() {
+        let mut manager = packageManager();
+        manager.registerPackage(ToolPackage {
+            name: "demo".into(), tools: vec![PackageTool {
+                name: "run".into(), script: "large source".repeat(1000), ..Default::default()
+            }], ..Default::default()
+        });
+        manager.enablePackage("demo");
+        manager.activatePackage("demo");
+        let snapshot = manager.clone();
+        assert!(Arc::ptr_eq(&manager.availablePackages, &snapshot.availablePackages));
+        assert!(Arc::ptr_eq(&manager.enabledPackageNames, &snapshot.enabledPackageNames));
+        manager.availablePackagesMut().get_mut("demo").unwrap().tools[0].script = "updated".into();
+        manager.disablePackage("demo");
+        assert_eq!(manager.effectiveTool("demo", "run").unwrap().script, "updated");
+        assert_eq!(snapshot.effectiveTool("demo", "run").unwrap().script, "large source".repeat(1000));
+        assert!(snapshot.isPackageEnabled("demo"));
+        assert!(snapshot.isPackageActivated("demo"));
+        assert!(!manager.isPackageActivated("demo"));
+    }
+
+    /// Borrowed selection keeps state exclusion and override behavior identical to catalog display.
+    #[test]
+    fn effective_tool_preserves_conditional_overrides() {
+        let tool = |name: &str, script: &str| PackageTool {
+            name: name.into(), script: script.into(), ..Default::default()
+        };
+        let mut manager = packageManager();
+        manager.registerPackage(ToolPackage {
+            name: "demo".into(), tools: vec![tool("run", "base"), tool("hidden", "hidden")],
+            api_version: "2.0.0".into(),
+            states: vec![ToolPackageState {
+                id: "state".into(), inherit_tools: true, exclude_tools: vec!["hidden".into()],
+                tools: vec![tool("run", "override"), tool("added", "added")], ..Default::default()
+            }], ..Default::default()
+        });
+        assert_eq!(manager.effectiveTool("demo", "run").unwrap().script, "override");
+        assert_eq!(manager.effectiveTool("demo", "added").unwrap().script, "added");
+        assert!(manager.effectiveTool("demo", "hidden").is_err());
+        assert_eq!(manager.effectivePackage("demo").unwrap().api_version, "2.0.0");
+        for tool in manager.effectivePackage("demo").unwrap().tools {
+            assert_eq!(manager.effectiveTool("demo", &tool.name).unwrap().script, tool.script);
+        }
+        manager.availablePackagesMut().get_mut("demo").unwrap().states[0].inherit_tools = false;
+        assert_eq!(manager.effectiveTool("demo", "run").unwrap().script, "override");
+        assert!(manager.effectiveTool("demo", "hidden").is_err());
+    }
+
+    /// Fast lookup must retain all executable admission checks without copying the package.
+    #[test]
+    fn effective_tool_rejects_ambiguous_and_non_executable_declarations() {
+        let mut manager = packageManager();
+        let declaration = PackageTool { name: "run".into(), script: "return 1".into(), ..Default::default() };
+        manager.registerPackage(ToolPackage {
+            name: "demo".into(), tools: vec![declaration.clone(), declaration], ..Default::default()
+        });
+        assert!(manager.effectiveTool("demo", "run").unwrap_err().contains("Duplicate tool registration"));
+        let package = manager.availablePackagesMut().get_mut("demo").unwrap();
+        package.tools.pop();
+        package.tools[0].advice = true;
+        assert!(manager.effectiveTool("demo", "run").unwrap_err().contains("advisory"));
+        let package = manager.availablePackagesMut().get_mut("demo").unwrap();
+        package.tools[0].advice = false;
+        package.tools[0].script.clear();
+        assert!(manager.effectiveTool("demo", "run").unwrap_err().contains("empty"));
+        assert!(manager.effectiveTool("demo", "missing").is_err());
+        assert!(manager.effectiveTool("missing", "run").is_err());
     }
 
     /// Verifies JavaScript package registration, activation, and state selection.
@@ -710,28 +777,26 @@ mod tests {
         assert!(registered);
         manager.setEnabledPackageNames(&["container".to_string()]);
 
-        let output = manager
-            .toolPkgManager()
-            .dispatchToolPkgHook(
-                &manager.enabledPackageNames(),
-                ToolPkgHookInvocation {
-                    containerPackageName: "container".to_string(),
-                    functionName: "onEvent".to_string(),
-                    event: "host_event".to_string(),
-                    eventName: None,
-                    pluginId: None,
-                    inlineFunctionSource: None,
-                    eventPayload: Value::Object(Default::default()),
-                    executionContextKey: None,
-                    runtimeKind: None,
-                    envOverrides: BTreeMap::new(),
-                    timestampMs: 1,
-                    timeoutMillis: 10_000,
-                    dispatchIntermediateOnMain: true,
-                    onIntermediateResult: None,
-                },
-            )
-            .expect("ToolPkg hook dispatch must succeed");
+        let output = pollReadyCompletion(manager.toolPkgManager().dispatchToolPkgHook(
+            &manager.enabledPackageNames(),
+            ToolPkgHookInvocation {
+                containerPackageName: "container".to_string(),
+                functionName: "onEvent".to_string(),
+                event: "host_event".to_string(),
+                eventName: None,
+                pluginId: None,
+                inlineFunctionSource: None,
+                eventPayload: Value::Object(Default::default()),
+                executionContextKey: None,
+                runtimeKind: None,
+                envOverrides: BTreeMap::new(),
+                timestampMs: 1,
+                timeoutMillis: None,
+                dispatchIntermediateOnMain: true,
+                onIntermediateResult: None,
+            },
+        ))
+        .expect("ToolPkg hook dispatch must succeed");
 
         assert_eq!(output.as_deref(), Some("host_event"));
     }

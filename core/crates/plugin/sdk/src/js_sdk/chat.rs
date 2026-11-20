@@ -1,9 +1,60 @@
 //! Chat service controls and conversation-management types exposed to plugins.
+use super::core::JsonObject;
 use super::results::*;
-use super::{JsDate, JsFuture};
+use super::{JsAsyncIterable, JsDate, JsFuture, JsNullable, JsOptional};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+
+/// Identifies an existing conversation or an exact persisted message revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum ChatExtensionTarget {
+    /// Selects the executing owner's namespace on one existing conversation.
+    #[serde(rename = "chat")]
+    Chat { chatId: String },
+    /// Selects revision zero or one explicitly identified persisted variant.
+    #[serde(rename = "message")]
+    Message {
+        chatId: String,
+        messageTimestamp: i64,
+        variantIndex: i32,
+    },
+}
+
+impl ChatExtensionTarget {
+    /// Rejects empty identities and negative variant indexes before native storage access.
+    pub fn validate(&self) -> Result<(), String> {
+        let chatId = match self {
+            Self::Chat { chatId } | Self::Message { chatId, .. } => chatId,
+        };
+        if chatId.trim().is_empty() {
+            return Err("Chat extension target requires a nonempty chatId".to_string());
+        }
+        if let Self::Message { variantIndex, .. } = self {
+            if *variantIndex < 0 {
+                return Err("Chat extension variantIndex must be nonnegative".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Configures workspace conversation creation without exposing plugin associations.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatCreateOptions {
+    /// Controls whether the newly persisted conversation becomes current.
+    pub setAsCurrentChat: Option<bool>,
+    /// Identifies an explicitly selected existing source conversation for creation hooks.
+    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
+    pub sourceChatId: JsOptional<String>,
+    /// Places the new conversation beneath an existing parent without cloning its history.
+    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
+    pub parentChatId: JsOptional<String>,
+    /// Supplies opaque creation input interpreted solely by registered plugins.
+    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
+    pub input: JsOptional<JsonObject>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Describes one prompt turn supplied to a non-persistent functional model call.
@@ -63,6 +114,8 @@ pub enum ChatHostListChatsParamsSortOrder {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Configures filtering, ordering, and result limits when listing conversations.
 pub struct ChatHostListChatsParams {
+    /// Selects an explicit batch of 1..200 generic chat identities through SQL.
+    pub chat_ids: Option<Vec<String>>,
     /// Contains the text or pattern used to filter conversations.
     pub query: Option<String>,
     /// Selects how the query is compared with chat titles and identifiers.
@@ -136,8 +189,222 @@ pub enum ChatStartServiceOptionsInitialMode {
     #[serde(rename = "SCREEN_OCR")]
     SCREENOCR,
 }
-/// Starts the chat service and manages conversations, messages, and character cards.
+/// Preserves the original submitted text, attachments and reply target for a native sequence.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(deny_unknown_fields)]
+pub struct ChatTurnInput {
+    pub text: String,
+    pub attachments: Vec<ChatSendAttachment>,
+    pub replyToMessageTimestamp: JsNullable<i64>,
+}
+
+/// Selects real user-only persistence or one explicitly selected execution participant.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChatInitialTurn {
+    #[serde(rename = "record_only")]
+    RecordOnly,
+    #[serde(rename = "execute")]
+    Execute { participantId: Option<String> },
+}
+
+/// Controls summary scheduling for an explicitly continued user turn.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatSummaryPolicy {
+    /// Defers ordinary history summaries; tool-loop context limits still trigger compaction.
+    #[serde(rename = "defer")]
+    Defer,
+    /// Checks configured summary thresholds after this reply has actually completed.
+    #[serde(rename = "after_reply")]
+    AfterReply,
+}
+
+/// Sends original input once or generates a reply to an explicitly identified persisted user message.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChatSendRequest {
+    #[serde(rename = "submit")]
+    Submit {
+        chatId: String,
+        runtime: ChatRuntime,
+        input: ChatTurnInput,
+        turn: ChatInitialTurn,
+        notifyReply: bool,
+    },
+    #[serde(rename = "continue")]
+    Continue {
+        chatId: String,
+        runtime: ChatRuntime,
+        userMessageTimestamp: i64,
+        participantId: String,
+        notifyReply: bool,
+        summaryPolicy: ChatSummaryPolicy,
+    },
+}
+
+impl ChatSendRequest {
+    /// Rejects malformed identities and ambiguous input before acquiring native execution ownership.
+    pub fn validate(&self) -> Result<(), String> {
+        let chatId = match self { Self::Submit { chatId, .. } | Self::Continue { chatId, .. } => chatId };
+        if chatId.trim().is_empty() { return Err("Chat send requires a nonempty chatId".to_string()); }
+        match self {
+            Self::Submit { input, turn, .. } => {
+                if input.text.trim().is_empty() && input.attachments.is_empty() {
+                    return Err("Initial submission requires text or complete attachments".to_string());
+                }
+                if input.replyToMessageTimestamp.as_value().is_some_and(|timestamp| *timestamp <= 0) {
+                    return Err("Reply target requires a positive committed timestamp".to_string());
+                }
+                for attachment in &input.attachments {
+                    if attachment.fileName.trim().is_empty() || attachment.mimeType.trim().is_empty()
+                        || attachment.fileSize < 0 || attachment.nodeId.as_value().is_some_and(|id| id.trim().is_empty()) {
+                        return Err("Chat attachment requires its complete original identity and metadata".to_string());
+                    }
+                }
+                if let ChatInitialTurn::Execute { participantId: Some(id) } = turn {
+                    if id.trim().is_empty() { return Err("Execution participantId cannot be blank".to_string()); }
+                }
+            }
+            Self::Continue { userMessageTimestamp, participantId, .. } => {
+                if *userMessageTimestamp <= 0 || participantId.trim().is_empty() {
+                    return Err("Continuation requires a committed user timestamp and participantId".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Describes one already parsed semantic message block, including its structured tool fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+pub struct ChatMessagePart {
+    pub partId: String,
+    pub sequence: i32,
+    pub kind: ChatMessagePartKind,
+    pub content: String,
+    pub toolCallId: JsNullable<String>,
+    pub toolName: JsNullable<String>,
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// Identifies semantic content without requiring plugins to parse provider markup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatMessagePartKind {
+    #[serde(rename = "markdown")]
+    Markdown,
+    #[serde(rename = "thinking")]
+    Thinking,
+    #[serde(rename = "tool_call")]
+    ToolCall,
+    #[serde(rename = "tool_result")]
+    ToolResult,
+    #[serde(rename = "status")]
+    Status,
+}
+
+/// Publishes atomic semantic snapshots followed by the actual finalized receipt.
+/// A part event replaces the entire ordered part list, including removed or revised blocks.
+/// Slow consumers observe the latest snapshot; snapshots are not an append-only chunk log.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatSendEvent {
+    #[serde(rename = "part")]
+    Part { chatId: String, messageTimestamp: i64, revision: u64, parts: Vec<ChatMessagePart> },
+    #[serde(rename = "completed")]
+    Completed { result: MessageSendResultData },
+}
+
+/// Reports cancellation of this authenticated plugin's execution in the named chat.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+pub struct ChatCancelResult { pub chatId: String, pub cancelRequested: bool }
+
+/// Publishes already generated assistant text to one existing conversation on any platform.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatPreparedMessageRequest {
+    pub chatId: String,
+    pub text: String,
+    /// Positive Unix milliseconds; must have reached this time before committing.
+    pub timestamp: i64,
+    #[serde(default)]
+    pub notify: bool,
+}
+pub fn validatePreparedMessageRequest(request: &ChatPreparedMessageRequest, now: i64) -> Result<(), String> {
+        validatePreparedChatText(&request.chatId, &request.text)?;
+        if request.timestamp <= 0 || request.timestamp > now {
+            return Err("Prepared message timestamp must be positive and already due".into());
+        }
+        Ok(())
+    }
+
+/// Requests a proactive reply from the target conversation's actual execution profile.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatScheduledGeneration {
+    /// Supplies instructions for a proactive reply using the target conversation's resolved participant and context.
+    pub instruction: String,
+}
+
+/// Schedules supplied text or asks the host to prepare a contextual assistant reply.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatScheduledMessageRequest {
+    /// Scoped automatically to the authenticated plugin. Identical retries are idempotent.
+    pub id: String,
+    pub chatId: String,
+    pub title: String,
+    pub text: String,
+    /// Requires empty text. The host saves the actual author, model usage and generation timing with the prepared reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<ChatScheduledGeneration>,
+    /// Absolute Unix milliseconds, from one second to 30 days ahead.
+    pub timestamp: i64,
+}
+pub fn validateChatScheduledMessageRequest(request: &ChatScheduledMessageRequest, now: i64) -> Result<(), String> {
+        validatePreparedNotificationId(&request.id)?;
+        match &request.generation {
+            Some(generation) => {
+                if !request.text.is_empty() { return Err("Generated scheduled replies require empty text".into()); }
+                validatePreparedChatText(&request.chatId, &generation.instruction)?;
+            }
+            None => validatePreparedChatText(&request.chatId, &request.text)?,
+        }
+        if request.title.len() > 1024 { return Err("Notification title exceeds 1024 bytes".into()); }
+        let delay = request.timestamp.saturating_sub(now);
+        if !(1000..=2_592_000_000).contains(&delay) {
+            return Err("Notification time must be from one second to 30 days in the future".into());
+        }
+        Ok(())
+    }
+
+pub fn validatePreparedNotificationId(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() || id.len() > 200 { return Err("Notification ID requires 1 to 200 bytes".into()); }
+    Ok(())
+}
+fn validatePreparedChatText(chatId: &str, text: &str) -> Result<(), String> {
+    if chatId.trim().is_empty() || chatId.trim() != chatId { return Err("A nonempty exact chatId is required".into()); }
+    if text.trim().is_empty() || text.len() > 65536 { return Err("Prepared text requires 1 to 65536 bytes".into()); }
+    Ok(())
+}
+
+/// Starts the chat service and manages generic conversations and execution participants.
 pub trait ChatHost: Send + Sync {
+    /// Commits prepared assistant text once by chat ID and timestamp, without changing the selected chat.
+    fn deliverPrepared(&self, request: ChatPreparedMessageRequest) -> JsFuture<ChatPreparedDeliveryResultData>;
+    /// Durably schedules prepared assistant text for a chat. The host handles delivery and platform restrictions.
+    fn scheduleMessage(&self, request: ChatScheduledMessageRequest) -> JsFuture<ChatScheduleMessageResultData>;
+    /// Cancels this plugin's scheduled message and any associated system notification.
+    fn cancelScheduledMessage(&self, id: String) -> JsFuture<ChatCancelScheduledMessageResultData>;
+    /// Lists this plugin's scheduled messages and delivery outcomes without platform-specific handling.
+    fn listScheduledMessages(&self) -> JsFuture<ChatScheduledMessagesResultData>;
     ///
     ///Start the chat service (floating window)
     ///@param options - Optional service startup options
@@ -152,18 +419,20 @@ pub trait ChatHost: Send + Sync {
     ///
     fn stopService(&self) -> JsFuture<ChatServiceStartResultData>;
     ///
-    ///Create a new chat conversation
-    ///@param group - Optional group name for the new chat
-    ///@param setAsCurrentChat - Optional, whether to switch to the new chat (default true)
-    ///@param characterCardId - Optional character card id to bind for the new chat
-    ///@returns Promise resolving to the new chat creation result
-    ///
-    fn createNew(
+    /// Creates a workspace conversation through the registered creation hooks.
+    /// @param options - Current-chat control, an explicit source chat, and opaque plugin input.
+    /// @returns The identity and timestamp of the actually persisted conversation.
+    fn createNew(&self, options: Option<ChatCreateOptions>) -> JsFuture<ChatCreationResultData>;
+    /// Reads only the authenticated executing package's extension on an existing target.
+    fn readExtension(&self, target: ChatExtensionTarget) -> JsFuture<ChatReadExtensionResultData>;
+    /// Replaces only the authenticated executing package's object extension on an existing target.
+    fn writeExtension(
         &self,
-        group: Option<String>,
-        setAsCurrentChat: Option<bool>,
-        characterCardId: Option<String>,
-    ) -> JsFuture<ChatCreationResultData>;
+        target: ChatExtensionTarget,
+        value: JsonObject,
+    ) -> JsFuture<ChatWriteExtensionResultData>;
+    /// Deletes only the authenticated executing package's extension on an existing target.
+    fn deleteExtension(&self, target: ChatExtensionTarget) -> JsFuture<ChatDeleteExtensionResultData>;
     ///
     ///List all chat conversations
     ///@returns Promise resolving to the list of all chats
@@ -191,48 +460,26 @@ pub trait ChatHost: Send + Sync {
     ///Update chat title
     ///
     fn updateTitle(&self, chatId: String, title: String) -> JsFuture<ChatTitleUpdateResultData>;
+    /// Updates only the pinned state of an existing canonical chat.
+    /// Assigns existing conversations to a native folder; null removes folder membership.
+    fn updateGroup(&self, chatIds: Vec<String>, groupName: JsNullable<String>) -> JsFuture<String>;
+    fn updatePinned(&self, chatId: String, pinned: bool) -> JsFuture<String>;
+    /// Updates only the deletion lock of an existing canonical chat.
+    fn updateLocked(&self, chatId: String, locked: bool) -> JsFuture<String>;
+    /// Clears the parent relationship while preserving the conversation and its children.
+    fn promoteToRoot(&self, chatId: String) -> JsFuture<String>;
+    /// Persists the supplied unique existing chat identifiers in display order.
+    fn reorder(&self, chatIds: Vec<String>) -> JsFuture<String>;
     ///
     ///Delete a chat conversation by id
     ///
     fn deleteChat(&self, chatId: String) -> JsFuture<ChatDeleteResultData>;
-    ///
-    ///Send a message to the AI
-    ///@param message - The message content to send
-    ///@param chatId - Optional chat ID to send the message to (defaults to current chat)
-    ///@param roleCardId - Optional role card ID to use for this send
-    ///@param senderName - Optional display name when AI sends as user
-    ///@param options - Optional per-turn controls for persistence, notification, hidden user-message display, and timeout
-    ///@returns Promise resolving to the message send result
-    ///
-    fn sendMessage(
-        &self,
-        message: String,
-        chatId: Option<String>,
-        roleCardId: Option<String>,
-        senderName: Option<String>,
-        options: Option<ChatSendMessageOptions>,
-    ) -> JsFuture<MessageSendResultData>;
-    ///
-    ///Send a message to the AI and receive incremental reply chunks.
-    ///@param message - The message content to send
-    ///@param chatId - Optional chat ID to send the message to (defaults to current chat)
-    ///@param roleCardId - Optional role card ID to use for this send
-    ///@param senderName - Optional display name when AI sends as user
-    ///@param options - Optional per-turn controls, plus streaming callback and waifu-style chunk aggregation
-    ///@returns Promise resolving to the final message send result
-    ///
-    fn sendMessageStreaming(
-        &self,
-        message: String,
-        chatId: Option<String>,
-        roleCardId: Option<String>,
-        senderName: Option<String>,
-        options: Option<ChatSendMessageStreamingOptions>,
-    ) -> JsFuture<MessageSendResultData>;
-    ///
-    ///List all character cards
-    ///
-    fn listCharacterCards(&self) -> JsFuture<CharacterCardListResultData>;
+    /// Sends one request and resolves only after its real receipt and native cleanup are complete.
+    fn sendMessage(&self, request: ChatSendRequest) -> JsFuture<ChatSendMessageResultData>;
+    /// Streams authoritative parsed part snapshots and the real terminal receipt through one async iterator.
+    fn sendMessageStreaming(&self, request: ChatSendRequest) -> JsAsyncIterable<ChatSendEvent>;
+    /// Cancels only the calling plugin's execution captured in the specified conversation.
+    fn cancel(&self, chatId: String) -> JsFuture<ChatCancelResultData>;
     ///
     ///Get messages from a specific chat
     ///@param chatId - The ID of the chat to read
@@ -283,6 +530,38 @@ pub struct ChatStartServiceOptions {
     #[serde(rename = "keep_if_exists")]
     pub keep_if_exists: Option<bool>,
 }
+/// Carries every attachment field that the host passes to submit hooks and the real input processor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(deny_unknown_fields)]
+pub struct ChatSendAttachment {
+    /// Preserves a saved VFS locator independently of the local media path.
+    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
+    pub vfsPath: JsOptional<String>,
+    /// Contains the original logical file path, not a reconstructed placeholder.
+    pub filePath: String,
+    /// Identifies the actual originating node or explicitly contains null.
+    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
+    pub nodeId: JsOptional<String>,
+    /// Contains the original attachment filename.
+    pub fileName: String,
+    /// Contains the actual MIME type.
+    pub mimeType: String,
+    /// Contains the attachment size in bytes.
+    pub fileSize: i64,
+    /// Contains the original inline attachment payload.
+    pub content: String,
+}
+
+/// Continues a real committed user turn without inserting or modifying the original submitted message.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(non_snake_case)]
+#[serde(deny_unknown_fields)]
+pub struct ChatSendContinuation {
+    /// Identifies the existing user-message row in the explicitly selected conversation.
+    pub userMessageTimestamp: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Controls persistence, presentation, and timing for one AI chat turn.
 pub struct ChatSendMessageOptions {
@@ -304,13 +583,147 @@ pub struct ChatSendMessageOptions {
     /// Sets the maximum turn-processing time in milliseconds.
     #[serde(rename = "timeout_ms")]
     pub timeout_ms: Option<f64>,
+    /// Supplies complete original attachments only for an initial submit.
+    pub attachments: Option<Vec<ChatSendAttachment>>,
+    /// Identifies the real replied-to message on an initial submit.
+    pub replyToMessageTimestamp: Option<i64>,
+    /// Continues the identified committed user message; attachments, reply and replacement text are prohibited.
+    pub continuation: Option<ChatSendContinuation>,
+
 }
-/// Extends chat-turn controls with incremental reply delivery.
-pub struct ChatSendMessageStreamingOptions {
-    /// Contains the persistence, presentation, and timeout controls for the turn.
-    pub base_send_message_options: ChatSendMessageOptions,
-    /// Enables waifu-style aggregation of streamed reply chunks.
-    pub waifu: Option<bool>,
-    /// Receives each intermediate event emitted while the assistant reply is generated.
-    pub onIntermediateResult: Option<Arc<dyn Fn(MessageSendStreamEventData) -> () + Send + Sync>>,
+#[cfg(test)]
+mod chat_extension_contract_tests {
+    use super::{ChatCreateOptions, ChatExtensionTarget, ChatSendRequest, ChatSummaryPolicy, JsOptional, JsonObject};
+    use serde_json::json;
+
+    /// Requires an explicit summary policy on every continuation and preserves both supported wire values.
+    #[test]
+    fn continuation_requires_explicit_summary_policy() {
+        let base = json!({"kind":"continue","chatId":"chat","runtime":"main",
+            "userMessageTimestamp":10,"participantId":"speaker","notifyReply":false});
+        assert!(serde_json::from_value::<ChatSendRequest>(base.clone()).is_err());
+        for (wire, expected) in [("defer", ChatSummaryPolicy::Defer), ("after_reply", ChatSummaryPolicy::AfterReply)] {
+            let mut raw = base.clone();
+            raw["summaryPolicy"] = json!(wire);
+            let parsed: ChatSendRequest = serde_json::from_value(raw.clone()).unwrap();
+            assert!(matches!(&parsed, ChatSendRequest::Continue { summaryPolicy, .. } if *summaryPolicy == expected));
+            assert_eq!(serde_json::to_value(parsed).unwrap(), raw);
+        }
+        let mut raw = base;
+        raw["summaryPolicy"] = json!("automatic");
+        assert!(serde_json::from_value::<ChatSendRequest>(raw).is_err());
+    }
+
+    /// Accepts only existing-record targets with an explicit zero-based message revision identity.
+    #[test]
+    fn accepts_exact_tagged_targets() {
+        let chat: ChatExtensionTarget =
+            serde_json::from_value(json!({"kind":"chat", "chatId":"chat-a"})).unwrap();
+        chat.validate().unwrap();
+        for variantIndex in [0, 1, 7] {
+            let raw = json!({"kind":"message", "chatId":"chat-a", "messageTimestamp":123, "variantIndex":variantIndex});
+            let target: ChatExtensionTarget = serde_json::from_value(raw.clone()).unwrap();
+            target.validate().unwrap();
+            assert_eq!(serde_json::to_value(target).unwrap(), raw);
+        }
+    }
+
+    /// Rejects missing revisions, forged namespaces, unknown discriminators, and malformed target values.
+    #[test]
+    fn rejects_untyped_or_forged_targets() {
+        for raw in [
+            json!({"kind":"message", "chatId":"chat-a", "messageTimestamp":123}),
+            json!({"kind":"chat", "chatId":"chat-a", "owner":"other"}),
+            json!({"kind":"chat", "chatId":"chat-a", "namespace":"other"}),
+            json!({"kind":"chat", "chatId":"chat-a", "pluginId":"other"}),
+            json!({"kind":"variant", "chatId":"chat-a"}),
+            json!({"kind":"message", "chatId":"chat-a", "messageTimestamp":123, "variantIndex":0.5}),
+        ] {
+            assert!(serde_json::from_value::<ChatExtensionTarget>(raw).is_err());
+        }
+        for raw in [
+            json!({"kind":"chat", "chatId":" "}),
+            json!({"kind":"message", "chatId":"chat-a", "messageTimestamp":123, "variantIndex":-1}),
+        ] {
+            assert!(serde_json::from_value::<ChatExtensionTarget>(raw)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+    }
+
+    /// Preserves omitted and explicit-null creation inputs without exposing role or group association parameters.
+    #[test]
+    fn preserves_creation_options_without_legacy_associations() {
+        let omitted: ChatCreateOptions = serde_json::from_value(json!({})).unwrap();
+        assert!(matches!(omitted.sourceChatId, JsOptional::Undefined));
+        assert!(matches!(omitted.input, JsOptional::Undefined));
+        let explicit: ChatCreateOptions =
+            serde_json::from_value(json!({"sourceChatId":null, "input":null})).unwrap();
+        assert!(matches!(explicit.sourceChatId, JsOptional::Null));
+        assert!(matches!(explicit.input, JsOptional::Null));
+        for key in ["group", "selection", "roleCardId", "characterCardId"] {
+            let mut raw = json!({});
+            raw[key] = json!("old-association");
+            assert!(serde_json::from_value::<ChatCreateOptions>(raw).is_err());
+        }
+    }
+
+    /// Keeps the SDK object representation lossless while rejecting non-object stored values.
+    #[test]
+    fn round_trips_complete_json_objects() {
+        let raw = json!({"actor":{"id":"opaque"}, "nullable":null, "values":[1, false, "text"]});
+        let value: JsonObject = serde_json::from_value(raw.clone()).unwrap();
+        let canonical = serde_json::Value::Object(value.into_iter().collect());
+        assert_eq!(canonical, raw);
+        for value in [json!(null), json!([]), json!("not-an-object")] {
+            assert!(serde_json::from_value::<JsonObject>(value).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod prepared_delivery_tests {
+    use super::*;
+    /// Requires exactly one content source and validates contextual generation before model invocation.
+    #[test]
+    fn scheduled_generation_rejects_mixed_empty_and_oversized_instructions() {
+        let mut request = ChatScheduledMessageRequest {
+            id: "contextual".into(), chatId: "chat".into(), title: "Title".into(), text: String::new(),
+            timestamp: 2000, generation: Some(ChatScheduledGeneration { instruction: "Continue our topic".into() }),
+        };
+        assert!(validateChatScheduledMessageRequest(&request, 1000).is_ok());
+        request.text = "Forged prewritten body".into();
+        assert!(validateChatScheduledMessageRequest(&request, 1000).is_err());
+        request.text.clear();
+        request.generation.as_mut().unwrap().instruction = " ".into();
+        assert!(validateChatScheduledMessageRequest(&request, 1000).is_err());
+        request.generation.as_mut().unwrap().instruction = "x".repeat(65537);
+        assert!(validateChatScheduledMessageRequest(&request, 1000).is_err());
+    }
+    #[test]
+    fn prepared_requests_reject_future_blank_oversized_and_unknown_fields() {
+        let mut request = ChatPreparedMessageRequest { chatId: "chat".into(), text: "hello".into(), timestamp: 1, notify: false };
+        assert!(validatePreparedMessageRequest(&request, 1000).is_ok());
+        request.timestamp = 1001;
+        assert!(validatePreparedMessageRequest(&request, 1000).is_err());
+        request.timestamp = 1; request.text = " ".into();
+        assert!(validatePreparedMessageRequest(&request, 1000).is_err());
+        request.text = "x".repeat(65537);
+        assert!(validatePreparedMessageRequest(&request, 1000).is_err());
+        assert!(serde_json::from_value::<ChatPreparedMessageRequest>(serde_json::json!({"chatId":"chat","text":"hello","timestamp":1,"extra":true})).is_err());
+    }
+    #[test]
+    fn notification_requests_enforce_identical_time_and_identity_bounds_on_every_platform() {
+        let mut request = ChatScheduledMessageRequest { id: "slot".into(), chatId: "chat".into(), title: "Title".into(), text: "Text".into(), generation: None, timestamp: 2000 };
+        assert!(validateChatScheduledMessageRequest(&request, 1000).is_ok());
+        request.timestamp = 1999;
+        assert!(validateChatScheduledMessageRequest(&request, 1000).is_err());
+        request.timestamp = 1000 + 2_592_000_000;
+        assert!(validateChatScheduledMessageRequest(&request, 1000).is_ok());
+        request.timestamp += 1;
+        assert!(validateChatScheduledMessageRequest(&request, 1000).is_err());
+        assert!(validatePreparedNotificationId("").is_err());
+        assert!(validatePreparedNotificationId(&"x".repeat(201)).is_err());
+    }
 }

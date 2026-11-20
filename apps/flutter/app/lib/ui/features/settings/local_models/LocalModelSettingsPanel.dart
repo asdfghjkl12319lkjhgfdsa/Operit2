@@ -1,6 +1,7 @@
 // ignore_for_file: file_names
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
@@ -9,8 +10,8 @@ import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../../../l10n/generated/app_localizations.dart';
 import '../../../common/components/M3LoadingIndicator.dart';
+import '../../../common/components/PageActivityMixin.dart';
 import '../../../common/components/OperitDialog.dart';
-import '../components/SettingsControlStyles.dart';
 import '../../../theme/OperitGlassSurface.dart';
 
 class LocalModelSettingsPanel extends StatefulWidget {
@@ -26,11 +27,16 @@ class LocalModelSettingsPanel extends StatefulWidget {
       _LocalModelSettingsPanelState();
 }
 
-class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
+class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel>
+    with PageActivityMixin<LocalModelSettingsPanel> {
   Future<_LocalModelSettingsData>? _future;
   final Set<String> _activeOperations = <String>{};
   final Set<String> _pausedOperations = <String>{};
   Timer? _progressTimer;
+  String _catalogQuery = '';
+  final _searchController = TextEditingController();
+  _CatalogScope _scope = _CatalogScope.all;
+  core_proxy.LocalModelKind? _kind;
   List<core_proxy.LocalModelInstallStatus>? _installStatuses;
   bool _statusRefreshRunning = false;
 
@@ -39,6 +45,17 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
   void initState() {
     super.initState();
     _reload();
+  }
+
+  /// Polls installation status only while this settings page is active.
+  @override
+  void onPageActivityChanged(bool active) {
+    _progressTimer?.cancel();
+    _progressTimer = null;
+    if (!active) {
+      return;
+    }
+    unawaited(_refreshInstallStatuses());
     _progressTimer = Timer.periodic(
       const Duration(milliseconds: 500),
       (_) => _refreshInstallStatuses(),
@@ -47,19 +64,29 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
 
   /// Refreshes installation status snapshots while the settings panel is mounted.
   Future<void> _refreshInstallStatuses() async {
-    if (!mounted || _statusRefreshRunning) {
+    if (!mounted || !isPageActive || _statusRefreshRunning) {
       return;
     }
     _statusRefreshRunning = true;
     try {
       final statuses = await widget.clients.servicesLocalModelService
           .getInstallStatuses();
-      if (!mounted) {
+      if (!mounted || !isPageActive) {
         return;
       }
-      setState(() {
-        _installStatuses = statuses;
-      });
+      if (jsonEncode(_installStatuses) == jsonEncode(statuses)) return;
+      final finished = (_installStatuses ?? [])
+          .where(_isInstallRunning)
+          .any(
+            (previous) => !statuses.any(
+              (current) =>
+                  current.modelId == previous.modelId &&
+                  current.version == previous.version &&
+                  _isInstallRunning(current),
+            ),
+          );
+      setState(() => _installStatuses = statuses);
+      if (finished) _reload();
     } catch (error) {
       debugPrint('Local model status refresh failed: $error');
     } finally {
@@ -71,6 +98,7 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
   @override
   void dispose() {
     _progressTimer?.cancel();
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -90,6 +118,7 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
       service.getPlatformTarget(),
       service.getInstallStatuses(),
     ]);
+    _installStatuses = results[3] as List<core_proxy.LocalModelInstallStatus>;
     return _LocalModelSettingsData(
       catalog: results[0] as List<core_proxy.LocalModelCatalogStatus>,
       registry: results[1] as core_proxy.LocalModelRegistrySnapshot,
@@ -137,9 +166,7 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
   }
 
   /// Updates the preferred model download source.
-  Future<void> _setPreferredSource(
-    core_proxy.LocalModelSourceKind sourceKind,
-  ) {
+  Future<void> _setPreferredSource(core_proxy.LocalModelSourceKind sourceKind) {
     return _runOperation('source:${sourceKind.value}', () async {
       await widget.clients.servicesLocalModelService.setPreferredSource(
         sourceKind: sourceKind,
@@ -161,7 +188,9 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
   }
 
   /// Removes one custom imported model from the catalog and filesystem.
-  Future<void> _removeCustomModel(core_proxy.LocalModelManifest manifest) async {
+  Future<void> _removeCustomModel(
+    core_proxy.LocalModelManifest manifest,
+  ) async {
     final l10n = AppLocalizations.of(context)!;
     final confirmed = await _confirmDelete(
       title: l10n.localModelsRemoveFromCatalog,
@@ -253,6 +282,9 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
       }
     }
     await _runOperation('delete:${manifest.id}@${manifest.version}', () async {
+      if (manifest.kind == core_proxy.LocalModelKind.chat) {
+        await widget.clients.servicesLocalModelService.unloadChatModel();
+      }
       await widget.clients.servicesLocalModelService.deleteModel(
         modelId: manifest.id,
         version: manifest.version,
@@ -325,249 +357,385 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
     return result == true;
   }
 
-  /// Builds local model management content for the current runtime target.
+  Future<void> _openChatInference(
+    core_proxy.LocalModelCatalogStatus status,
+  ) async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) =>
+          _LocalChatInferenceDialog(clients: widget.clients, status: status),
+    );
+  }
+
+  /// Scrolls catalog controls with lazily built model rows to maximize space.
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
-    final future = _future;
-    if (future == null) {
-      return const Center(child: M3LoadingIndicator());
-    }
     return FutureBuilder<_LocalModelSettingsData>(
-      future: future,
+      future: _future,
       builder: (context, snapshot) {
         if (!snapshot.hasData) {
           if (snapshot.hasError) {
             return Center(
-              child: Text(l10n.localModelsLoadFailed('${snapshot.error}')),
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(l10n.localModelsLoadFailed('${snapshot.error}')),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      onPressed: _reload,
+                      icon: const Icon(Icons.refresh),
+                      label: Text(l10n.retry),
+                    ),
+                  ],
+                ),
+              ),
             );
           }
           return const Center(child: M3LoadingIndicator());
         }
         final data = snapshot.requireData;
-        final preferredSource =
+        final statuses = _installStatuses ?? data.installStatuses;
+        final source =
             data.registry.preferredSourceKind ??
             core_proxy.LocalModelSourceKind.huggingFace;
-        final modelKinds = data.catalog
-            .map((status) => status.manifest.kind)
-            .toSet();
-        return ListView(
-          padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
-          children: <Widget>[
-            _buildHeader(context, data.target, preferredSource),
-            const SizedBox(height: 20),
-            Row(
-              children: <Widget>[
-                Text(
-                  l10n.localModelsCatalog,
-                  style: SettingsControlStyles.sectionTitleTextStyle(context),
-                ),
-                const SizedBox(width: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(10),
+        bool matchesScope(core_proxy.LocalModelCatalogStatus status) {
+          return switch (_scope) {
+            _CatalogScope.all => true,
+            _CatalogScope.installed => status.installedModel != null,
+            _CatalogScope.downloads =>
+              status.installedModel == null &&
+                  statuses.any(
+                    (task) =>
+                        task.modelId == status.manifest.id &&
+                        task.version == status.manifest.version &&
+                        task.phase !=
+                            core_proxy.LocalModelInstallPhase.completed,
                   ),
-                  child: Text(
-                    '${data.catalog.length}',
-                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                      fontWeight: FontWeight.w700,
+          };
+        }
+
+        final scoped = data.catalog.where(matchesScope).toList();
+        final query = _catalogQuery.trim().toLowerCase();
+        final visible = scoped.where((status) {
+          final m = status.manifest;
+          final searchable = [
+            m.displayName,
+            m.id,
+            m.engine.value,
+            _localEngineTitle(m.engine),
+            _localModelDescription(l10n, m),
+            ...m.languages,
+            ...m.tags,
+          ].join(' ').toLowerCase();
+          return (_kind == null || m.kind == _kind) &&
+              searchable.contains(query);
+        }).toList();
+        final colors = Theme.of(context).colorScheme;
+        return CustomScrollView(
+          slivers: [
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    LayoutBuilder(
+                      builder: (context, constraints) => Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              l10n.localModelsCatalog,
+                              style: Theme.of(context).textTheme.titleMedium
+                                  ?.copyWith(fontWeight: FontWeight.w700),
+                            ),
+                          ),
+                          PopupMenuButton<core_proxy.LocalModelSourceKind>(
+                            tooltip:
+                                '${l10n.localModelsDownloadSource}: ${_sourceKindTitle(l10n, source)}',
+                            icon: const Icon(
+                              Icons.cloud_download_outlined,
+                              size: 20,
+                            ),
+                            initialValue: source,
+                            onSelected: _setPreferredSource,
+                            itemBuilder: (_) => [
+                              for (final kind in [
+                                core_proxy.LocalModelSourceKind.huggingFace,
+                                core_proxy.LocalModelSourceKind.modelScope,
+                                core_proxy.LocalModelSourceKind.hfMirror,
+                              ])
+                                CheckedPopupMenuItem(
+                                  value: kind,
+                                  checked: source == kind,
+                                  child: Text(_sourceKindTitle(l10n, kind)),
+                                ),
+                            ],
+                          ),
+                          IconButton(
+                            onPressed: _reload,
+                            icon: const Icon(Icons.refresh, size: 20),
+                            tooltip: l10n.refresh,
+                          ),
+                          const SizedBox(width: 4),
+                          if (constraints.maxWidth < 320)
+                            IconButton.filled(
+                              tooltip: l10n.localModelsAddModel,
+                              onPressed: () =>
+                                  _openHubExploreDialog(context, source),
+                              icon: const Icon(Icons.add),
+                            )
+                          else
+                            FilledButton.icon(
+                              onPressed: () =>
+                                  _openHubExploreDialog(context, source),
+                              icon: const Icon(Icons.add, size: 18),
+                              label: Text(l10n.localModelsAddModel),
+                            ),
+                        ],
+                      ),
                     ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            for (final kind in core_proxy.LocalModelKind.values.where(
-              modelKinds.contains,
-            )) ...<Widget>[
-              Padding(
-                padding: const EdgeInsets.only(top: 6, bottom: 8),
-                child: Row(
-                  children: <Widget>[
-                    Icon(
-                      _modelKindIcon(kind),
-                      size: 16,
-                      color: Theme.of(context).colorScheme.primary,
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _searchController,
+                      onChanged: (value) =>
+                          setState(() => _catalogQuery = value),
+                      decoration: InputDecoration(
+                        isDense: true,
+                        prefixIcon: const Icon(Icons.search, size: 20),
+                        hintText: l10n.localModelsSearchCatalog,
+                        suffixIcon: _catalogQuery.isEmpty
+                            ? null
+                            : IconButton(
+                                tooltip: l10n.clear,
+                                icon: const Icon(Icons.close, size: 18),
+                                onPressed: () {
+                                  _searchController.clear();
+                                  setState(() => _catalogQuery = '');
+                                },
+                              ),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
                     ),
-                    const SizedBox(width: 6),
-                    Text(
-                      _localModelKindTitle(l10n, kind),
-                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                        fontWeight: FontWeight.w600,
+                    const SizedBox(height: 8),
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          for (final scope in _CatalogScope.values)
+                            Padding(
+                              padding: const EdgeInsets.only(right: 8),
+                              child: ChoiceChip(
+                                label: Text(switch (scope) {
+                                  _CatalogScope.all =>
+                                    l10n.localModelsFilterAll,
+                                  _CatalogScope.installed =>
+                                    l10n.localModelsFilterInstalled,
+                                  _CatalogScope.downloads =>
+                                    l10n.localModelsFilterDownloads,
+                                }),
+                                selected: _scope == scope,
+                                showCheckmark: false,
+                                onSelected: (_) =>
+                                    setState(() => _scope = scope),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          for (final kind in <core_proxy.LocalModelKind?>[
+                            null,
+                            core_proxy.LocalModelKind.chat,
+                            ...core_proxy.LocalModelKind.values.where(
+                              (kind) => kind != core_proxy.LocalModelKind.chat,
+                            ),
+                          ])
+                            Padding(
+                              padding: const EdgeInsets.only(right: 6),
+                              child: FilterChip(
+                                label: Text(
+                                  kind == null
+                                      ? l10n.localModelsAllTypes
+                                      : _localModelKindTitle(l10n, kind),
+                                ),
+                                selected: _kind == kind,
+                                showCheckmark: false,
+                                onSelected: (_) => setState(() => _kind = kind),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 6),
+                      child: Text(
+                        l10n.localModelsResultCount(
+                          visible.length,
+                          data.catalog.length,
+                        ),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: colors.onSurfaceVariant,
+                        ),
                       ),
                     ),
                   ],
                 ),
               ),
-              for (final status in data.catalog.where(
-                (status) => status.manifest.kind == kind,
-              )) ...<Widget>[
-                _buildModelItem(
-                  context,
-                  status,
-                  _installStatuses ?? data.installStatuses,
-                  data.registry,
-                ),
-                const SizedBox(height: 10),
-              ],
-            ],
-            const SizedBox(height: 14),
-            Text(
-              l10n.localModelsInstalledEngines,
-              style: SettingsControlStyles.sectionTitleTextStyle(context),
             ),
-            const SizedBox(height: 10),
-            if (data.registry.installedEngines.isEmpty)
-              OperitGlassSurface(
-                color: Theme.of(context).colorScheme.surfaceContainerLow.withValues(alpha: 0.6),
-                layer: OperitGlassSurfaceLayer.control,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: Theme.of(context).colorScheme.outlineVariant.withValues(alpha: 0.3),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(
-                    l10n.localModelsNoInstalledEngines,
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+            const SliverToBoxAdapter(child: Divider(height: 1)),
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+              sliver: SliverList(
+                key: ValueKey('$_scope:$_kind:$_catalogQuery'),
+                delegate: SliverChildBuilderDelegate((context, index) {
+                  if (index == (visible.isEmpty ? 1 : visible.length)) {
+                    return Padding(
+                      padding: const EdgeInsets.only(top: 16),
+                      child: ExpansionTile(
+                        tilePadding: EdgeInsets.zero,
+                        leading: const Icon(
+                          Icons.developer_board_outlined,
+                          size: 20,
+                        ),
+                        title: Text(
+                          l10n.localModelsInstalledEngines,
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                        subtitle: Text(
+                          '${data.target.platform.value} · ${data.target.architecture.value} · ${data.registry.installedEngines.length}',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        children: [
+                          if (data.registry.installedEngines.isEmpty)
+                            Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Text(l10n.localModelsNoInstalledEngines),
+                            )
+                          else
+                            for (final engine in data.registry.installedEngines)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: _buildEngineItem(context, engine),
+                              ),
+                        ],
+                      ),
+                    );
+                  }
+                  if (visible.isEmpty) {
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 36),
+                      child: Column(
+                        children: [
+                          Icon(
+                            Icons.search_off_outlined,
+                            size: 36,
+                            color: colors.onSurfaceVariant,
+                          ),
+                          const SizedBox(height: 12),
+                          Text(l10n.localModelsNoMatches),
+                          const SizedBox(height: 12),
+                          TextButton(
+                            onPressed: () {
+                              _searchController.clear();
+                              setState(() {
+                                _catalogQuery = '';
+                                _scope = _CatalogScope.all;
+                                _kind = null;
+                              });
+                            },
+                            child: Text(l10n.localModelsResetFilters),
+                          ),
+                        ],
+                      ),
+                    );
+                  }
+                  final status = visible[index];
+                  return Padding(
+                    key: ValueKey(
+                      '${status.manifest.id}@${status.manifest.version}',
                     ),
-                  ),
-                ),
-              )
-            else
-              for (final engine in data.registry.installedEngines) ...<Widget>[
-                _buildEngineItem(context, engine),
-                const SizedBox(height: 8),
-              ],
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: _buildModelItem(
+                      context,
+                      status,
+                      statuses,
+                      data.registry,
+                    ),
+                  );
+                }, childCount: (visible.isEmpty ? 1 : visible.length) + 1),
+              ),
+            ),
           ],
         );
       },
     );
   }
 
-  /// Builds the platform provider heading, target summary, and source selector.
-  Widget _buildHeader(
-    BuildContext context,
-    core_proxy.LocalPlatformTarget target,
-    core_proxy.LocalModelSourceKind preferredSource,
-  ) {
+  /// Shows secondary metadata without crowding the model list.
+  Future<void> _showModelDetails(
+    core_proxy.LocalModelCatalogStatus status,
+  ) async {
     final l10n = AppLocalizations.of(context)!;
-    final colors = Theme.of(context).colorScheme;
-    return OperitGlassSurface(
-      color: colors.surfaceContainerLow.withValues(alpha: 0.72),
-      layer: OperitGlassSurfaceLayer.control,
-      borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: colors.outlineVariant.withValues(alpha: 0.35)),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
+    final m = status.manifest;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => OperitDialogScaffold(
+        title: m.displayName,
+        showCloseButton: true,
+        expandContent: false,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    color: colors.primary.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Icon(Icons.memory_outlined, color: colors.primary, size: 24),
-                ),
-                const SizedBox(width: 14),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text(
-                        l10n.settingsModelProviderTypeLocalModel,
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 4,
-                        children: <Widget>[
-                          _buildTagChip(
-                            context,
-                            icon: Icons.laptop_outlined,
-                            label: target.platform.value,
-                          ),
-                          _buildTagChip(
-                            context,
-                            icon: Icons.settings_input_component_outlined,
-                            label: target.architecture.value,
-                          ),
-                          _buildTagChip(
-                            context,
-                            icon: Icons.cloud_download_outlined,
-                            label: _sourceKindTitle(l10n, preferredSource),
-                            color: colors.primary,
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-                IconButton(
-                  onPressed: _reload,
-                  icon: const Icon(Icons.refresh),
-                  tooltip: l10n.refresh,
-                ),
-              ],
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SelectableText(_localModelDescription(l10n, m)),
+            const SizedBox(height: 16),
+            SelectableText(
+              '${m.id} @ ${m.version}',
+              style: Theme.of(context).textTheme.bodySmall,
             ),
-            const Divider(height: 24),
+            const SizedBox(height: 12),
             Wrap(
-              spacing: 12,
+              spacing: 8,
               runSpacing: 8,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: <Widget>[
-                Text(
-                  l10n.localModelsDownloadSource,
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: colors.onSurfaceVariant,
+              children: [
+                _buildTagChip(
+                  context,
+                  icon: Icons.storage_outlined,
+                  label: _formatBytes(_modelByteSize(m)),
+                ),
+                if (m.license.isNotEmpty)
+                  _buildTagChip(
+                    context,
+                    icon: Icons.gavel_outlined,
+                    label: m.license,
                   ),
-                ),
-                SegmentedButton<core_proxy.LocalModelSourceKind>(
-                  showSelectedIcon: false,
-                  style: const ButtonStyle(
-                    visualDensity: VisualDensity.compact,
-                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                if (m.languages.isNotEmpty)
+                  _buildTagChip(
+                    context,
+                    icon: Icons.translate_outlined,
+                    label: m.languages.join(' / '),
                   ),
-                  segments: <ButtonSegment<core_proxy.LocalModelSourceKind>>[
-                    ButtonSegment<core_proxy.LocalModelSourceKind>(
-                      value: core_proxy.LocalModelSourceKind.huggingFace,
-                      label: Text(l10n.localModelsSourceHuggingFace),
-                    ),
-                    ButtonSegment<core_proxy.LocalModelSourceKind>(
-                      value: core_proxy.LocalModelSourceKind.modelScope,
-                      label: Text(l10n.localModelsSourceModelScope),
-                    ),
-                    ButtonSegment<core_proxy.LocalModelSourceKind>(
-                      value: core_proxy.LocalModelSourceKind.hfMirror,
-                      label: Text(l10n.localModelsSourceHfMirror),
-                    ),
-                  ],
-                  selected: <core_proxy.LocalModelSourceKind>{preferredSource},
-                  onSelectionChanged: (selected) {
-                    if (selected.isNotEmpty) {
-                      _setPreferredSource(selected.first);
-                    }
-                  },
-                ),
-                const SizedBox(width: 4),
-                FilledButton.tonalIcon(
-                  onPressed: () => _openHubExploreDialog(context, preferredSource),
-                  icon: const Icon(Icons.travel_explore_outlined, size: 18),
-                  label: Text(l10n.localModelsExploreHub),
-                ),
+                if (m.sources.isNotEmpty)
+                  _buildTagChip(
+                    context,
+                    icon: Icons.cloud_outlined,
+                    label: _modelSourcesLabel(l10n, m.sources),
+                  ),
+                if (status.installedEngine != null)
+                  _buildTagChip(
+                    context,
+                    icon: Icons.developer_board_outlined,
+                    label: l10n.localModelsEngineInstalled,
+                  ),
               ],
             ),
           ],
@@ -593,6 +761,8 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
     );
     final isPaused =
         installStatus?.phase == core_proxy.LocalModelInstallPhase.cancelled;
+    final isFailed =
+        installStatus?.phase == core_proxy.LocalModelInstallPhase.failed;
     final isCancelling =
         installStatus?.phase == core_proxy.LocalModelInstallPhase.cancelling;
     final isBusy =
@@ -604,104 +774,240 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
     );
     final colors = Theme.of(context).colorScheme;
 
+    final stateLabel = !status.platformCompatible
+        ? l10n.localModelsPlatformIncompatible
+        : installed
+        ? l10n.localModelsModelInstalled
+        : isBusy
+        ? l10n.localModelsInstalling
+        : isFailed
+        ? l10n.localModelsDownloadFailed
+        : isPaused
+        ? l10n.localModelsDownloadPausedLabel
+        : l10n.localModelsModelNotInstalled;
+    final stateColor = !status.platformCompatible || isFailed
+        ? colors.error
+        : installed
+        ? colors.primary
+        : colors.onSurfaceVariant;
+    final primaryAction = installed
+        ? manifest.kind == core_proxy.LocalModelKind.chat
+              ? OutlinedButton.icon(
+                  onPressed: !isBusy && status.platformCompatible
+                      ? () => _openChatInference(status)
+                      : null,
+                  icon: const Icon(Icons.play_arrow, size: 18),
+                  label: Text(l10n.localModelsRunChat),
+                )
+              : null
+        : FilledButton.tonalIcon(
+            onPressed:
+                status.platformCompatible &&
+                    !localOperationActive &&
+                    (!isBusy || isPaused)
+                ? () => _install(manifest)
+                : null,
+            icon: Icon(
+              isPaused ? Icons.play_arrow : Icons.download_outlined,
+              size: 18,
+            ),
+            label: Text(
+              isPaused
+                  ? l10n.localModelsResumeDownload
+                  : isFailed
+                  ? l10n.retry
+                  : isBusy
+                  ? l10n.localModelsInstalling
+                  : l10n.localModelsInstall,
+            ),
+          );
+    final menu = PopupMenuButton<_ModelAction>(
+      tooltip: l10n.localModelsMoreActions,
+      onSelected: (action) {
+        switch (action) {
+          case _ModelAction.details:
+            unawaited(_showModelDetails(status));
+          case _ModelAction.verify:
+            unawaited(_verify(manifest));
+          case _ModelAction.delete:
+            unawaited(_deleteModel(manifest));
+          case _ModelAction.remove:
+            unawaited(_removeCustomModel(manifest));
+        }
+      },
+      itemBuilder: (_) => [
+        PopupMenuItem(
+          value: _ModelAction.details,
+          child: Text(l10n.localModelsDetails),
+        ),
+        if (installed)
+          PopupMenuItem(
+            value: _ModelAction.verify,
+            enabled: !isBusy,
+            child: Text(l10n.localModelsVerifyModelAndEngine),
+          ),
+        if (installed || hasDownloadTask)
+          PopupMenuItem(
+            value: _ModelAction.delete,
+            enabled: !installed || !isBusy,
+            child: Text(
+              installed
+                  ? l10n.localModelsDeleteModel
+                  : l10n.localModelsDeleteDownload,
+              style: TextStyle(color: colors.error),
+            ),
+          ),
+        if (isCustomModel)
+          PopupMenuItem(
+            value: _ModelAction.remove,
+            enabled: !isBusy,
+            child: Text(l10n.localModelsRemoveFromCatalog),
+          ),
+      ],
+    );
     return OperitGlassSurface(
       color: colors.surfaceContainerLow.withValues(alpha: 0.72),
       layer: OperitGlassSurfaceLayer.control,
-      borderRadius: BorderRadius.circular(10),
+      borderRadius: BorderRadius.circular(12),
       border: Border.all(color: colors.outlineVariant.withValues(alpha: 0.35)),
       child: Padding(
         padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Container(
-                  width: 36,
-                  height: 36,
-                  decoration: BoxDecoration(
-                    color: colors.primary.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Icon(_modelKindIcon(manifest.kind), color: colors.primary, size: 20),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Row(
-                        children: <Widget>[
-                          Flexible(
-                            child: Text(
-                              manifest.displayName,
-                              style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ),
-                          if (isCustomModel) ...<Widget>[
-                            const SizedBox(width: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                              decoration: BoxDecoration(
-                                color: colors.secondaryContainer,
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Text(
-                                l10n.localModelsCustomBadge,
-                                style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                                  color: colors.onSecondaryContainer,
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ],
+          children: [
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final compact = constraints.maxWidth < 520;
+                final actions = Wrap(
+                  alignment: WrapAlignment.end,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 4,
+                  runSpacing: 4,
+                  children: [
+                    if (hasDownloadTask && _isInstallRunning(installStatus))
+                      IconButton(
+                        onPressed: isCancelling
+                            ? null
+                            : () => _pauseInstall(manifest),
+                        icon: const Icon(Icons.pause),
+                        tooltip: l10n.localModelsPauseDownload,
                       ),
-                      const SizedBox(height: 3),
-                      Text(
-                        _localModelDescription(l10n, manifest),
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: colors.onSurfaceVariant,
-                          height: 1.35,
-                        ),
+                    ?primaryAction,
+                    menu,
+                  ],
+                );
+                final summary = Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      manifest.displayName,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
                       ),
-                    ],
-                  ),
-                ),
-                if (isBusy)
-                  const SizedBox(
-                    width: 24,
-                    height: 24,
-                    child: Padding(
-                      padding: EdgeInsets.all(2),
-                      child: CircularProgressIndicator(strokeWidth: 2),
                     ),
-                  ),
-              ],
+                    const SizedBox(height: 4),
+                    Text(
+                      _localModelDescription(l10n, manifest),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: colors.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 4,
+                      children: [
+                        Text(
+                          stateLabel,
+                          style: Theme.of(
+                            context,
+                          ).textTheme.labelSmall?.copyWith(color: stateColor),
+                        ),
+                        Text(
+                          '${_localModelKindTitle(l10n, manifest.kind)} · ${_localEngineTitle(manifest.engine)}',
+                          style: Theme.of(context).textTheme.labelSmall
+                              ?.copyWith(color: colors.onSurfaceVariant),
+                        ),
+                        if (_modelByteSize(manifest) > 0)
+                          Text(
+                            _formatBytes(_modelByteSize(manifest)),
+                            style: Theme.of(context).textTheme.labelSmall,
+                          ),
+                        if (isCustomModel)
+                          Text(
+                            l10n.localModelsCustomBadge,
+                            style: Theme.of(context).textTheme.labelSmall,
+                          ),
+                      ],
+                    ),
+                  ],
+                );
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(
+                            color: colors.primary.withValues(alpha: 0.08),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Icon(
+                            _modelKindIcon(manifest.kind),
+                            color: colors.primary,
+                            size: 20,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(child: summary),
+                        if (!compact) ...[const SizedBox(width: 12), actions],
+                      ],
+                    ),
+                    if (compact) ...[
+                      const SizedBox(height: 8),
+                      Align(alignment: Alignment.centerRight, child: actions),
+                    ],
+                  ],
+                );
+              },
             ),
-            const SizedBox(height: 10),
+            if (hasDownloadTask) const SizedBox(height: 12),
             if (hasDownloadTask) ...<Widget>[
               Container(
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
                   color: colors.surfaceContainerHighest.withValues(alpha: 0.45),
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: colors.outlineVariant.withValues(alpha: 0.2)),
+                  border: Border.all(
+                    color: colors.outlineVariant.withValues(alpha: 0.2),
+                  ),
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
+                    if (isFailed && installStatus.error != null) ...[
+                      SelectableText(
+                        installStatus.error!,
+                        style: TextStyle(color: colors.error),
+                      ),
+                      const SizedBox(height: 8),
+                    ],
                     ClipRRect(
                       borderRadius: BorderRadius.circular(3),
                       child: LinearProgressIndicator(
                         minHeight: 5,
                         value: installStatus.totalBytes == 0
-                            ? null
-                            : installStatus.downloadedBytes / installStatus.totalBytes,
+                            ? (isBusy ? null : 0)
+                            : (installStatus.downloadedBytes /
+                                      installStatus.totalBytes)
+                                  .clamp(0.0, 1.0),
                       ),
                     ),
                     const SizedBox(height: 6),
@@ -709,31 +1015,34 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
                       children: <Widget>[
                         Expanded(
                           child: Text(
-                            isCancelling
+                            isFailed
+                                ? l10n.localModelsDownloadFailed
+                                : isCancelling
                                 ? l10n.localModelsCancelling
                                 : isPaused
                                 ? l10n.localModelsDownloadPaused(
                                     _formatBytes(installStatus.downloadedBytes),
                                     _formatBytes(installStatus.totalBytes),
                                   )
-                                : installStatus.downloadedBytes == installStatus.totalBytes
+                                : installStatus.downloadedBytes ==
+                                      installStatus.totalBytes
                                 ? l10n.localModelsDownloadInstalling
                                 : l10n.localModelsDownloading(
                                     _formatBytes(installStatus.downloadedBytes),
                                     _formatBytes(installStatus.totalBytes),
                                   ),
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                              color: colors.onSurfaceVariant,
-                            ),
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: colors.onSurfaceVariant),
                           ),
                         ),
                         if (installStatus.totalBytes > 0)
                           Text(
                             '${((installStatus.downloadedBytes / installStatus.totalBytes) * 100).clamp(0, 100).toStringAsFixed(1)}%',
-                            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                              fontWeight: FontWeight.w700,
-                              color: colors.primary,
-                            ),
+                            style: Theme.of(context).textTheme.labelSmall
+                                ?.copyWith(
+                                  fontWeight: FontWeight.w700,
+                                  color: colors.primary,
+                                ),
                           ),
                       ],
                     ),
@@ -742,119 +1051,6 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
               ),
               const SizedBox(height: 10),
             ],
-            Wrap(
-              spacing: 8,
-              runSpacing: 6,
-              children: <Widget>[
-                _buildTagChip(
-                  context,
-                  icon: Icons.storage_outlined,
-                  label: _formatBytes(_modelByteSize(manifest)),
-                ),
-                _buildTagChip(
-                  context,
-                  icon: Icons.gavel_outlined,
-                  label: manifest.license,
-                ),
-                _buildTagChip(
-                  context,
-                  icon: Icons.translate_outlined,
-                  label: manifest.languages.join(' / '),
-                ),
-                _buildTagChip(
-                  context,
-                  icon: Icons.cloud_outlined,
-                  label: _modelSourcesLabel(l10n, manifest.sources),
-                  color: colors.primary,
-                ),
-                if (installed)
-                  SettingsActivePill(label: l10n.localModelsModelInstalled)
-                else
-                  _buildTagChip(
-                    context,
-                    icon: Icons.circle_outlined,
-                    label: l10n.localModelsModelNotInstalled,
-                  ),
-                if (status.installedEngine != null)
-                  _buildTagChip(
-                    context,
-                    icon: Icons.developer_board,
-                    label: l10n.localModelsEngineInstalled,
-                    color: colors.secondary,
-                  ),
-                if (!status.platformCompatible)
-                  _buildTagChip(
-                    context,
-                    icon: Icons.warning_amber_outlined,
-                    label: l10n.localModelsPlatformIncompatible,
-                    color: colors.error,
-                  ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            Row(
-              children: <Widget>[
-                const Spacer(),
-                if (installed) ...<Widget>[
-                  IconButton(
-                    onPressed: !isBusy ? () => _verify(manifest) : null,
-                    icon: const Icon(Icons.verified_outlined),
-                    tooltip: l10n.localModelsVerifyModelAndEngine,
-                  ),
-                  IconButton(
-                    onPressed: !isBusy ? () => _deleteModel(manifest) : null,
-                    icon: Icon(Icons.delete_outline, color: colors.error),
-                    tooltip: l10n.localModelsDeleteModel,
-                  ),
-                  if (isCustomModel)
-                    IconButton(
-                      onPressed: !isBusy ? () => _removeCustomModel(manifest) : null,
-                      icon: const Icon(Icons.bookmark_remove_outlined),
-                      tooltip: l10n.localModelsRemoveFromCatalog,
-                    ),
-                ] else ...<Widget>[
-                  if (isCustomModel && !hasDownloadTask)
-                    IconButton(
-                      onPressed: !isBusy ? () => _removeCustomModel(manifest) : null,
-                      icon: const Icon(Icons.bookmark_remove_outlined),
-                      tooltip: l10n.localModelsRemoveFromCatalog,
-                    ),
-                  if (hasDownloadTask)
-                    IconButton(
-                      onPressed: isPaused || isCancelling
-                          ? null
-                          : () => _pauseInstall(manifest),
-                      icon: const Icon(Icons.pause),
-                      tooltip: l10n.localModelsPauseDownload,
-                    ),
-                  if (hasDownloadTask)
-                    IconButton(
-                      onPressed: () => _deleteModel(manifest),
-                      icon: Icon(Icons.delete_outline, color: colors.error),
-                      tooltip: l10n.localModelsDeleteDownload,
-                    ),
-                  FilledButton.icon(
-                    onPressed:
-                        status.platformCompatible &&
-                            !localOperationActive &&
-                            (!isBusy || isPaused)
-                        ? () => _install(manifest)
-                        : null,
-                    icon: Icon(
-                      isPaused ? Icons.play_arrow : Icons.download_outlined,
-                      size: 18,
-                    ),
-                    label: Text(
-                      isPaused
-                          ? l10n.localModelsResumeDownload
-                          : isBusy
-                          ? l10n.localModelsInstalling
-                          : l10n.localModelsInstall,
-                    ),
-                  ),
-                ],
-              ],
-            ),
           ],
         ),
       ),
@@ -884,7 +1080,11 @@ class _LocalModelSettingsPanelState extends State<LocalModelSettingsPanel> {
                 color: colors.primary.withValues(alpha: 0.1),
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Icon(Icons.developer_board_outlined, color: colors.primary, size: 20),
+              child: Icon(
+                Icons.developer_board_outlined,
+                color: colors.primary,
+                size: 20,
+              ),
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -956,11 +1156,13 @@ Widget _buildTagChip(
       children: <Widget>[
         Icon(icon, size: 12, color: effectiveColor),
         const SizedBox(width: 4),
-        Text(
-          label,
-          style: Theme.of(context).textTheme.labelSmall?.copyWith(
-            color: effectiveColor,
-            fontSize: 11,
+        Flexible(
+          child: Text(
+            label,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: effectiveColor,
+              fontSize: 11,
+            ),
           ),
         ),
       ],
@@ -1003,8 +1205,7 @@ String _sourceKindTitle(
       l10n.localModelsSourceHuggingFace,
     core_proxy.LocalModelSourceKind.modelScope =>
       l10n.localModelsSourceModelScope,
-    core_proxy.LocalModelSourceKind.hfMirror =>
-      l10n.localModelsSourceHfMirror,
+    core_proxy.LocalModelSourceKind.hfMirror => l10n.localModelsSourceHfMirror,
     core_proxy.LocalModelSourceKind.directHttp =>
       l10n.localModelsSourceDirectHttp,
   };
@@ -1043,9 +1244,25 @@ String _localModelDescription(
       l10n.localModelDescriptionSherpaOnnxWebParaformer,
     'sherpa-onnx-web-vits-piper-en-us-libritts-r-medium' =>
       l10n.localModelDescriptionSherpaOnnxWebVitsPiper,
-    _ => manifest.description.isNotEmpty ? manifest.description : manifest.displayName,
+    _ =>
+      manifest.description.isNotEmpty
+          ? manifest.description
+          : manifest.displayName,
   };
 }
+
+String _localEngineTitle(core_proxy.LocalEngineKind engine) => switch (engine) {
+  core_proxy.LocalEngineKind.llamaCpp => 'llama.cpp',
+  core_proxy.LocalEngineKind.mnn => 'MNN',
+  core_proxy.LocalEngineKind.sherpaOnnx => 'sherpa-onnx',
+  core_proxy.LocalEngineKind.sherpaNcnn => 'sherpa-ncnn',
+  core_proxy.LocalEngineKind.piper => 'Piper',
+  core_proxy.LocalEngineKind.onnxRuntime => 'ONNX Runtime',
+};
+
+enum _CatalogScope { all, installed, downloads }
+
+enum _ModelAction { details, verify, delete, remove }
 
 class _LocalModelSettingsData {
   const _LocalModelSettingsData({
@@ -1134,6 +1351,7 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
   final TextEditingController _directRevController = TextEditingController();
   List<core_proxy.LocalModelHubRepoSummary>? _searchResults;
   bool _isSearching = false;
+  int _searchEpoch = 0;
   String? _searchError;
   bool _isImporting = false;
   String? _importingRepo;
@@ -1154,9 +1372,10 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
 
   Future<void> _doSearch() async {
     final query = _searchController.text.trim();
-    if (query.isEmpty) {
+    if (query.isEmpty || _isSearching || _isImporting) {
       return;
     }
+    final epoch = ++_searchEpoch;
     setState(() {
       _isSearching = true;
       _searchError = null;
@@ -1164,21 +1383,21 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
     try {
       final results = await widget.clients.servicesLocalModelService
           .searchHubModels(query: query, sourceKind: _selectedSource);
-      if (!mounted) {
+      if (!mounted || epoch != _searchEpoch) {
         return;
       }
       setState(() {
         _searchResults = results;
       });
     } catch (error) {
-      if (!mounted) {
+      if (!mounted || epoch != _searchEpoch) {
         return;
       }
       setState(() {
         _searchError = error.toString();
       });
     } finally {
-      if (mounted) {
+      if (mounted && epoch == _searchEpoch) {
         setState(() {
           _isSearching = false;
         });
@@ -1206,9 +1425,9 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
       }
       widget.onImportSuccess();
       final l10n = AppLocalizations.of(context)!;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(l10n.localModelsHubImportSuccess)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(l10n.localModelsHubImportSuccess)));
       Navigator.of(context).pop();
     } catch (error) {
       if (!mounted) {
@@ -1247,71 +1466,68 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Row(
-            children: <Widget>[
-              SegmentedButton<int>(
-                showSelectedIcon: false,
-                style: const ButtonStyle(
-                  visualDensity: VisualDensity.compact,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                segments: <ButtonSegment<int>>[
-                  ButtonSegment<int>(
-                    value: 0,
-                    icon: const Icon(Icons.search, size: 16),
-                    label: Text(l10n.search),
-                  ),
-                  ButtonSegment<int>(
-                    value: 1,
-                    icon: const Icon(Icons.link, size: 16),
-                    label: Text(l10n.localModelsHubDirectImportTitle),
-                  ),
-                ],
-                selected: <int>{_activeTab},
-                onSelectionChanged: (selected) {
-                  if (selected.isNotEmpty) {
-                    setState(() {
-                      _activeTab = selected.first;
-                    });
-                  }
-                },
+          SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<int>(
+              showSelectedIcon: false,
+              style: const ButtonStyle(
+                visualDensity: VisualDensity.compact,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),
-              const Spacer(),
-              Text(
-                l10n.localModelsDownloadSource,
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  fontWeight: FontWeight.w600,
-                  color: colors.onSurfaceVariant,
+              segments: <ButtonSegment<int>>[
+                ButtonSegment<int>(
+                  value: 0,
+                  icon: const Icon(Icons.search, size: 16),
+                  label: Text(l10n.search),
                 ),
-              ),
-              const SizedBox(width: 8),
-              DropdownButton<core_proxy.LocalModelSourceKind>(
-                value: _selectedSource,
-                underline: const SizedBox.shrink(),
-                items: <DropdownMenuItem<core_proxy.LocalModelSourceKind>>[
-                  DropdownMenuItem(
-                    value: core_proxy.LocalModelSourceKind.huggingFace,
-                    child: Text(l10n.localModelsSourceHuggingFace),
-                  ),
-                  DropdownMenuItem(
-                    value: core_proxy.LocalModelSourceKind.modelScope,
-                    child: Text(l10n.localModelsSourceModelScope),
-                  ),
-                  DropdownMenuItem(
-                    value: core_proxy.LocalModelSourceKind.hfMirror,
-                    child: Text(l10n.localModelsSourceHfMirror),
-                  ),
-                ],
-                onChanged: (source) {
-                  if (source != null) {
+                ButtonSegment<int>(
+                  value: 1,
+                  icon: const Icon(Icons.link, size: 16),
+                  label: Text(l10n.localModelsHubRepositoryTab),
+                ),
+              ],
+              selected: <int>{_activeTab},
+              onSelectionChanged: (selected) {
+                if (selected.isNotEmpty) {
+                  setState(() {
+                    _activeTab = selected.first;
+                  });
+                }
+              },
+            ),
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<core_proxy.LocalModelSourceKind>(
+            initialValue: _selectedSource,
+            isExpanded: true,
+            decoration: InputDecoration(
+              labelText: l10n.localModelsDownloadSource,
+              isDense: true,
+              border: const OutlineInputBorder(),
+            ),
+            items: [
+              for (final kind in [
+                core_proxy.LocalModelSourceKind.huggingFace,
+                core_proxy.LocalModelSourceKind.modelScope,
+                core_proxy.LocalModelSourceKind.hfMirror,
+              ])
+                DropdownMenuItem(
+                  value: kind,
+                  child: Text(_sourceKindTitle(l10n, kind)),
+                ),
+            ],
+            onChanged: _isImporting
+                ? null
+                : (source) {
+                    if (source == null) return;
                     setState(() {
                       _selectedSource = source;
+                      _searchEpoch++;
+                      _isSearching = false;
                       _searchResults = null;
+                      _searchError = null;
                     });
-                  }
-                },
-              ),
-            ],
+                  },
           ),
           const SizedBox(height: 12),
           if (_activeTab == 0) ...<Widget>[
@@ -1324,7 +1540,9 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
                       hintText: l10n.localModelsHubSearchHint,
                       isDense: true,
                       prefixIcon: const Icon(Icons.search, size: 20),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
                     ),
                     onSubmitted: (_) => _doSearch(),
                   ),
@@ -1340,67 +1558,88 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
             const SizedBox(height: 12),
             Expanded(child: _buildResultsList(context)),
           ] else ...<Widget>[
-            OperitGlassSurface(
-              color: colors.surfaceContainerLow.withValues(alpha: 0.65),
-              layer: OperitGlassSurfaceLayer.control,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: colors.outlineVariant.withValues(alpha: 0.3)),
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Text(
-                      l10n.localModelsHubDirectImportPrompt,
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: colors.onSurfaceVariant,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _directRepoController,
-                      decoration: InputDecoration(
-                        hintText: 'owner/repo / https://modelscope.cn/models/...',
-                        isDense: true,
-                        prefixIcon: const Icon(Icons.folder_outlined, size: 18),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _directRevController,
-                      decoration: InputDecoration(
-                        hintText: 'main / master',
-                        isDense: true,
-                        prefixIcon: const Icon(Icons.commit_outlined, size: 18),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: FilledButton.icon(
-                        onPressed: _isImporting
-                            ? null
-                            : () => _doImport(
-                                  _directRepoController.text,
-                                  _directRevController.text,
-                                ),
-                        icon: _isImporting
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.download_for_offline_outlined, size: 18),
-                        label: Text(
-                          _isImporting
-                              ? l10n.localModelsHubImporting
-                              : l10n.localModelsHubImport,
+            Expanded(
+              child: SingleChildScrollView(
+                child: OperitGlassSurface(
+                  color: colors.surfaceContainerLow.withValues(alpha: 0.65),
+                  layer: OperitGlassSurfaceLayer.control,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: colors.outlineVariant.withValues(alpha: 0.3),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          l10n.localModelsHubDirectImportPrompt,
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(color: colors.onSurfaceVariant),
                         ),
-                      ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: _directRepoController,
+                          decoration: InputDecoration(
+                            hintText:
+                                'owner/repo / https://modelscope.cn/models/...',
+                            isDense: true,
+                            prefixIcon: const Icon(
+                              Icons.folder_outlined,
+                              size: 18,
+                            ),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: _directRevController,
+                          decoration: InputDecoration(
+                            hintText: 'main / master',
+                            isDense: true,
+                            prefixIcon: const Icon(
+                              Icons.commit_outlined,
+                              size: 18,
+                            ),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: FilledButton.icon(
+                            onPressed: _isImporting
+                                ? null
+                                : () => _doImport(
+                                    _directRepoController.text,
+                                    _directRevController.text,
+                                  ),
+                            icon: _isImporting
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(
+                                    Icons.download_for_offline_outlined,
+                                    size: 18,
+                                  ),
+                            label: Text(
+                              _isImporting
+                                  ? l10n.localModelsHubImporting
+                                  : l10n.localModelsHubImport,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                  ],
+                  ),
                 ),
               ),
             ),
@@ -1431,9 +1670,9 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
       return Center(
         child: Text(
           l10n.localModelsHubDirectImportPrompt,
-          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-            color: colors.onSurfaceVariant,
-          ),
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: colors.onSurfaceVariant),
           textAlign: TextAlign.center,
         ),
       );
@@ -1442,23 +1681,26 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
       return Center(
         child: Text(
           l10n.localModelsHubNoResults,
-          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-            color: colors.onSurfaceVariant,
-          ),
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: colors.onSurfaceVariant),
         ),
       );
     }
     return ListView.separated(
       itemCount: results.length,
-      separatorBuilder: (_, __) => const SizedBox(height: 8),
+      separatorBuilder: (_, _) => const SizedBox(height: 8),
       itemBuilder: (context, index) {
         final item = results[index];
-        final isThisImporting = _isImporting && _importingRepo == item.repository;
+        final isThisImporting =
+            _isImporting && _importingRepo == item.repository;
         return OperitGlassSurface(
           color: colors.surfaceContainerLow.withValues(alpha: 0.65),
           layer: OperitGlassSurfaceLayer.control,
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: colors.outlineVariant.withValues(alpha: 0.25)),
+          border: Border.all(
+            color: colors.outlineVariant.withValues(alpha: 0.25),
+          ),
           child: Padding(
             padding: const EdgeInsets.all(12),
             child: Row(
@@ -1468,7 +1710,9 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
                       Text(
-                        item.displayName.isNotEmpty ? item.displayName : item.repository,
+                        item.displayName.isNotEmpty
+                            ? item.displayName
+                            : item.repository,
                         style: Theme.of(context).textTheme.titleSmall?.copyWith(
                           fontWeight: FontWeight.w600,
                         ),
@@ -1508,7 +1752,9 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
                 ),
                 const SizedBox(width: 12),
                 FilledButton.tonal(
-                  onPressed: _isImporting ? null : () => _doImport(item.repository, item.revision),
+                  onPressed: _isImporting
+                      ? null
+                      : () => _doImport(item.repository, item.revision),
                   child: isThisImporting
                       ? const SizedBox(
                           width: 16,
@@ -1522,6 +1768,308 @@ class _LocalModelHubDialogState extends State<_LocalModelHubDialog> {
           ),
         );
       },
+    );
+  }
+}
+
+class _LocalChatInferenceDialog extends StatefulWidget {
+  const _LocalChatInferenceDialog({
+    required this.clients,
+    required this.status,
+  });
+  final GeneratedCoreProxyClients clients;
+  final core_proxy.LocalModelCatalogStatus status;
+  @override
+  State<_LocalChatInferenceDialog> createState() =>
+      _LocalChatInferenceDialogState();
+}
+
+class _LocalChatInferenceDialogState extends State<_LocalChatInferenceDialog> {
+  final _prompt = TextEditingController();
+  final _threads = TextEditingController(text: '4');
+  final _context = TextEditingController(text: '2048');
+  final _batch = TextEditingController(text: '512');
+  bool _busy = false;
+  bool _loading = true;
+  String? _error;
+  String? _output;
+  core_proxy.LocalModelRuntimeSettings? _saved;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      // Without a local-models provider nothing is saved yet: the fields keep
+      // their initial values until the user first uses the model for chat.
+      final providerId = await _localProviderId();
+      if (providerId == null) return;
+      final model = await widget.clients.preferencesModelConfigManager
+          .getModelProfile(providerId: providerId, modelId: _binding);
+      if (!mounted) return;
+      _saved = model.localRuntime;
+      _threads.text =
+          '${_isMnn ? _saved!.mnnThreadCount : _saved!.llamaThreadCount}';
+      _context.text = '${_saved!.llamaContextSize}';
+      _batch.text = '${_saved!.llamaBatchSize}';
+    } catch (error) {
+      if (mounted) _error = '$error';
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  String get _binding =>
+      '${widget.status.manifest.id}@${widget.status.manifest.version}';
+
+  /// Returns the provider that lists installed local models, `null` when the
+  /// user has not added one.
+  Future<String?> _localProviderId() async {
+    final providers = await widget.clients.preferencesModelConfigManager
+        .getProviderProfiles();
+    for (final provider in providers) {
+      if (provider.providerTypeId == 'LOCAL_MODEL') {
+        return provider.id;
+      }
+    }
+    return null;
+  }
+
+  bool get _isMnn =>
+      widget.status.manifest.engine == core_proxy.LocalEngineKind.mnn;
+
+  core_proxy.LocalModelRuntimeSettings _settings() {
+    final threads = int.tryParse(_threads.text);
+    final contextSize = int.tryParse(_context.text);
+    final batch = int.tryParse(_batch.text);
+    if (threads == null ||
+        threads < 1 ||
+        threads > 256 ||
+        contextSize == null ||
+        contextSize < 128 ||
+        contextSize > 1048576 ||
+        batch == null ||
+        batch < 1 ||
+        batch > 65536) {
+      throw FormatException(
+        AppLocalizations.of(context)!.localModelsInvalidSettings,
+      );
+    }
+    return core_proxy.LocalModelRuntimeSettings.fromJson(<String, Object?>{
+      ...?_saved?.toJson(),
+      'inferenceBindingKey': widget.status.inferenceBindingKey ?? '',
+      'mnnForwardType': 0,
+      'mnnThreadCount': threads,
+      'llamaThreadCount': threads,
+      'llamaContextSize': contextSize,
+      'llamaBatchSize': batch,
+      'llamaUBatchSize': batch,
+      'llamaGpuLayers': 0,
+      'llamaUseMmap': true,
+      'llamaFlashAttention': false,
+      'llamaKvUnified': true,
+      'llamaOffloadKqv': false,
+    });
+  }
+
+  Future<void> _run() async {
+    if (_prompt.text.trim().isEmpty) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+      _output = null;
+    });
+    try {
+      final result = await widget.clients.servicesLocalModelService
+          .runChatInference(
+            modelId: widget.status.manifest.id,
+            version: widget.status.manifest.version,
+            prompt: _prompt.text,
+            settings: _settings(),
+          );
+      if (mounted) setState(() => _output = result.text);
+    } catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _useForChat() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final settings = _settings();
+      final manager = widget.clients.preferencesModelConfigManager;
+      final providerName = AppLocalizations.of(
+        context,
+      )!.settingsModelProviderTypeLocalModel;
+      // Using a local model for chat is the user asking for the provider that
+      // lists them, so one is added when there is none yet.
+      final providerId =
+          await _localProviderId() ??
+          await manager.createProvider(
+            name: providerName,
+            providerTypeId: 'LOCAL_MODEL',
+            endpoint: '',
+          );
+      final profile = await manager.getModelProfile(
+        providerId: providerId,
+        modelId: _binding,
+      );
+      await manager.updateModelProfile(
+        providerId: providerId,
+        model: core_proxy.ModelProfile.fromJson(<String, Object?>{
+          ...profile.toJson(),
+          'localRuntime': settings.toJson(),
+          'contextOverride': <String, Object?>{
+            'maxContextLength': settings.llamaContextSize / 1000,
+          },
+        }),
+      );
+      await widget.clients.preferencesFunctionalConfigManager
+          .setModelForFunction(
+            functionType: core_proxy.FunctionType.chat,
+            providerId: providerId,
+            modelId: _binding,
+          );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(AppLocalizations.of(context)!.localModelsChatActivated),
+        ),
+      );
+    } catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _unload() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.clients.servicesLocalModelService.unloadChatModel();
+    } catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _prompt.dispose();
+    _threads.dispose();
+    _context.dispose();
+    _batch.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    return AlertDialog(
+      title: Text(widget.status.manifest.displayName),
+      content: SizedBox(
+        width: 640,
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Text(l10n.localModelsCpuBackend),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _threads,
+                enabled: !_busy && !_loading,
+                keyboardType: TextInputType.number,
+                decoration: InputDecoration(
+                  labelText: l10n.localModelsThreads,
+                  border: const OutlineInputBorder(),
+                ),
+              ),
+              if (!_isMnn) ...<Widget>[
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _context,
+                  enabled: !_busy && !_loading,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                    labelText: l10n.localModelsContextSize,
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _batch,
+                  enabled: !_busy && !_loading,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                    labelText: l10n.localModelsBatchSize,
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+              ],
+              const SizedBox(height: 16),
+              TextField(
+                controller: _prompt,
+                enabled: !_busy && !_loading,
+                minLines: 3,
+                maxLines: 6,
+                decoration: InputDecoration(
+                  labelText: l10n.localModelsPrompt,
+                  border: const OutlineInputBorder(),
+                ),
+              ),
+              if (_busy || _loading) ...<Widget>[
+                const SizedBox(height: 16),
+                const LinearProgressIndicator(),
+                const SizedBox(height: 8),
+                Text(l10n.localModelsGenerating),
+              ],
+              if (_error != null) ...<Widget>[
+                const SizedBox(height: 16),
+                SelectableText(
+                  _error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ],
+              if (_output != null) ...<Widget>[
+                const SizedBox(height: 16),
+                SelectableText(_output!),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: _busy || _loading ? null : _unload,
+          child: Text(l10n.localModelsUnload),
+        ),
+        TextButton(
+          onPressed: _busy || _loading ? null : _useForChat,
+          child: Text(l10n.localModelsUseForChat),
+        ),
+        FilledButton.icon(
+          onPressed: _busy || _loading ? null : _run,
+          icon: const Icon(Icons.play_arrow),
+          label: Text(l10n.localModelsGenerate),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(l10n.close),
+        ),
+      ],
     );
   }
 }

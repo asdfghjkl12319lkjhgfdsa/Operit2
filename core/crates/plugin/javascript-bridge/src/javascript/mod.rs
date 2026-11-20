@@ -1,5 +1,14 @@
+#[path = "JsComposeCompiler.rs"]
+mod JsComposeCompiler;
+
+#[path = "JsAsyncCompiler.rs"]
+mod JsAsyncCompiler;
+
 #[path = "JsEngine.rs"]
 pub mod JsEngine;
+
+#[path = "PreparedEnginePool.rs"]
+mod PreparedEnginePool;
 
 #[path = "JsExecutionProvider.rs"]
 pub mod JsExecutionProvider;
@@ -19,8 +28,11 @@ pub mod JsExternalJavaCodeLoader;
 #[path = "JsInitRuntimeScriptBuilder.rs"]
 pub mod JsInitRuntimeScriptBuilder;
 
-#[path = "JsNativeInterfaceDelegates.rs"]
-pub mod JsNativeInterfaceDelegates;
+#[path = "JsHostOperations.rs"]
+pub mod JsHostOperations;
+
+#[path = "JsBinaryCrypto.rs"]
+mod JsBinaryCrypto;
 
 #[path = "JsJavaBridge.rs"]
 pub mod JsJavaBridge;
@@ -31,8 +43,6 @@ pub mod JsJavaBridgeDelegates;
 #[path = "JsLibraries.rs"]
 pub mod JsLibraries;
 
-#[path = "JsTimeoutConfig.rs"]
-pub mod JsTimeoutConfig;
 
 #[path = "JsToolManager.rs"]
 pub mod JsToolManager;

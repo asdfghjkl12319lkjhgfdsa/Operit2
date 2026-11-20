@@ -1,3 +1,7 @@
+#[path = "ExtensionRuntimeService.rs"]
+pub mod ExtensionRuntimeService;
+#[path = "PreparedChatDeliveryService.rs"]
+pub mod PreparedChatDeliveryService;
 #[path = "ChatServiceCore.rs"]
 pub mod ChatServiceCore;
 #[path = "CodexOAuthService.rs"]
@@ -14,6 +18,8 @@ pub mod ProviderRuntimeSupportService;
 pub mod RuntimeBrowserService;
 #[path = "RuntimeEventIngressService.rs"]
 pub mod RuntimeEventIngressService;
+#[path = "RemoteAnnouncementService.rs"]
+pub mod RemoteAnnouncementService;
 #[path = "RuntimeHostInfoService.rs"]
 pub mod RuntimeHostInfoService;
 #[path = "RuntimeHostInteractionService.rs"]
@@ -42,6 +48,7 @@ pub use LocalProviderService::*;
 pub use ProviderRuntimeSupportService::*;
 pub use RuntimeBrowserService::*;
 pub use RuntimeEventIngressService::*;
+pub use RemoteAnnouncementService::*;
 pub use RuntimeHostInfoService::*;
 pub use RuntimeHostInteractionService::*;
 pub use RuntimeTerminalService::*;
@@ -57,3 +64,31 @@ pub use ArchiveTransferManager::*;
 #[path = "SyncBlobTransferManager.rs"]
 pub mod SyncBlobTransferManager;
 pub use SyncBlobTransferManager::*;
+
+pub(crate) mod media;
+
+
+#[path = "AttachmentTransferManager.rs"]
+pub mod AttachmentTransferManager;
+pub use AttachmentTransferManager::*;
+
+#[path = "FileSelectionService.rs"]
+pub mod FileSelectionService;
+pub use FileSelectionService::*;
+#[path = "ChatBackupDirectoryService.rs"]
+pub mod ChatBackupDirectoryService;
+pub use ChatBackupDirectoryService::*;
+
+#[path = "ComposeDslSessionService.rs"]
+pub mod ComposeDslSessionService;
+
+#[path = "WorkActivityService.rs"]
+pub mod WorkActivityService;
+
+#[path = "LocalLlmService.rs"]
+pub(crate) mod LocalLlmService;
+
+#[path = "ModelCatalogService.rs"]
+pub(crate) mod ModelCatalogService;
+
+mod chat_input_stream;

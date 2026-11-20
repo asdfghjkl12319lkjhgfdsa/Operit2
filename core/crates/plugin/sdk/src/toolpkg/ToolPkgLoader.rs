@@ -1,12 +1,12 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::javascript::JsExecutionEngine;
+use crate::javascript::{JsExecutionEngine, ToolPkgConfigScope};
 use crate::toolpkg::ToolPkgParser::{
     ToolPkgArchiveParser, ToolPkgLoadResult, ToolPkgMainRegistrationParseResult, ToolPkgSourceType,
 };
 use crate::JsPackageLoader::JsPackageLoader;
-use operit_host_api::FileSystemHost;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 
 /// Loads ToolPkg archives and executes their main registration scripts.
 pub struct ToolPkgLoader;
@@ -15,15 +15,16 @@ impl ToolPkgLoader {
     /// Loads a ToolPkg archive through the supplied file-system host.
     #[allow(non_snake_case)]
     pub fn loadToolPkgFromExternalFile<FReportPackageLoadError>(
-        fileSystemHost: &dyn FileSystemHost,
+        filesystem: &VisualFileSystem,
         sourcePath: &str,
+        configScope: ToolPkgConfigScope,
         jsEngine: &dyn JsExecutionEngine,
         reportPackageLoadError: FReportPackageLoadError,
     ) -> Result<ToolPkgLoadResult, String>
     where
         FReportPackageLoadError: Fn(&str, &str),
     {
-        let archiveBytes = fileSystemHost
+        let archiveBytes = filesystem
             .readFileBytes(sourcePath)
             .map_err(|error| error.to_string())?;
         Self::loadToolPkgFromArchiveBytes(
@@ -31,6 +32,7 @@ impl ToolPkgLoader {
             ToolPkgSourceType::EXTERNAL,
             sourcePath,
             false,
+            configScope,
             jsEngine,
             reportPackageLoadError,
         )
@@ -47,11 +49,16 @@ impl ToolPkgLoader {
     where
         FReportPackageLoadError: Fn(&str, &str),
     {
+        let scope = match ToolPkgArchiveParser::readInstallationScope(bytes)? {
+            Some(scope) => scope,
+            None => ToolPkgConfigScope::Device,
+        };
         Self::loadToolPkgFromArchiveBytes(
             bytes,
             ToolPkgSourceType::EXTERNAL,
             assetName,
             false,
+            scope,
             jsEngine,
             reportPackageLoadError,
         )
@@ -73,6 +80,7 @@ impl ToolPkgLoader {
             ToolPkgSourceType::ASSET,
             assetName,
             true,
+            ToolPkgConfigScope::Device,
             jsEngine,
             reportPackageLoadError,
         )
@@ -81,15 +89,16 @@ impl ToolPkgLoader {
     /// Loads a raw protected ToolPkg ZIP after its local market installation seal has verified.
     #[allow(non_snake_case)]
     pub fn loadToolPkgFromMarketFile<FReportPackageLoadError>(
-        fileSystemHost: &dyn FileSystemHost,
+        filesystem: &VisualFileSystem,
         sourcePath: &str,
+        configScope: ToolPkgConfigScope,
         jsEngine: &dyn JsExecutionEngine,
         reportPackageLoadError: FReportPackageLoadError,
     ) -> Result<ToolPkgLoadResult, String>
     where
         FReportPackageLoadError: Fn(&str, &str),
     {
-        let archiveBytes = fileSystemHost
+        let archiveBytes = filesystem
             .readFileBytes(sourcePath)
             .map_err(|error| error.to_string())?;
         Self::loadToolPkgFromArchiveBytes(
@@ -97,6 +106,7 @@ impl ToolPkgLoader {
             ToolPkgSourceType::MARKET,
             sourcePath,
             false,
+            configScope,
             jsEngine,
             reportPackageLoadError,
         )
@@ -104,17 +114,27 @@ impl ToolPkgLoader {
 
     /// Parses one already-unwrapped ToolPkg ZIP using its trusted source classification.
     #[allow(non_snake_case)]
-    fn loadToolPkgFromArchiveBytes<FReportPackageLoadError>(
+    pub fn loadToolPkgFromArchiveBytes<FReportPackageLoadError>(
         archiveBytes: &[u8],
         sourceType: ToolPkgSourceType,
         sourcePath: &str,
         isBuiltIn: bool,
+        configScope: ToolPkgConfigScope,
         jsEngine: &dyn JsExecutionEngine,
         reportPackageLoadError: FReportPackageLoadError,
     ) -> Result<ToolPkgLoadResult, String>
     where
         FReportPackageLoadError: Fn(&str, &str),
     {
+        let requiredScope = ToolPkgArchiveParser::readInstallationScope(archiveBytes)?;
+        let configScope = match (isBuiltIn, requiredScope) {
+            (true, Some(scope)) => scope,
+            (false, Some(scope)) if scope != configScope => {
+                return Err(format!("ToolPkg requires {} installation scope, not {}", scope.as_str(), configScope.as_str()));
+            }
+            _ => configScope,
+        };
+        ToolPkgArchiveParser::readThemeTemplates(archiveBytes)?;
         let cursor = Cursor::new(archiveBytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|error| error.to_string())?;
         let entryIndex = ToolPkgArchiveParser::buildZipEntryIndex(&mut archive);
@@ -133,19 +153,21 @@ impl ToolPkgLoader {
             sourceType,
             sourcePath,
             isBuiltIn,
-            |jsContent, reportPackageLoadError| match JsPackageLoader::parse(jsContent) {
+            |jsContent, apiVersion, reportPackageLoadError| match JsPackageLoader::parse_with_default_api_version(jsContent, apiVersion) {
                 Ok(package) => Some(package),
                 Err(error) => {
                     reportPackageLoadError(String::new(), error);
                     None
                 }
             },
-            |mainScriptText, toolPkgId, mainScriptPath, apiVersion| {
+            |mainScriptText, toolPkgId, mainScriptPath, apiVersion, environmentNames| {
                 parseMainRegistration(
                     mainScriptText,
                     toolPkgId,
                     mainScriptPath,
                     apiVersion,
+                    environmentNames,
+                    configScope,
                     jsEngine,
                     textResources.clone(),
                 )
@@ -162,6 +184,8 @@ fn parseMainRegistration(
     toolPkgId: &str,
     mainScriptPath: &str,
     apiVersion: &str,
+    environmentNames: &[String],
+    configScope: ToolPkgConfigScope,
     jsEngine: &dyn JsExecutionEngine,
     textResources: Arc<std::collections::BTreeMap<String, String>>,
 ) -> ToolPkgMainRegistrationParseResult {
@@ -170,6 +194,8 @@ fn parseMainRegistration(
         toolPkgId,
         mainScriptPath,
         apiVersion,
+        environmentNames,
+        configScope,
         jsEngine,
         Some(textResources),
     )

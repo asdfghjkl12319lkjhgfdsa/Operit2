@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use operit_host_api::{
-    HostManager::HostManager, RuntimeSqliteHost, RuntimeStorageHost, RuntimeStorageWriteHost,
+    HostManager::{defaultHostRuntimeTaskSchedulerHost, HostManager},
+    HostRuntimeTaskSchedulerHost, HostSecretStore, RuntimeSqliteHost, RuntimeStorageHost,
+    RuntimeStorageWriteHost,
 };
 use operit_store::db::AppDatabase::AppDatabase;
 use operit_store::RuntimeStorePaths::RuntimeStorePaths;
@@ -15,7 +17,9 @@ use crate::data::backup::Operit1SnapshotImportManager::{
 use crate::data::backup::RawSnapshotBackupManager::{
     RawSnapshotBackupManager, RawSnapshotManifest,
 };
-use crate::services::ArchiveTransferManager::{ArchiveTransferManager, StagedArchive};
+use crate::services::ArchiveTransferManager::{
+    ArchiveTransferManager, StagedArchive, StagedArchiveFile,
+};
 
 /// Applies snapshot-specific parsing and restore operations to a staged archive.
 #[derive(Clone)]
@@ -24,6 +28,7 @@ pub struct SnapshotImportManager {
     storageHost: Arc<dyn RuntimeStorageHost>,
     storageWriteHost: Arc<dyn RuntimeStorageWriteHost>,
     sqliteHost: Arc<dyn RuntimeSqliteHost>,
+    secretStore: Option<Arc<dyn HostSecretStore>>,
 }
 
 impl SnapshotImportManager {
@@ -32,6 +37,7 @@ impl SnapshotImportManager {
     pub fn getInstance(hostManager: &HostManager) -> Result<Self, String> {
         Ok(Self {
             archiveTransferManager: ArchiveTransferManager::getInstance(hostManager)?,
+            secretStore: hostManager.hostSecretStore.clone(),
             storageHost: hostManager.runtimeStorageHost.clone().ok_or_else(|| {
                 "RuntimeStorageHost is not registered for snapshot operations".to_string()
             })?,
@@ -44,11 +50,38 @@ impl SnapshotImportManager {
         })
     }
 
-    /// Exports all raw runtime storage into a portable snapshot archive.
+    /// Streams a raw snapshot into host storage and returns only its sealed file reference.
     #[allow(non_snake_case)]
-    pub fn exportRawSnapshot(&self) -> Result<Vec<u8>, String> {
-        RawSnapshotBackupManager::new(self.storageHost.clone(), self.storageWriteHost.clone())
-            .exportSnapshot()
+    pub async fn exportRawSnapshot(&self) -> Result<StagedArchiveFile, String> {
+        let transfer = self.archiveTransferManager.clone();
+        let backup = RawSnapshotBackupManager::new(
+            self.storageHost.clone(),
+            self.storageWriteHost.clone(),
+            self.secretStore.clone(),
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        defaultHostRuntimeTaskSchedulerHost()
+            .scheduleHostRuntimeAsyncTask(
+                "raw-snapshot-export",
+                Box::new(move || {
+                    Box::pin(async move {
+                        let result = transfer.exportArchive(|writer| backup.exportSnapshot(writer));
+                        if let Err(undelivered) = sender.send(result) {
+                            if let Ok(file) = undelivered {
+                                if let Err(error) =
+                                    transfer.discardArchiveUpload(file.archive.archiveId)
+                                {
+                                    operit_host_api::logHostError("SnapshotExport", &error);
+                                }
+                            }
+                        }
+                    })
+                }),
+            )
+            .map_err(|error| format!("Unable to schedule snapshot export: {error}"))?;
+        receiver
+            .await
+            .map_err(|error| format!("Snapshot export returned no result: {error}"))?
     }
 
     /// Reads raw snapshot metadata from a sealed archive without changing runtime storage.
@@ -57,8 +90,12 @@ impl SnapshotImportManager {
         &self,
         archive: StagedArchive,
     ) -> Result<RawSnapshotManifest, String> {
-        RawSnapshotBackupManager::new(self.storageHost.clone(), self.storageWriteHost.clone())
-            .inspectSnapshotSource(self.archiveTransferManager.openStagedArchive(&archive)?)
+        RawSnapshotBackupManager::new(
+            self.storageHost.clone(),
+            self.storageWriteHost.clone(),
+            self.secretStore.clone(),
+        )
+        .inspectSnapshotSource(self.archiveTransferManager.openStagedArchive(&archive)?)
     }
 
     /// Restores one sealed raw snapshot after closing the active database handle.
@@ -66,8 +103,12 @@ impl SnapshotImportManager {
     pub fn restoreRawSnapshot(&self, archive: StagedArchive) -> Result<(), String> {
         let source = self.archiveTransferManager.openStagedArchive(&archive)?;
         AppDatabase::closeDatabase();
-        RawSnapshotBackupManager::new(self.storageHost.clone(), self.storageWriteHost.clone())
-            .restoreSnapshotSource(source)
+        RawSnapshotBackupManager::new(
+            self.storageHost.clone(),
+            self.storageWriteHost.clone(),
+            self.secretStore.clone(),
+        )
+        .restoreSnapshotSource(source)
     }
 
     /// Previews an Operit1 model-configuration snapshot from a sealed archive.
@@ -108,19 +149,37 @@ impl SnapshotImportManager {
 
     /// Imports one sealed Operit1 snapshot and publishes progress events.
     #[allow(non_snake_case)]
-    pub fn importOperit1Snapshot(
+    pub async fn importOperit1Snapshot(
         &self,
         archive: StagedArchive,
     ) -> Result<Operit1SnapshotImportResult, String> {
-        publishOperit1SnapshotImportProgress(Operit1SnapshotImportProgress {
-            stage: "parse".to_string(),
-            title: "解析快照".to_string(),
-            detail: "正在读取 Operit1 快照内容。".to_string(),
-            progress: 0.04,
-            active: true,
-        });
-        self.operit1Importer()
-            .importSnapshotSource(self.archiveTransferManager.openStagedArchive(&archive)?)
+        let source = self.archiveTransferManager.openStagedArchive(&archive)?;
+        let importer = self.operit1Importer();
+        let (resultSender, resultReceiver) = tokio::sync::oneshot::channel();
+        // Keep the synchronous migration on the host-owned scheduler. The
+        // importer performs blocking storage/SQLite work, and the scheduler
+        // is the runtime's supported boundary for that work; do not create a
+        // task/thread directly here.
+        defaultHostRuntimeTaskSchedulerHost()
+            .scheduleHostRuntimeAsyncTask(
+                "operit1-snapshot-import",
+                Box::new(move || {
+                    Box::pin(async move {
+                        publishOperit1SnapshotImportProgress(Operit1SnapshotImportProgress {
+                            stage: "parse".to_string(),
+                            title: "解析快照".to_string(),
+                            detail: "正在读取 Operit1 快照内容。".to_string(),
+                            progress: 0.04,
+                            active: true,
+                        });
+                        let _ = resultSender.send(importer.importSnapshotSource(source));
+                    })
+                }),
+            )
+            .map_err(|error| format!("无法调度 Operit1 快照导入任务：{error}"))?;
+        resultReceiver
+            .await
+            .map_err(|error| format!("Operit1 快照导入任务未返回结果：{error}"))?
     }
 
     /// Observes the latest Operit1 snapshot import progress state.

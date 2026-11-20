@@ -2,171 +2,32 @@
 
 part of '../ToolPkgUiLauncherScreen.dart';
 
-class _ParsedComposeDslActionEvent {
-  /// Resolves parsed compose dsl action event for the Compose DSL renderer.
-  const _ParsedComposeDslActionEvent({
-    required this.phase,
-    required this.renderResult,
-    required this.actionResult,
-    required this.errorText,
-    this.navigationCommands = const [],
-  });
-
-  final String? phase;
-  final _ComposeDslRenderResult? renderResult;
-  final Object? actionResult;
-  final String? errorText;
-  final List<({String routeId, Map<String, Object?> args})> navigationCommands;
-
-  /// Parses one serialized DSL value.
-  static _ParsedComposeDslActionEvent parse(String event) {
-    final decoded = jsonDecode(event) as Map<String, Object?>;
-    final phase = decoded['phase']?.toString().trim();
-    if (phase == 'intermediate' || phase == 'final') {
-      final raw = decoded['result'];
-      if (raw is! String) {
-        throw StateError('compose_dsl action result event missing result');
-      }
-      final result = _ComposeDslRenderResult.tryParse(raw);
-      return _ParsedComposeDslActionEvent(
-        phase: phase,
-        renderResult: result,
-        actionResult: _ComposeDslRenderResult.actionResultOf(raw),
-        errorText: null,
-        navigationCommands: _ComposeDslRenderResult.navigationCommandsOf(raw),
-      );
-    }
-    if (phase == 'error') {
-      return _ParsedComposeDslActionEvent(
-        phase: phase,
-        renderResult: null,
-        actionResult: null,
-        errorText: decoded['error']?.toString(),
-      );
-    }
-    return _ParsedComposeDslActionEvent(
-      phase: phase,
-      renderResult: null,
-      actionResult: null,
-      errorText: null,
-    );
+/// Exposes the structured action result contract for return-type regression tests.
+@visibleForTesting
+({Object? actionResult, Object? renderedActionResult, bool hasRenderResult})
+parseComposeDslActionEventForTest(core_proxy.ToolPkgComposeDslEvent event) {
+  if (event.error != null) throw StateError(event.error!);
+  final update = event.update;
+  if (update != null) {
+    final store = _ComposeProgramStore()..apply(update);
+    store.dispose();
   }
+  return (
+    actionResult: event.actionResult,
+    renderedActionResult: update == null ? null : event.actionResult,
+    hasRenderResult: update != null,
+  );
 }
 
 class _ComposeDslRenderResult {
-  /// Reads navigation side effects independently of the action return value.
-  static List<({String routeId, Map<String, Object?> args})>
-  navigationCommandsOf(String? raw) {
-    final commands = _rootObject(raw)?['navigationCommands'];
-    if (commands == null) return const [];
-    return (commands as List).map(_composeNavigateCommand).toList();
-  }
-
-  /// Creates the compose dsl render result instance.
+  /// Stores the root handle and the latest structured runtime metadata.
   const _ComposeDslRenderResult({
     required this.tree,
-    required this.state,
-    required this.memo,
     required this.actionResult,
   });
 
-  final _ComposeDslNode tree;
-  final Map<String, Object?> state;
-  final Map<String, Object?> memo;
+  final _ComposeProgramNode tree;
   final Object? actionResult;
-
-  /// Parses one serialized DSL value.
-  static _ComposeDslRenderResult parse(String? raw) {
-    final result = tryParse(raw);
-    if (result != null) {
-      return result;
-    }
-    throw FormatException(
-      'compose_dsl result is invalid: ${_rawResultSummary(raw)}',
-    );
-  }
-
-  /// Parses a supported serialized DSL representation.
-  static _ComposeDslRenderResult? tryParse(String? raw) {
-    final value = _rootObject(raw);
-    if (value == null) {
-      return null;
-    }
-    final success = value['success'];
-    if (success == false) {
-      throw Exception((value['message'] ?? 'compose_dsl failed').toString());
-    }
-    final tree = _ComposeDslNode.parse(value['tree']);
-    if (tree == null) {
-      return null;
-    }
-    return _ComposeDslRenderResult(
-      tree: tree,
-      state: _stringMap(value['state']),
-      memo: _stringMap(value['memo']),
-      actionResult: _plainJsonValue(value['actionResult']),
-    );
-  }
-
-  /// Resolves action result of for the Compose DSL renderer.
-  static Object? actionResultOf(String? raw) {
-    final value = _rootObject(raw);
-    if (value == null) {
-      return null;
-    }
-    final success = value['success'];
-    if (success == false) {
-      throw Exception((value['message'] ?? 'compose_dsl failed').toString());
-    }
-    return _plainJsonValue(value['actionResult']);
-  }
-
-  static Map<Object?, Object?>? _rootObject(String? raw) {
-    Object? value = raw;
-    for (var i = 0; i < 3; i += 1) {
-      if (value is String) {
-        final trimmed = value.trim();
-        if (trimmed.isEmpty) {
-          break;
-        }
-        value = jsonDecode(trimmed);
-      }
-    }
-    if (value is Map) {
-      return Map<Object?, Object?>.from(value);
-    }
-    return null;
-  }
-
-  /// Resolves raw result summary for the Compose DSL renderer.
-  static String _rawResultSummary(Object? raw) {
-    final text = raw?.toString().trim();
-    if (text == null || text.isEmpty) {
-      return '<empty>';
-    }
-    const maxLength = 1200;
-    if (text.length <= maxLength) {
-      return text;
-    }
-    return '${text.substring(0, maxLength)}...';
-  }
-}
-
-/// Reads a Compose `setEnv` command returned by a plugin action.
-Map<String, String>? _composeSetEnvCommand(Object? raw) {
-  if (raw is! Map) {
-    return null;
-  }
-  final map = _stringMap(raw);
-  if (!_bool(map['__operitSetEnv'])) {
-    return null;
-  }
-  final key = _string(map['key']).trim();
-  final value = _string(map['value']).trim();
-  if (key.isEmpty) {
-    throw StateError('compose setEnv requires a key');
-  }
-  return {key: value};
 }
 
 /// Decodes one queued Compose navigation request.
@@ -186,24 +47,28 @@ Map<String, String>? _composeSetEnvCommand(Object? raw) {
   return (routeId: routeId, args: args);
 }
 
-/// Resolves plain json value for the Compose DSL renderer.
-Object? _plainJsonValue(Object? raw) {
-  if (raw is! String) {
-    return raw;
-  }
-  final trimmed = raw.trim();
-  if (trimmed.isEmpty) {
-    return null;
-  }
-  try {
-    return jsonDecode(trimmed);
-  } catch (_) {
-    return raw;
-  }
-}
-
 /// Canonical node names indexed by the Kotlin-compatible normalized token.
 const _composeNodeTypes = <String, String>{
+  'richtext': 'RichText',
+  'codetext': 'CodeText',
+  'codeeditor': 'CodeEditor',
+  'selectabletext': 'SelectableText',
+  'menuanchor': 'MenuAnchor',
+  'tooltip': 'Tooltip',
+  'scrollarea': 'ScrollArea',
+  'inkwell': 'InkWell',
+  'svg': 'Svg',
+  'gradientrule': 'GradientRule',
+  'loadingindicator': 'LoadingIndicator',
+  'activitydots': 'ActivityDots',
+  'draggable': 'Draggable',
+  'dragtarget': 'DragTarget',
+  'swipeactions': 'SwipeActions',
+  'hoverregion': 'HoverRegion',
+  'hoveronly': 'HoverOnly',
+  'popupmenu': 'PopupMenu',
+  'horizontalpager': 'HorizontalPager',
+  'inputdecorator': 'InputDecorator',
   'outlinedtextfield': 'OutlinedTextField',
   'asyncimage': 'AsyncImage',
   'navigationbaritem': 'NavigationBarItem',
@@ -267,6 +132,8 @@ const _composeNodeTypes = <String, String>{
   'outlinedcard': 'OutlinedCard',
   'outlinediconbutton': 'OutlinedIconButton',
   'outlinedicontogglebutton': 'OutlinedIconToggleButton',
+  'segmentedcontrol': 'SegmentedControl',
+  'select': 'Select',
   'permanentdrawersheet': 'PermanentDrawerSheet',
   'permanentnavigationdrawer': 'PermanentNavigationDrawer',
   'primaryscrollabletabrow': 'PrimaryScrollableTabRow',
@@ -288,6 +155,8 @@ const _composeNodeTypes = <String, String>{
   'suggestionchip': 'SuggestionChip',
   'surface': 'Surface',
   'switch': 'Switch',
+  'slider': 'Slider',
+  'table': 'Table',
   'tab': 'Tab',
   'text': 'Text',
   'textbutton': 'TextButton',
@@ -300,42 +169,6 @@ const _composeNodeTypes = <String, String>{
   'widenavigationrailitem': 'WideNavigationRailItem',
 };
 
-class _ComposeDslNode {
-  /// Creates the compose dsl node instance.
-  const _ComposeDslNode({
-    required this.type,
-    required this.props,
-    required this.children,
-    required this.slots,
-  });
-
-  final String type;
-  final Map<String, Object?> props;
-  final List<_ComposeDslNode> children;
-  final Map<String, List<_ComposeDslNode>> slots;
-
-  /// Parses one serialized DSL value.
-  static _ComposeDslNode? parse(Object? raw) {
-    if (raw is! Map) {
-      return null;
-    }
-    final token = _normalizeToken((raw['type'] ?? '').toString());
-    if (token.isEmpty) {
-      return null;
-    }
-    final type = _composeNodeTypes[token];
-    if (type == null) {
-      throw FormatException('Unknown Compose node type: ${raw['type']}');
-    }
-    return _ComposeDslNode(
-      type: type,
-      props: _stringMap(raw['props']),
-      children: _nodeList(raw['children']),
-      slots: _slotMap(raw['slots']),
-    );
-  }
-}
-
 class _NoUiView extends StatelessWidget {
   /// Creates the no ui view instance.
   const _NoUiView();
@@ -345,4 +178,38 @@ class _NoUiView extends StatelessWidget {
   Widget build(BuildContext context) {
     return const Center(child: Icon(Icons.extension_off_outlined, size: 42));
   }
+}
+
+/// Matches Kotlin Map/List value equality for JSON-backed Compose effect inputs.
+bool _composeInputEquals(Object? left, Object? right) {
+  if (identical(left, right)) return true;
+  if (left is Map && right is Map) {
+    if (left.length != right.length) return false;
+    for (final entry in left.entries) {
+      if (!right.containsKey(entry.key) ||
+          !_composeInputEquals(entry.value, right[entry.key])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (left is List && right is List) {
+    if (left.length != right.length) return false;
+    for (var index = 0; index < left.length; index++) {
+      if (!_composeInputEquals(left[index], right[index])) return false;
+    }
+    return true;
+  }
+  return left == right;
+}
+
+/// Correlates a command's completion and side effects without one subscription per action.
+class _ComposeDslPendingCommand {
+  /// Records unfinished action ownership across host input updates.
+  _ComposeDslPendingCommand(this.generation);
+  final int generation;
+  final Completer<void> completion = Completer<void>();
+  Object? actionResult;
+  final List<({String routeId, Map<String, Object?> args})> navigationCommands =
+      [];
 }

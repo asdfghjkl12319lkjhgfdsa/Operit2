@@ -18,6 +18,7 @@ impl Parse for CoreRouteArguments {
         let mut binding = None;
         let mut permission = None;
         let mut sdk = false;
+        let mut create_binding = None;
         while !input.is_empty() {
             let name: Ident = input.parse()?;
             if name == "binding" {
@@ -26,6 +27,9 @@ impl Parse for CoreRouteArguments {
             } else if name == "permission" {
                 input.parse::<Token![=]>()?;
                 permission = Some(input.parse::<LitStr>()?);
+            } else if name == "create_binding" {
+                input.parse::<Token![=]>()?;
+                create_binding = Some(input.parse::<LitStr>()?);
             } else if name == "sdk" {
                 sdk = true;
             } else {
@@ -39,8 +43,15 @@ impl Parse for CoreRouteArguments {
             }
         }
         let binding = binding.ok_or_else(|| input.error("missing `binding = argument`"))?;
-        let permission = permission.ok_or_else(|| input.error("missing `permission = \"scope:capability\"`"))?;
-        validate_permission(&permission)?;
+        if let Some(permission) = &permission {
+            validate_permission(permission)?;
+        }
+        if let Some(capability) = create_binding {
+            if capability.value().trim().is_empty() {
+                return Err(Error::new(capability.span(), "binding creation requires a target capability"));
+            }
+        }
+        let permission = permission.unwrap_or_else(|| LitStr::new("", binding.span()));
         Ok(Self {
             binding,
             permission,
@@ -87,17 +98,153 @@ pub fn operit_plugin_sdk_expose(_attribute: TokenStream, item: TokenStream) -> T
     item
 }
 
+/// Reads the same explicit ownership contract used by generated local proxy dispatch.
+fn owned_future_output(output: &ReturnType) -> Option<&Type> {
+    let ReturnType::Type(_, ty) = output else { return None; };
+    let Type::ImplTrait(future) = ty.as_ref() else { return None; };
+    if !future.bounds.iter().any(|bound| matches!(bound,
+        syn::TypeParamBound::Lifetime(lifetime) if lifetime.ident == "static")) { return None; }
+    for bound in &future.bounds {
+        let syn::TypeParamBound::Trait(bound) = bound else { continue; };
+        let segment = bound.path.segments.last()?;
+        if segment.ident != "Future" { continue; }
+        let PathArguments::AngleBracketed(args) = &segment.arguments else { continue; };
+        for argument in &args.args {
+            if let GenericArgument::AssocType(output) = argument {
+                if output.ident == "Output" { return Some(&output.ty); }
+            }
+        }
+    }
+    None
+}
+
+/// Captures routed operations synchronously and exposes only futures independent of the service borrow.
+fn expand_owned_core_route(arguments: CoreRouteArguments, mut function: ImplItemFn, output: Type)
+    -> syn::Result<proc_macro2::TokenStream> {
+    let original = function.sig.ident.clone();
+    let local = format_ident!("__operit_core_local_{}", original);
+    let call = format_ident!("__operit_core_route_call_{}", original);
+    let push = format_ident!("__operit_core_route_push_{}", original);
+    let binding = format_ident!("__operit_core_binding_{}", original);
+    let permission = format_ident!("__operit_core_permission_{}", original);
+    let binding_name = arguments.binding.to_string();
+    let permission_value = arguments.permission;
+    let names = function_argument_names(&function)?;
+    if !names.iter().any(|name| name == &arguments.binding) {
+        return Err(Error::new_spanned(&function.sig, "Binding argument is missing"));
+    }
+    let reverse = function.sig.inputs.iter().filter_map(|arg| {
+        let FnArg::Typed(arg) = arg else { return None; };
+        let Type::Path(ty) = arg.ty.as_ref() else { return None; };
+        if ty.path.segments.last()?.ident != "ReverseStream" { return None; }
+        let Pat::Ident(name) = arg.pat.as_ref() else { return None; };
+        Some((name.ident.clone(), arg.ty.clone()))
+    }).collect::<Vec<_>>();
+    if reverse.len() > 1 { return Err(Error::new_spanned(&function.sig, "Routed methods accept one ReverseStream input")); }
+    let entries = names.iter().filter(|name| reverse.first().map(|v| &v.0) != Some(*name)).map(|name| quote! {
+        operit_rslink_runtime::core_arg_entry(stringify!(#name), &#name)
+            .expect("annotated route argument must be serializable")
+    });
+    let route_args = quote! { operit_rslink_runtime::core_route_args(vec![#(#entries),*]) };
+    let logical_output: ReturnType = syn::parse_quote!(-> #output);
+    let decode_response = route_call_decode(&logical_output);
+    let remote = if let Some((input, _)) = reverse.first() {
+        quote! { operit_rslink_runtime::core_route_reverse_stream(
+            runtime.as_ref(), stringify!(#original), args, #input).await.map_err(|error| error.message) }
+    } else { quote! {
+        let __core_route_response = operit_rslink_runtime::core_route_call_response(
+            runtime.as_ref(), stringify!(#original), args).await;
+        #decode_response
+    } };
+    let signature = function.sig.clone();
+    let attrs = function.attrs.clone();
+    let vis = function.vis.clone();
+    let decode = function.sig.inputs.iter().filter_map(|arg| {
+        let FnArg::Typed(arg) = arg else { return None; };
+        let Pat::Ident(name) = arg.pat.as_ref() else { return None; };
+        if reverse.first().map(|v| &v.0) == Some(&name.ident) { return None; }
+        let name = &name.ident;
+        let ty = owned_decode_type(&arg.ty);
+        Some(quote! { let #name: #ty = operit_rslink_runtime::decode_core_arg(&mut args, stringify!(#name))?; })
+    }).collect::<Vec<_>>();
+    let encoding = render_return_encoding(&logical_output);
+    let helper = if let Some((input, ty)) = reverse.first() { quote! {
+        /// Captures a typed input consumer before releasing the chat runtime lock.
+        #[doc(hidden)]
+        #vis fn #push(&mut self, request: operit_link::CorePushRequest, #input: #ty)
+            -> impl std::future::Future<Output = Result<(), operit_link::CoreLinkError>> + 'static {
+            let pending = (|| -> Result<_, operit_link::CoreLinkError> {
+                let mut args = operit_rslink_runtime::object_args(request.args)?;
+                #(#decode)*
+                Ok(self.#local(#(#names),*))
+            })();
+            async move { pending?.await.map_err(|error| operit_link::CoreLinkError::internal(error.to_string())) }
+        }
+    } } else { quote! {
+        /// Captures a value operation before releasing the chat runtime lock.
+        #[doc(hidden)]
+        #vis fn #call(&mut self, request: operit_link::CoreCallRequest)
+            -> impl std::future::Future<Output = Result<operit_link::CoreValue, operit_link::CoreLinkError>> + 'static {
+            let pending = (|| -> Result<_, operit_link::CoreLinkError> {
+                let mut args = operit_rslink_runtime::object_args(request.args)?;
+                #(#decode)*
+                Ok(self.#local(#(#names),*))
+            })();
+            async move { let __core_result = pending?.await; #encoding }
+        }
+    } };
+    function.sig.ident = local.clone();
+    Ok(quote! {
+        #(#attrs)*
+        #vis #signature {
+            if let Some(runtime) = operit_link::coreRouteRuntime() {
+                let args = #route_args;
+                if runtime.shouldRoute(stringify!(#original), &args).expect("annotated route resolution failed") {
+                    return Box::pin(async move { #remote })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = #output> + 'static>>;
+                }
+            }
+            Box::pin(self.#local(#(#names),*))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = #output> + 'static>>
+        }
+        #[doc(hidden)]
+        #function
+        #[doc(hidden)]
+        #vis fn #binding() -> &'static str { #binding_name }
+        #[doc(hidden)]
+        #vis fn #permission() -> &'static str { #permission_value }
+        #helper
+    })
+}
+
 /// Generates the public routed entry point and its protocol-safe local implementation.
 fn expand_core_route(
     arguments: CoreRouteArguments,
     mut function: ImplItemFn,
 ) -> syn::Result<proc_macro2::TokenStream> {
+    if let Some(output) = owned_future_output(&function.sig.output).cloned() {
+        return expand_owned_core_route(arguments, function, output);
+    }
     let original_name = function.sig.ident.clone();
     let local_name = format_ident!("__operit_core_local_{}", original_name);
     let binding_argument = arguments.binding;
     let permission = arguments.permission;
     let permission_value = permission.value();
     let argument_names = function_argument_names(&function)?;
+    let reverse_arguments = function.sig.inputs.iter().filter_map(|argument| {
+        let FnArg::Typed(argument) = argument else { return None };
+        let Type::Path(path) = argument.ty.as_ref() else { return None };
+        if path.path.segments.last()?.ident != "ReverseStream" { return None }
+        let Pat::Ident(pattern) = argument.pat.as_ref() else { return None };
+        Some(pattern.ident.clone())
+    }).collect::<Vec<_>>();
+    if reverse_arguments.len() > 1 {
+        return Err(Error::new_spanned(&function.sig, "routed methods accept one ReverseStream input"));
+    }
+    let reverse_argument = reverse_arguments.first();
+    if reverse_argument.is_some() && function.sig.asyncness.is_none() {
+        return Err(Error::new_spanned(&function.sig, "ReverseStream routes require an async method"));
+    }
     if !argument_names.iter().any(|name| name == &binding_argument) {
         return Err(Error::new(
             binding_argument.span(),
@@ -143,6 +290,7 @@ fn expand_core_route(
     let watch_helper_name = format_ident!("__operit_core_route_watch_{}", original_name);
     let route_arg_entries = argument_names
         .iter()
+        .filter(|name| reverse_argument != Some(*name))
         .map(|name| {
             quote! {
                 operit_rslink_runtime::core_arg_entry(stringify!(#name), &#name)
@@ -154,7 +302,21 @@ fn expand_core_route(
         operit_rslink_runtime::core_route_args(vec![#(#route_arg_entries),*])
     };
     let route_call_decode = route_call_decode(&function.sig.output);
-    let route_wrapper_body = if return_type_is_state_flow(&function.sig.output) {
+    let route_wrapper_body = if let Some(input) = reverse_argument {
+        quote! {
+            if let Some(__core_route_runtime) = operit_link::coreRouteRuntime() {
+                let __core_route_args_value = #route_args_value;
+                if __core_route_runtime.shouldRoute(stringify!(#original_name), &__core_route_args_value)
+                    .expect("annotated route resolution failed") {
+                    return operit_rslink_runtime::core_route_reverse_stream(
+                        __core_route_runtime.as_ref(), stringify!(#original_name),
+                        __core_route_args_value, #input,
+                    ).await.map_err(|error| error.message);
+                }
+            }
+            #call_expression
+        }
+    } else if return_type_is_state_flow(&function.sig.output) {
         let remote_flow = quote! {
             match operit_rslink_runtime::core_route_state_flow(
                 __core_route_runtime.clone(),
@@ -232,13 +394,48 @@ fn expand_core_route(
         }
     };
 
-    let route_helpers = render_route_helpers(
+    let route_helpers = if let Some(input) = reverse_argument {
+        let push_helper_name = format_ident!("__operit_core_route_push_{}", original_name);
+        let input_type = function.sig.inputs.iter().find_map(|arg| match arg {
+            FnArg::Typed(arg) if matches!(arg.pat.as_ref(), Pat::Ident(p) if p.ident == *input) => Some(arg.ty.clone()),
+            _ => None,
+        }).expect("reverse input type");
+        let decode = function.sig.inputs.iter().filter_map(|arg| match arg {
+            FnArg::Typed(arg) => match arg.pat.as_ref() {
+                Pat::Ident(p) if p.ident != *input => {
+                    let name = &p.ident; let ty = owned_decode_type(&arg.ty);
+                    Some(quote! { let #name: #ty = operit_rslink_runtime::decode_core_arg(&mut __core_args, stringify!(#name))?; })
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        quote! {
+            /// Consumes one authorized typed input using the service's local implementation.
+            #[doc(hidden)]
+            #visibility async fn #push_helper_name(
+                &mut self, request: operit_link::CorePushRequest, #input: #input_type,
+            ) -> Result<(), operit_link::CoreLinkError> {
+                let mut __core_args = operit_rslink_runtime::object_args(request.args)?;
+                #(#decode)*
+                #call_expression.map_err(|error| operit_link::CoreLinkError::internal(error.to_string()))
+            }
+
+            /// Rejects value calls to a service whose input is a ReverseStream.
+            #[doc(hidden)]
+            #visibility async fn #call_helper_name(
+                &mut self, _request: &operit_link::CoreCallRequest,
+            ) -> Result<operit_link::CoreValue, operit_link::CoreLinkError> {
+                Err(operit_link::CoreLinkError::new("REVERSE_STREAM_REQUIRES_PUSH", "ReverseStream requires the Push transport"))
+            }
+        }
+    } else { render_route_helpers(
         &function,
         &local_name,
         &call_helper_name,
         &watch_snapshot_helper_name,
         &watch_helper_name,
-    );
+    ) };
 
     function.sig = local_signature.clone();
     function.block = local_body;

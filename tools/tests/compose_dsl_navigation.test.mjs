@@ -1,3 +1,5 @@
+import { readSdkScript, wrapComposeScript } from "../runtime/compose_scripts.mjs";
+import { composeStreamFixture } from './support/compose_stream_fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
@@ -6,10 +8,7 @@ import test from 'node:test';
 const sourceRoot = new URL('../../core/crates/plugin/sdk/src/toolpkg/', import.meta.url);
 
 /** Extracts the embedded JavaScript without compiling the Rust crate. */
-function embeddedScript(name) {
-  const source = readFileSync(new URL(name, sourceRoot), 'utf8');
-  return source.slice(source.indexOf('r#"') + 3, source.lastIndexOf('"#'));
-}
+function embeddedScript(name) { return readSdkScript(name); }
 
 /** Runs the production context bridge and action wrapper with a clickable site card. */
 function createRuntime(environment = {}) {
@@ -17,20 +16,18 @@ function createRuntime(environment = {}) {
   const context = vm.createContext({
     module: { exports: {} },
     __operit_call_runtime_ref: {
+      callId: 'owner',
       /** Reads host environment storage across independent route contexts. */
       getEnv(key) { return environment[key]; },
     },
-    NativeInterface: {
-      /** Records the selected site just like the plugin's native environment call. */
-      setEnv(key, value) { environment[key] = value; },
-    },
+    __operitCurrentCallId: 'owner',
+    /** Records the selected site through the structured host value contract. */
+    __operitNativeSetEnv(owner, key, value) { assert.equal(owner, 'owner'); environment[key] = value; },
     /** Captures every intermediate response to verify commands are emitted once. */
     sendIntermediateResult(value) { events.push(value); },
   });
   vm.runInContext(embeddedScript('ToolPkgComposeDslBridge.rs'), context);
-  const wrapper = embeddedScript('ToolPkgComposeDslRuntimeScript.rs')
-    .replaceAll('{{', '{').replaceAll('}}', '}')
-    .replace('{script}', `
+  const wrapper = wrapComposeScript(`
       /** Builds a card whose async callback intentionally returns no value. */
       module.exports.default = function(ctx) {
         return ctx.UI.Card({
@@ -42,7 +39,9 @@ function createRuntime(environment = {}) {
       };
     `);
   vm.runInContext(wrapper, context);
-  return { context, events, environment };
+  const fixture = composeStreamFixture(context, { onResponse(phase, response) { if (phase === 'intermediate') events.push(response); } });
+  fixture.adapt();
+  return { context, events, environment, fixture };
 }
 
 test('clickable navigation survives an async callback with no return value', async () => {
@@ -57,7 +56,7 @@ test('clickable navigation survives an async callback with no return value', asy
   assert.deepEqual(JSON.parse(JSON.stringify(commands)), [{
     route: 'toolpkg:sites:ui:viewer', args: { id: 'doubao' },
   }]);
-  const rerendered = await context.__operit_rerender_compose_dsl({});
+  const rerendered = await context.__operit_render_compose_dsl({ __operit_update_inputs: true });
   assert.equal(rerendered.navigationCommands.length, 0);
 });
 
@@ -107,7 +106,7 @@ test('navigation preserves ordinary action results and no-render responses', asy
   const { context } = createRuntime();
   await context.__operit_render_compose_dsl({});
   const runtime = context.__operit_compose_bundle;
-  const actionId = runtime.registerAction(async () => {
+  const actionId = runtime.actions.register(async () => {
     await runtime.ctx.navigate('first', { step: 1 });
     await runtime.ctx.navigate('second', { step: 2 });
     return { accepted: true };
@@ -121,4 +120,35 @@ test('navigation preserves ordinary action results and no-render responses', asy
     { route: 'first', args: { step: 1 } },
     { route: 'second', args: { step: 2 } },
   ]);
+});
+
+
+test('navigation from a mounted effect callback streams without an action or state change', async () => {
+  const { context, events, fixture } = createRuntime();
+  vm.runInContext(`
+    module.exports.default = function(ctx) {
+      ctx.useEffect('navigation-listener', function() {
+        globalThis.openWorkspace = function() {
+          return Promise.resolve().then(function() {
+            return ctx.navigate('toolpkg:review:ui:workspace', { file: 'a.ts' });
+          });
+        };
+        return function() { delete globalThis.openWorkspace; };
+      }, []);
+      return ctx.UI.Text({ text: 'Mounted' });
+    };
+  `, context);
+  await context.__operit_render_compose_dsl({});
+  const before = JSON.stringify(context.__operit_compose_bundle.stateStore);
+  await context.openWorkspace();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(JSON.stringify(context.__operit_compose_bundle.stateStore), before);
+  assert.deepEqual(fixture.errors, []);
+  const commands = events.flatMap(event => event.navigationCommands);
+  assert.deepEqual(JSON.parse(JSON.stringify(commands)), [{
+    route: 'toolpkg:review:ui:workspace', args: { file: 'a.ts' },
+  }]);
+  assert.equal(events.find(event => event.navigationCommands.length > 0).update, undefined);
+  const refreshed = await context.__operit_render_compose_dsl({ __operit_update_inputs: true });
+  assert.equal(refreshed.navigationCommands.length, 0);
 });

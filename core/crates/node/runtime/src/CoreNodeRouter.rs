@@ -1,27 +1,20 @@
+use crate::PeerSync::{PeerSyncMethod, NODE_SYNC_TARGET};
 use async_trait::async_trait;
-use operit_access_runtime::CoreNodePeerLink::{
-    activePeerNodeIds, peerLink, CoreNodeLinkClient, PeerLinkClient, RoutedCoreRequest,
-    RoutedCoreRequestKind,
-};
+use operit_link::{RoutedCoreRequest, RoutedCoreRequestKind};
+use crate::RuntimePeerService::RuntimePeerService;
+use crate::NodeServices::{NodeServices, PairingDirection};
+use crate::space_policy::RoutingPolicy;
 use operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost;
 use operit_host_api::RuntimeStorageHost;
 use operit_link::route_runtime::CoreRouteRuntime;
-use operit_link::{
-    CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream, CoreLinkClient,
-    CoreLinkError, CoreLinkPushSession, CoreLinkSharedClient, CorePushItem, CorePushRequest,
-    CoreValue, CoreWatchRequest, CORE_INTERNAL_TARGET,
-    CORE_ROUTE_STREAM_SOURCE_ARGS_ARGUMENT, CORE_ROUTE_STREAM_SOURCE_METHOD_ARGUMENT,
-    CORE_ROUTE_STREAM_SOURCE_MODE_ARGUMENT, CORE_STREAM_TARGET,
-};
+use operit_link::{CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream, CoreLinkClient, CoreLinkError, CoreLinkPushSession, CoreLinkSharedClient, CorePushItem, CorePushRequest, CoreValue, CoreWatchRequest, CORE_INTERNAL_TARGET, CORE_ROUTE_STREAM_SOURCE_ARGS_ARGUMENT, CORE_ROUTE_STREAM_SOURCE_METHOD_ARGUMENT, CORE_ROUTE_STREAM_SOURCE_MODE_ARGUMENT, CORE_STREAM_TARGET};
 use operit_store::CoreNodeBindingStore::{CoreNodeBindingRecord, CoreNodeBindingStore};
 use operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore;
-use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceStore};
+use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceRoutePlan, CoreSpaceStore};
 use operit_store::NetworkControlStore::NetworkControlStore;
 use operit_store::PreferencesDataStore::StateFlow;
 use serde::{Deserialize, Serialize};
-use operit_tools::runtime_support::{
-    CoreNodeToolRuntime, RuntimeCoreNodeRouteState, RuntimeCoreNodeStatus,
-};
+use operit_tools::runtime_support::{CoreNodeToolRuntime, RuntimeCoreNodeRouteState, RuntimeCoreNodeStatus};
 use operit_util::AppLogger::{AppLogger, VERBOSE_LEVEL_5, VERBOSE_LEVEL_6};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -30,9 +23,18 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
 use crate::GeneratedCoreRoute;
-use crate::SpaceRuntime::SpaceRuntime;
+use crate::RuntimeRemoteLinkService::{
+    RuntimeRemoteLinkService, NODE_SPACE_APPROVAL_TARGET, NODE_SPACE_TARGET,
+};
 
-const ROUTED_BINDING_WATCH_RECHECK_DELAY_MS: u64 = 50;
+#[path = "peer/sync_dispatch.rs"]
+mod sync_dispatch;
+#[path = "route_forwarding.rs"]
+mod route_forwarding;
+use route_forwarding::{requireRouteMember, requireRoutableTarget, RouteParticipant};
+#[path = "device_tools.rs"]
+mod device_tools;
+use operit_tools::tools::DeviceTools::{DeviceToolService, DEVICE_TOOL_TARGET};
 
 /// Reports both persisted ownership and the device currently selected by routing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +63,8 @@ struct CoreNodePushState {
 /// Routes incoming Core Link traffic through CoreNode Binding and Space routing state.
 #[derive(Clone)]
 pub struct CoreNodeRouter {
+    deviceToolService: Arc<std::sync::OnceLock<Arc<dyn DeviceToolService>>>,
+    peerServices: Arc<std::sync::OnceLock<NodeServices>>,
     localCore: Arc<CoreNodeLocalRuntime>,
     bindingStore: Arc<dyn CoreNodeBindingRuntime>,
     localNodeId: String,
@@ -71,6 +75,7 @@ pub struct CoreNodeRouter {
 /// Carries local Core capabilities into the server-side Space router.
 #[derive(Clone)]
 pub struct CoreNodeLocalRuntime {
+    peerServices: Arc<std::sync::OnceLock<NodeServices>>,
     sharedClient: Arc<dyn CoreLinkSharedClient + Send + Sync>,
     applicationClient: Arc<dyn CoreLinkSharedClient + Send + Sync>,
     runtimeStorageHost: Arc<dyn RuntimeStorageHost>,
@@ -82,7 +87,7 @@ pub struct CoreNodeLocalRuntime {
             + Send
             + Sync,
     >,
-    spaceRuntime: Arc<SpaceRuntime>,
+    spaceRuntime: Arc<dyn CoreLinkSharedClient + Send + Sync>,
 }
 
 impl CoreNodeLocalRuntime {
@@ -100,9 +105,10 @@ impl CoreNodeLocalRuntime {
                 + Send
                 + Sync,
         >,
-        spaceRuntime: Arc<SpaceRuntime>,
+        spaceRuntime: Arc<dyn CoreLinkSharedClient + Send + Sync>,
     ) -> Self {
         Self {
+            peerServices: Arc::new(std::sync::OnceLock::new()),
             sharedClient,
             applicationClient,
             runtimeStorageHost,
@@ -113,10 +119,21 @@ impl CoreNodeLocalRuntime {
         }
     }
 
+    /// 生成 Proxy 和应用 Router 共享已注入的通信实例；不新建会话仓库。
+    pub fn withPeerServices(mut self, services: Arc<std::sync::OnceLock<NodeServices>>) -> Self {
+        self.peerServices = services;
+        self
+    }
+
     /// Returns the storage host owned by the local Core.
     #[allow(non_snake_case)]
     pub fn runtimeStorageHost(&self) -> Arc<dyn RuntimeStorageHost> {
         self.runtimeStorageHost.clone()
+    }
+
+    /// Facades share execution state only within the same application instance.
+    pub(crate) fn sharesApplicationWith(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.applicationClient, &other.applicationClient)
     }
 
     /// Resolves one generated Core schema to the local numeric object ID.
@@ -136,23 +153,41 @@ impl CoreNodeLocalRuntime {
 
     /// Executes one local Core call through the local shared client.
     pub async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
+        let context = format!("Space request {}::{} [{}]", request.target, request.methodName, request.requestId.0);
+        let correlation = request.requestId.clone();
+        crate::fault_isolation::call(&context, correlation, async {
         self.sharedClient.call(request).await
+
+        }).await
     }
 
     /// Executes one local application call without entering the Core service dispatcher.
     pub async fn callApplication(&self, request: CoreCallRequest) -> CoreCallResponse {
+        let context = format!("Space request {}::{} [{}]", request.target, request.methodName, request.requestId.0);
+        let correlation = request.requestId.clone();
+        crate::fault_isolation::call(&context, correlation, async {
         self.applicationClient.call(request).await
+
+        }).await
     }
 
     /// Reads one local Core watch snapshot through the local shared client.
     #[allow(non_snake_case)]
     async fn watchSnapshot(&self, request: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.target, request.propertyName, request.requestId.0);
+        crate::fault_isolation::link(&context, async {
         self.sharedClient.watchSnapshot(request).await
+
+        }).await
     }
 
     /// Opens one local Core watch through the local shared client.
     async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.target, request.propertyName, request.requestId.0);
+        crate::fault_isolation::link(&context, async {
         self.sharedClient.watch(request).await
+
+        }).await
     }
 
     /// Opens one local Core push through the supplied capability.
@@ -166,7 +201,12 @@ impl CoreNodeLocalRuntime {
 
     /// Executes one Space call in the server-owned Space route namespace.
     pub(crate) async fn callSpace(&self, request: CoreCallRequest) -> CoreCallResponse {
+        let context = format!("Space request {}::{} [{}]", request.target, request.methodName, request.requestId.0);
+        let correlation = request.requestId.clone();
+        crate::fault_isolation::call(&context, correlation, async {
         self.spaceRuntime.call(request).await
+
+        }).await
     }
 
     /// Reads one Space watch snapshot in the server-owned Space route namespace.
@@ -174,7 +214,11 @@ impl CoreNodeLocalRuntime {
         &self,
         request: CoreWatchRequest,
     ) -> Result<CoreEvent, CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.target, request.propertyName, request.requestId.0);
+        crate::fault_isolation::link(&context, async {
         self.spaceRuntime.watchSnapshot(request).await
+
+        }).await
     }
 
     /// Opens one Space watch in the server-owned Space route namespace.
@@ -182,18 +226,19 @@ impl CoreNodeLocalRuntime {
         &self,
         request: CoreWatchRequest,
     ) -> Result<CoreEventStream, CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.target, request.propertyName, request.requestId.0);
+        crate::fault_isolation::link(&context, async {
         self.spaceRuntime.watch(request).await
+
+        }).await
     }
 
     /// Opens one Space push in the server-owned Space route namespace.
-    fn openSpacePush(
+    async fn openSpacePush(
         &self,
         request: CorePushRequest,
     ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
-        Err(CoreLinkError::new(
-            "SPACE_PUSH_NOT_REGISTERED",
-            format!("Space push route is not registered: {}", request.methodName),
-        ))
+        self.spaceRuntime.openPush(request).await
     }
 }
 
@@ -230,11 +275,30 @@ impl CoreNodeBindingRuntime for CoreNodeBindingStore {
 }
 
 impl CoreNodeRouter {
+    /// 由应用装配一次；所有 Router 克隆与外围共享同一个节点服务。
+    pub fn installNodeServices(&self, services: NodeServices) -> Result<(), String> {
+        self.peerServices.set(services).map_err(|_| "Node services are already installed".into())
+    }
+
+
+    /// 同步和业务服务读取同一节点服务；未装配时明确报错，不退回旧全局连接表。
+    pub fn nodeServices(&self) -> Result<&NodeServices, String> {
+        self.peerServices.get().ok_or_else(|| "Node services are not installed".into())
+    }
+
+    /// Largest encoded Link message one direct peer connection can carry.
+    /// Callers that build their own payloads size them against this ceiling;
+    /// an uninstalled peer service falls back to the documented default.
+    pub fn maxPeerMessageBytes(&self) -> usize {
+        self.nodeServices()
+            .map(|services| services.peers().maxMessageBytes())
+            .unwrap_or(operit_peer_link::DEFAULT_MAX_PEER_MESSAGE_BYTES)
+    }
+
     /// Creates a router over the local Core and its runtime-owned Link Access records.
-    pub fn new(localCore: CoreNodeLocalRuntime) -> Self {
+    pub fn new(localCore: CoreNodeLocalRuntime) -> Result<Self, String> {
         let bindingStore = Arc::new(
-            CoreNodeBindingStore::new(localCore.runtimeStorageHost())
-                .expect("CoreNodeRouter requires persistent Binding storage"),
+            CoreNodeBindingStore::new(localCore.runtimeStorageHost())? ,
         );
         Self::newWithRuntime(Arc::new(localCore), bindingStore)
     }
@@ -244,25 +308,27 @@ impl CoreNodeRouter {
     fn newWithRuntime(
         localCore: Arc<CoreNodeLocalRuntime>,
         bindingStore: Arc<dyn CoreNodeBindingRuntime>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let localNodeId = CoreNodeIdentityStore::new(localCore.runtimeStorageHost())
-            .initialize()
-            .expect("CoreNodeRouter requires a CoreNode identity")
+            .initialize()?
             .nodeId;
         let spaceStore = CoreSpaceStore::new(localCore.runtimeStorageHost());
-        let networkControlStore = NetworkControlStore::new(localCore.runtimeStorageHost())
-            .expect("CoreNodeRouter requires network control storage");
-        spaceStore
-            .initialize()
-            .expect("CoreNodeRouter requires an initialized Space");
+        let networkControlStore = NetworkControlStore::withLocalNodeId(localCore.runtimeStorageHost(), localNodeId.clone());
+        if let Err(error) = crate::fault_isolation::run("initialize Space membership", || spaceStore.initialize().map(|_| ())) {
+            AppLogger::w("CoreNodeRouter", &error);
+        }
+        let peerServices = localCore.peerServices.clone();
         localCore
             .bindCoreNodeToolRuntime(Arc::new(CoreNodeToolRouteRuntime {
+                peerServices: peerServices.clone(),
                 localNodeId: localNodeId.clone(),
                 spaceStore: spaceStore.clone(),
                 networkControlStore: networkControlStore.clone(),
             }))
-            .expect("CoreNodeRouter requires tool routing state registration");
+            .map_err(|error| error.to_string())?;
         let router = Self {
+            deviceToolService: Arc::new(std::sync::OnceLock::new()),
+            peerServices,
             localCore,
             bindingStore,
             localNodeId,
@@ -270,7 +336,7 @@ impl CoreNodeRouter {
             networkControlStore,
         };
         operit_link::installCoreRouteRuntime(Arc::new(router.clone()));
-        router
+        Ok(router)
     }
 
     /// Returns the stable identity of the CoreNode that owns this router.
@@ -283,6 +349,21 @@ impl CoreNodeRouter {
     #[allow(non_snake_case)]
     pub fn targetForSchema(&self, schema: &str) -> Option<&'static str> {
         self.localCore.targetForSchema(schema)
+    }
+
+    /// Test support: installs a minimal application call client so contract
+    /// fixtures can exercise persistence synchronization without the full
+    /// application runtime. Must run before the router is wired into endpoints.
+    #[cfg(test)]
+    pub(crate) fn installTestApplicationClient(
+        &mut self,
+        client: Arc<dyn operit_link::CoreLinkSharedClient + Send + Sync>,
+    ) {
+        let runtime = Arc::make_mut(&mut self.localCore);
+        runtime.targetForSchema = Arc::new(|schema: &str| {
+            if schema == "application" { Some("core/server.application") } else { None }
+        });
+        runtime.applicationClient = client;
     }
 
     /// Opens a push stream whose CoreNode route remains fixed for its lifetime.
@@ -402,7 +483,7 @@ impl CoreNodeRouter {
         let subscription = operit_store::SyncOperationStore::subscribeSyncMutations(move || {
             let _ = changes.try_send(());
         });
-        let mut peers = operit_access_runtime::CoreNodePeerLink::subscribePeerLinkChanges();
+        let mut peers = self.nodeServices()?.peers().subscribePeerChanges();
         let state = StateFlow::new(Some(self.bindingRouteStatus(key.clone())?));
         let (stop, mut stopped) = oneshot::channel::<()>();
         let observed = state.map(move |value| { let _keepAlive = &stop; value });
@@ -440,6 +521,7 @@ impl CoreNodeRouter {
         targetNodeId: &str,
     ) -> Result<(), CoreLinkError> {
         let capability = route.permissionCapability;
+        if capability.is_empty() { return Ok(()); }
         let (subject, subjectNodeId) = match route.permissionScope {
             crate::GeneratedRoutePermissionSubject::Caller => ("caller", callerNodeId),
             crate::GeneratedRoutePermissionSubject::Target => ("target", targetNodeId),
@@ -531,14 +613,40 @@ impl CoreNodeRouter {
         };
         self.requireRoutePermission(&route, callerNodeId, targetNodeId)
     }
+    /// A transport grant is usable only after both memberships have been
+    /// admitted by the current Space control log; mere pairing is insufficient.
+    pub(crate) fn spaceChannelScope(&self, peer: &str) -> Result<Option<String>, CoreLinkError> {
+        crate::space_policy::spaceChannelScope(&self.networkControlStore, &self.localNodeId, peer)
+    }
+
     /// Reports whether the active Peer Link graph currently proves one device reachable.
     #[allow(non_snake_case)]
     pub fn nodeIsReachable(&self, targetNodeId: &str) -> Result<bool, String> {
-        coreNodeIsReachable(
+        if targetNodeId == self.localNodeId { return Ok(true); }
+        let peers = self.nodeServices()?.peers().activePeerNodeIds().map_err(|error| error.to_string())?;
+        coreNodeIsReachableThroughPeers(
             &self.localNodeId,
             &self.spaceStore,
             &self.networkControlStore,
             targetNodeId,
+            &peers,
+        )
+    }
+
+    /// Resolves the multi-hop route plan this device would use for one Space member.
+    ///
+    /// `None` covers the local device itself, a policy-disconnected member, a node outside
+    /// the current Space, and any member the active Peer Link graph cannot reach.
+    #[allow(non_snake_case)]
+    pub fn nodeRoutePlan(&self, targetNodeId: &str) -> Result<Option<CoreSpaceRoutePlan>, String> {
+        if targetNodeId == self.localNodeId { return Ok(None); }
+        let peers = self.nodeServices()?.peers().activePeerNodeIds().map_err(|error| error.to_string())?;
+        coreNodeRoutePlanThroughPeers(
+            &self.localNodeId,
+            &self.spaceStore,
+            &self.networkControlStore,
+            targetNodeId,
+            &peers,
         )
     }
 
@@ -583,22 +691,8 @@ impl CoreNodeRouter {
                 "Explicit routed target is the local CoreNode",
             ));
         }
-        if !space.members.iter().any(|member| member == &targetNodeId) {
-            return Err(CoreLinkError::new(
-                "CORE_NODE_NOT_IN_SPACE",
-                format!("CoreNode is not a Space member: {targetNodeId}"),
-            ));
-        }
-        if self
-            .networkControlStore
-            .nodeIsDisconnected(&targetNodeId)
-            .map_err(CoreLinkError::internal)?
-        {
-            return Err(CoreLinkError::new(
-                "CORE_NODE_REVOKED",
-                format!("CoreNode is revoked from routing: {targetNodeId}"),
-            ));
-        }
+        let policy = RoutingPolicy::load(&self.networkControlStore).map_err(CoreLinkError::internal)?;
+        requireRouteMember(&space, &policy, &targetNodeId, RouteParticipant::Target)?;
         let ttl = routeTtl(&space)?;
         Ok(RoutedCoreRequest {
             spaceId: space.spaceId.clone(),
@@ -608,15 +702,6 @@ impl CoreNodeRouter {
             routeKind: RoutedCoreRequestKind::Target,
             payload,
         })
-    }
-
-    /// Builds the initial envelope for one annotation-addressed Space request.
-    fn initialSpaceRoute<T>(
-        &self,
-        targetNodeId: String,
-        payload: T,
-    ) -> Result<RoutedCoreRequest<T>, CoreLinkError> {
-        self.initialSpaceRouteWithOrigin(targetNodeId, payload, self.localNodeId.clone())
     }
 
     /// Builds one Space route envelope while preserving its original caller identity.
@@ -638,43 +723,10 @@ impl CoreNodeRouter {
         previousNodeId: Option<&str>,
         excludedPeerNodeIds: &BTreeSet<String>,
         mut request: RoutedCoreRequest<T>,
-    ) -> Result<(PeerLinkClient, RoutedCoreRequest<T>), CoreLinkError> {
-        let space = self
-            .spaceStore
-            .initialize()
-            .map_err(CoreLinkError::internal)?;
-        if request.spaceId != space.spaceId {
-            return Err(CoreLinkError::new(
-                "SPACE_ID_MISMATCH",
-                format!(
-                    "Routed request targets Space {}, local Space is {}",
-                    request.spaceId, space.spaceId
-                ),
-            ));
-        }
-        if !space
-            .members
-            .iter()
-            .any(|member| member == &request.targetNodeId)
-        {
-            return Err(CoreLinkError::new(
-                "CORE_NODE_NOT_IN_SPACE",
-                format!("CoreNode is not a Space member: {}", request.targetNodeId),
-            ));
-        }
-        if self
-            .networkControlStore
-            .nodeIsDisconnected(&request.targetNodeId)
-            .map_err(CoreLinkError::internal)?
-        {
-            return Err(CoreLinkError::new(
-                "CORE_NODE_REVOKED",
-                format!(
-                    "Routed request targets a revoked CoreNode: {}",
-                    request.targetNodeId
-                ),
-            ));
-        }
+    ) -> Result<(Arc<dyn RuntimePeerService>, String, RoutedCoreRequest<T>), CoreLinkError> {
+        let space = self.requireRouteSpace(&request.spaceId)?;
+        let policy = RoutingPolicy::load(&self.networkControlStore).map_err(CoreLinkError::internal)?;
+        requireRouteMember(&space, &policy, &request.targetNodeId, RouteParticipant::Target)?;
         if request.ttl == 0 {
             return Err(CoreLinkError::new(
                 "CORE_NODE_ROUTE_TTL_EXHAUSTED",
@@ -685,17 +737,12 @@ impl CoreNodeRouter {
             request.targetNodeId.clone(),
             previousNodeId,
             excludedPeerNodeIds,
+            &policy,
         )?;
-        if previousNodeId == Some(nextNodeId.as_str()) {
-            return Err(CoreLinkError::new(
-                "CORE_NODE_ROUTE_LOOP",
-                format!("Routed Core request would return to {nextNodeId}"),
-            ));
-        }
         request.ttl -= 1;
-        let peer = peerLink(&self.localNodeId, &nextNodeId)
-            .map_err(|error| CoreLinkError::new("PEER_LINK_CLOSED", error))?;
-        Ok((peer, request))
+        let services = self.peerServices.get().ok_or_else(||
+            CoreLinkError::new("PEER_SERVICE_UNAVAILABLE", "RuntimePeerService has not been installed"))?;
+        Ok((services.peers(), nextNodeId, request))
     }
 
     /// Resolves one active first hop after removing previous and failed adjacent devices.
@@ -705,30 +752,18 @@ impl CoreNodeRouter {
         targetNodeId: String,
         previousNodeId: Option<&str>,
         excludedPeerNodeIds: &BTreeSet<String>,
+        policy: &RoutingPolicy,
     ) -> Result<String, CoreLinkError> {
-        let mut peers = activePeerNodeIds(&self.localNodeId).map_err(CoreLinkError::internal)?;
+        let mut peers = self.nodeServices().map_err(CoreLinkError::internal)?.peers().activePeerNodeIds()?;
         if let Some(previousNodeId) = previousNodeId {
             peers.remove(previousNodeId);
         }
         for peerNodeId in excludedPeerNodeIds {
             peers.remove(peerNodeId);
         }
-        let (blockedNodeIds, transitNodeIds) = self
-            .networkControlStore
-            .routingPolicySnapshot()
-            .map_err(CoreLinkError::internal)?;
-        for peerNodeId in blockedNodeIds {
-            peers.remove(&peerNodeId);
-        }
         let activePeers = peers.iter().cloned().collect::<Vec<_>>();
-        let nextHop = self
-            .spaceStore
-            .reachableNextHopThroughPeersWithTransitNodes(
-                targetNodeId.clone(),
-                peers,
-                transitNodeIds,
-            )
-            .map_err(CoreLinkError::internal)?;
+        let nextHop = policy.routePlan(&self.localNodeId, &self.spaceStore, &targetNodeId, &peers)
+            .map_err(CoreLinkError::internal)?.map(|plan| plan.firstHop().to_owned());
         if nextHop.is_none() {
             AppLogger::v_with_level(
                 "CoreNodeRouter",
@@ -747,92 +782,33 @@ impl CoreNodeRouter {
         })
     }
 
+    fn requireRouteSpace(&self, spaceId: &str) -> Result<CoreSpace, CoreLinkError> {
+        let space = self.spaceStore.initialize().map_err(CoreLinkError::internal)?;
+        if spaceId != space.spaceId {
+            return Err(CoreLinkError::new(
+                "SPACE_ID_MISMATCH",
+                format!("Routed request targets Space {spaceId}, local Space is {}", space.spaceId),
+            ));
+        }
+        Ok(space)
+    }
+
     /// Validates an incoming routed envelope and reports whether this CoreNode is the target.
     fn validateIncomingRoute<T>(
         &self,
         previousNodeId: &str,
         request: &RoutedCoreRequest<T>,
     ) -> Result<bool, CoreLinkError> {
-        let space = self
-            .spaceStore
-            .initialize()
-            .map_err(CoreLinkError::internal)?;
-        if request.spaceId != space.spaceId {
-            return Err(CoreLinkError::new(
-                "SPACE_ID_MISMATCH",
-                format!(
-                    "Routed request targets Space {}, local Space is {}",
-                    request.spaceId, space.spaceId
-                ),
-            ));
+        let space = self.requireRouteSpace(&request.spaceId)?;
+        let policy = RoutingPolicy::load(&self.networkControlStore).map_err(CoreLinkError::internal)?;
+        for (node, role) in [
+            (previousNodeId, RouteParticipant::Previous),
+            (request.originNodeId.as_str(), RouteParticipant::Origin),
+            (request.targetNodeId.as_str(), RouteParticipant::Target),
+        ] {
+            requireRouteMember(&space, &policy, node, role)?;
         }
-        if !space.members.iter().any(|member| member == previousNodeId) {
-            return Err(CoreLinkError::new(
-                "PREVIOUS_CORE_NODE_NOT_IN_SPACE",
-                format!("Previous CoreNode is not a Space member: {previousNodeId}"),
-            ));
-        }
-        if self
-            .networkControlStore
-            .nodeIsDisconnected(previousNodeId)
-            .map_err(CoreLinkError::internal)?
-        {
-            return Err(CoreLinkError::new(
-                "PREVIOUS_CORE_NODE_REVOKED",
-                format!("Previous CoreNode is revoked: {previousNodeId}"),
-            ));
-        }
-        if !space
-            .members
-            .iter()
-            .any(|member| member == &request.originNodeId)
-        {
-            return Err(CoreLinkError::new(
-                "ORIGIN_CORE_NODE_NOT_IN_SPACE",
-                format!(
-                    "Origin CoreNode is not a Space member: {}",
-                    request.originNodeId
-                ),
-            ));
-        }
-        if self
-            .networkControlStore
-            .nodeIsDisconnected(&request.originNodeId)
-            .map_err(CoreLinkError::internal)?
-        {
-            return Err(CoreLinkError::new(
-                "ORIGIN_CORE_NODE_REVOKED",
-                format!(
-                    "Origin CoreNode is revoked: {}",
-                    request.originNodeId
-                ),
-            ));
-        }
-        if !space
-            .members
-            .iter()
-            .any(|member| member == &request.targetNodeId)
-        {
-            return Err(CoreLinkError::new(
-                "CORE_NODE_NOT_IN_SPACE",
-                format!("CoreNode is not a Space member: {}", request.targetNodeId),
-            ));
-        }
-        if self
-            .networkControlStore
-            .nodeIsDisconnected(&request.targetNodeId)
-            .map_err(CoreLinkError::internal)?
-        {
-            return Err(CoreLinkError::new(
-                "CORE_NODE_REVOKED",
-                format!(
-                    "Routed request targets a revoked CoreNode: {}",
-                    request.targetNodeId
-                ),
-            ));
-        }
-        let atTarget = request.targetNodeId == self.localNodeId;
-        Ok(atTarget)
+        Ok(request.targetNodeId == self.localNodeId)
     }
 
     /// Executes one call on an explicit target CoreNode.
@@ -842,6 +818,28 @@ impl CoreNodeRouter {
         targetNodeId: String,
         request: CoreCallRequest,
     ) -> CoreCallResponse {
+        if request.target == NODE_SPACE_TARGET {
+            let requestId = request.requestId.clone();
+            if let Err(error) = self.requireDirectPeer(&targetNodeId, PairingDirection::Either) {
+                return CoreCallResponse::err(requestId, error);
+            }
+            let space = match self.spaceStore.initialize() {
+                Ok(space) => space,
+                Err(error) => return CoreCallResponse::err(requestId, CoreLinkError::internal(error)),
+            };
+            let peers = match self.nodeServices() {
+                Ok(services) => services.peers(),
+                Err(error) => return CoreCallResponse::err(requestId, CoreLinkError::internal(error)),
+            };
+            return peers.call(&targetNodeId, RoutedCoreRequest {
+                spaceId: space.spaceId,
+                originNodeId: self.localNodeId.clone(),
+                targetNodeId: targetNodeId.clone(),
+                ttl: 0,
+                routeKind: RoutedCoreRequestKind::Target,
+                payload: request,
+            }).await;
+        }
         self.callNodeWithKind(targetNodeId, request, RoutedCoreRequestKind::Target)
             .await
     }
@@ -890,32 +888,88 @@ impl CoreNodeRouter {
             Ok(value) => value,
             Err(error) => return CoreCallResponse::err(requestId, error),
         };
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRoute) =
-                match self.forwardRouteAvoiding(None, &excludedPeerNodeIds, route.clone()) {
-                    Ok(value) => value,
-                    Err(error) => return CoreCallResponse::err(requestId, error),
-                };
-            let peerNodeId = peer.peerNodeId();
-            let response = peer.routedCall(forwardedRoute).await;
-            if response
-                .result
-                .as_ref()
-                .err()
-                .map(isRouteUnavailableError)
-                .unwrap_or(false)
-            {
-                excludedPeerNodeIds.insert(peerNodeId);
-                continue;
-            }
-            return response;
-        }
+        self.forwardCall(None, route).await
     }
 
     /// Executes one annotation-addressed Space call through Binding-selected routing.
     pub async fn callSpace(&self, request: CoreCallRequest) -> CoreCallResponse {
         self.callSpaceWithOrigin(request, self.localNodeId.clone()).await
+    }
+
+    /// Sends one best-effort same-Space envelope along an explicitly chosen first hop.
+    ///
+    /// Removal notices are the only caller. After one removal the target may
+    /// already be outside this device's membership view, and the hop may have
+    /// lost its transit licence while it still holds the links this device no
+    /// longer resolves. Every receiving node keeps its normal per-hop checks:
+    /// the envelope still carries this device as the origin, and each hop
+    /// validates the previous device against its own Space policy.
+    #[allow(non_snake_case)]
+    pub(crate) async fn sendSpaceEnvelopeAlongHop(
+        &self,
+        firstHop: &str,
+        targetNodeId: &str,
+        request: CoreCallRequest,
+    ) -> CoreCallResponse {
+        let requestId = request.requestId.clone();
+        let space = match self.spaceStore.initialize() {
+            Ok(space) => space,
+            Err(error) => return CoreCallResponse::err(requestId, CoreLinkError::internal(error)),
+        };
+        let ttl = match routeTtl(&space) {
+            Ok(ttl) => ttl,
+            Err(error) => return CoreCallResponse::err(requestId, error),
+        };
+        let route = RoutedCoreRequest {
+            spaceId: space.spaceId,
+            originNodeId: self.localNodeId.clone(),
+            targetNodeId: targetNodeId.to_string(),
+            ttl,
+            routeKind: RoutedCoreRequestKind::Target,
+            payload: request,
+        };
+        match self.nodeServices() {
+            Ok(services) => services.peers().call(firstHop, route).await,
+            Err(error) => CoreCallResponse::err(requestId, CoreLinkError::internal(error)),
+        }
+    }
+
+    /// Allocate bindings only for explicit creation commands on a capable executor.
+    async fn prepareCreationBinding(&self, route: &crate::GeneratedSpaceRoute, key: &str,
+        origin: &str) -> Result<(), CoreLinkError> {
+        if route.createBindingCapability.is_empty() { return Ok(()); }
+        self.requireRoutePermission(route, origin, &self.localNodeId)?;
+        let profiles = self.spaceStore.deviceProfiles().map_err(CoreLinkError::internal)?;
+        let bindings = CoreNodeBindingStore::new(self.localCore.runtimeStorageHost()).map_err(CoreLinkError::internal)?;
+        let commit = if let Some(binding) = bindings.bindingOptional(key).map_err(CoreLinkError::internal)? {
+            if !profiles.get(&binding.nodeId).is_some_and(|profile| profile.coreVersion.is_some())
+                || !self.networkControlStore.nodeHasCapability(&binding.nodeId, route.createBindingCapability, None).map_err(CoreLinkError::internal)? {
+                return Err(CoreLinkError::new("ROUTE_UNAVAILABLE", "Binding target cannot host Core execution"));
+            }
+            bindings.compareAndSet(key, &binding.nodeId, &binding.nodeId).map_err(CoreLinkError::internal)?
+        } else {
+            let mut members = self.spaceStore.space().map_err(CoreLinkError::internal)?.members;
+            members.sort_by_key(|id| (id != &self.localNodeId, id.clone()));
+            let mut selected = None;
+            for member in members {
+                if profiles.get(&member).is_some_and(|profile| profile.coreVersion.is_some())
+                    && self.networkControlStore.nodeHasCapability(&member, route.createBindingCapability, None).map_err(CoreLinkError::internal)?
+                    && (member == self.localNodeId || self.nodeIsReachable(&member).map_err(CoreLinkError::internal)?) {
+                    selected = Some(member); break;
+                }
+            }
+            let target = selected.ok_or_else(|| CoreLinkError::new("ROUTE_UNAVAILABLE", "No reachable node has the required execution capability"))?;
+            bindings.create(key, &target).map_err(CoreLinkError::internal)?
+        };
+        if commit.binding.nodeId != self.localNodeId {
+            let args = operit_link::toCoreValue(serde_json::json!({"operation": commit.operation}))
+                .map_err(|error| CoreLinkError::internal(error.to_string()))?;
+            let request = PeerSyncMethod::SyncApplyImmediateBindingOperation.request(
+                operit_link::nextCoreRouteRequestId("binding-install"), args,
+            );
+            Box::pin(self.callNode(commit.binding.nodeId, request)).await.result?;
+        }
+        Ok(())
     }
 
     /// Executes one Space call while preserving its original caller identity.
@@ -941,6 +995,9 @@ impl CoreNodeRouter {
             Ok(value) => value,
             Err(error) => return CoreCallResponse::err(requestId, error),
         };
+        if let Err(error) = self.prepareCreationBinding(&route, &bindingKey, &originNodeId).await {
+            return CoreCallResponse::err(requestId, error);
+        }
         let targetNodeId = match self
             .routeNodeId(GeneratedCoreRoute::Binding {
                 scope: 0,
@@ -985,18 +1042,7 @@ impl CoreNodeRouter {
         originNodeId: String,
     ) -> Result<CoreEvent, CoreLinkError> {
         let route = self.initialRouteWithOrigin(targetNodeId, request, originNodeId)?;
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRoute) =
-                self.forwardRouteAvoiding(None, &excludedPeerNodeIds, route.clone())?;
-            let peerNodeId = peer.peerNodeId();
-            match peer.routedWatchSnapshot(forwardedRoute).await {
-                Err(error) if isRouteUnavailableError(&error) => {
-                    excludedPeerNodeIds.insert(peerNodeId);
-                }
-                result => return result,
-            }
-        }
+        self.forwardWatchSnapshot(None, route).await
     }
 
     /// Opens one watch on an explicit target CoreNode.
@@ -1018,18 +1064,7 @@ impl CoreNodeRouter {
         originNodeId: String,
     ) -> Result<CoreEventStream, CoreLinkError> {
         let route = self.initialRouteWithOrigin(targetNodeId, request, originNodeId)?;
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRoute) =
-                self.forwardRouteAvoiding(None, &excludedPeerNodeIds, route.clone())?;
-            let peerNodeId = peer.peerNodeId();
-            match peer.routedWatch(forwardedRoute).await {
-                Err(error) if isRouteUnavailableError(&error) => {
-                    excludedPeerNodeIds.insert(peerNodeId);
-                }
-                result => return result,
-            }
-        }
+        self.forwardWatch(None, route).await
     }
 
     /// Reads one annotation-addressed Space watch snapshot through Binding routing.
@@ -1154,7 +1189,11 @@ impl CoreNodeRouter {
                 request.requestId.0, streamId, route.methodName, self.localNodeId, targetNodeId
             ),
         );
-        self.watchBindingNode(targetNodeId, request, originNodeId).await
+        // A response is a logical watch too: opening during peer admission or
+        // losing its physical connection must not permanently end the UI stream.
+        // The producer's explicit Completed event remains terminal (unlike a
+        // StateFlow segment completing when it needs to be rebound).
+        self.watchBindingFlow(bindingKey, request, originNodeId, None)
     }
 
     /// Opens one push on an explicit target CoreNode.
@@ -1165,27 +1204,7 @@ impl CoreNodeRouter {
         request: CorePushRequest,
     ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
         let route = self.initialRoute(targetNodeId, request)?;
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRoute) =
-                self.forwardRouteAvoiding(None, &excludedPeerNodeIds, route.clone())?;
-            let peerNodeId = peer.peerNodeId();
-            match peer.routedOpenPush(forwardedRoute).await {
-                Err(error) if isRouteUnavailableError(&error) => {
-                    excludedPeerNodeIds.insert(peerNodeId);
-                }
-                result => return result,
-            }
-        }
-    }
-
-    /// Reads one Space watch snapshot on an explicit CoreNode.
-    async fn watchNodeSnapshotSpace(
-        &self,
-        targetNodeId: String,
-        request: CoreWatchRequest,
-    ) -> Result<CoreEvent, CoreLinkError> {
-        self.watchNodeSnapshotSpaceWithOrigin(targetNodeId, request, self.localNodeId.clone()).await
+        self.forwardPush(None, route).await
     }
 
     /// Reads one Space watch snapshot while preserving its original caller identity.
@@ -1196,27 +1215,7 @@ impl CoreNodeRouter {
         originNodeId: String,
     ) -> Result<CoreEvent, CoreLinkError> {
         let route = self.initialSpaceRouteWithOrigin(targetNodeId, request, originNodeId)?;
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRoute) =
-                self.forwardRouteAvoiding(None, &excludedPeerNodeIds, route.clone())?;
-            let peerNodeId = peer.peerNodeId();
-            match peer.routedWatchSnapshot(forwardedRoute).await {
-                Err(error) if isRouteUnavailableError(&error) => {
-                    excludedPeerNodeIds.insert(peerNodeId);
-                }
-                result => return result,
-            }
-        }
-    }
-
-    /// Opens one Space watch on an explicit CoreNode.
-    async fn watchNodeSpace(
-        &self,
-        targetNodeId: String,
-        request: CoreWatchRequest,
-    ) -> Result<CoreEventStream, CoreLinkError> {
-        self.watchNodeSpaceWithOrigin(targetNodeId, request, self.localNodeId.clone()).await
+        self.forwardWatchSnapshot(None, route).await
     }
 
     /// Opens one Space watch while preserving its original caller identity.
@@ -1227,28 +1226,7 @@ impl CoreNodeRouter {
         originNodeId: String,
     ) -> Result<CoreEventStream, CoreLinkError> {
         let route = self.initialSpaceRouteWithOrigin(targetNodeId, request, originNodeId)?;
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRoute) =
-                self.forwardRouteAvoiding(None, &excludedPeerNodeIds, route.clone())?;
-            let peerNodeId = peer.peerNodeId();
-            match peer.routedWatch(forwardedRoute).await {
-                Err(error) if isRouteUnavailableError(&error) => {
-                    excludedPeerNodeIds.insert(peerNodeId);
-                }
-                result => return result,
-            }
-        }
-    }
-
-    /// Opens one Space push on an explicit CoreNode.
-    async fn openPushNodeSpace(
-        &self,
-        targetNodeId: String,
-        request: CorePushRequest,
-    ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
-        self.openPushNodeSpaceWithOrigin(targetNodeId, request, self.localNodeId.clone())
-            .await
+        self.forwardWatch(None, route).await
     }
 
     /// Opens one Space push on an explicit CoreNode while preserving its caller.
@@ -1259,18 +1237,7 @@ impl CoreNodeRouter {
         originNodeId: String,
     ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
         let route = self.initialSpaceRouteWithOrigin(targetNodeId, request, originNodeId)?;
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRoute) =
-                self.forwardRouteAvoiding(None, &excludedPeerNodeIds, route.clone())?;
-            let peerNodeId = peer.peerNodeId();
-            match peer.routedOpenPush(forwardedRoute).await {
-                Err(error) if isRouteUnavailableError(&error) => {
-                    excludedPeerNodeIds.insert(peerNodeId);
-                }
-                result => return result,
-            }
-        }
+        self.forwardPush(None, route).await
     }
 
     /// Opens one annotation-addressed Space push through Binding routing.
@@ -1303,7 +1270,7 @@ impl CoreNodeRouter {
             .await?;
         self.requireRoutePermission(&route, &originNodeId, &targetNodeId)?;
         if targetNodeId == self.localNodeId {
-            return self.localCore.openSpacePush(request);
+            return self.localCore.openSpacePush(request).await;
         }
         self.openPushNodeSpaceWithOrigin(targetNodeId, request, originNodeId)
             .await
@@ -1313,10 +1280,17 @@ impl CoreNodeRouter {
     #[allow(non_snake_case)]
     async fn executeLocalCall(&self, request: CoreCallRequest) -> CoreCallResponse {
         let requestId = request.requestId.clone();
+        if request.target == DEVICE_TOOL_TARGET {
+            return CoreCallResponse::err(requestId, CoreLinkError::new("DEVICE_TOOL_MODE_INVALID", "Device tools require a cancellable watch"));
+        }
         let applicationObjectId = self.localCore.targetForSchema("application");
         let isApplicationCall =
             applicationObjectId.is_some_and(|objectId| objectId == request.target);
-        let response = if isApplicationCall {
+        let response = if request.target == NODE_SPACE_APPROVAL_TARGET {
+            let result = RuntimeRemoteLinkService::newWithRouter((*self.localCore).clone(), self.clone())
+                .acceptSpaceApprovalCall(&self.localNodeId, request).await.map_err(CoreLinkError::internal);
+            CoreCallResponse { requestId: requestId.clone(), result }
+        } else if isApplicationCall {
             self.localCore.callApplication(request).await
         } else {
             operit_link::withCoreForceLocal(self.localCore.call(request)).await
@@ -1405,6 +1379,7 @@ impl CoreNodeRouter {
         originNodeId: String,
         localStream: Option<CoreEventStream>,
     ) -> Result<CoreEventStream, CoreLinkError> {
+        let peerChanges = self.nodeServices().map_err(CoreLinkError::internal)?.peers().subscribePeerChanges();
         let (sender, receiver) = CoreEventStream::channel();
         let (cancelSender, cancelReceiver) = oneshot::channel();
         let router = self.clone();
@@ -1421,6 +1396,7 @@ impl CoreNodeRouter {
                                 cancelReceiver,
                                 originNodeId,
                                 localStream,
+                                peerChanges,
                             )
                             .await;
                     })
@@ -1442,16 +1418,17 @@ impl CoreNodeRouter {
         mut cancelReceiver: oneshot::Receiver<()>,
         originNodeId: String,
         mut initialLocalStream: Option<CoreEventStream>,
+        mut peerChanges: tokio::sync::broadcast::Receiver<()>,
     ) {
         let requestId = request.requestId.0.clone();
         let propertyName = request.propertyName.clone();
+        let isEmbeddedStream = request.target == CORE_STREAM_TARGET;
         let mut segmentCount = 0_u64;
         let mut initialSnapshotForwarded = false;
         let (changes, mut routeChanges) = tokio::sync::mpsc::channel(1);
         let _subscription = operit_store::SyncOperationStore::subscribeSyncMutations(move || {
             let _ = changes.try_send(());
         });
-        let mut peerChanges = operit_access_runtime::CoreNodePeerLink::subscribePeerLinkChanges();
         'outer: loop {
             let binding = match self.effectiveBinding(&bindingKey) {
                 Ok(binding) => binding,
@@ -1486,7 +1463,7 @@ impl CoreNodeRouter {
                 ),
                 VERBOSE_LEVEL_5,
             );
-            AppLogger::i(
+            AppLogger::trace(
                 "CoreNodeRouter",
                 &format!(
                     "binding watch segment open requestId={} property={} owner={} generation={} localSource={}",
@@ -1542,7 +1519,7 @@ impl CoreNodeRouter {
                     }
                 }
             };
-            AppLogger::i(
+            AppLogger::trace(
                 "CoreNodeRouter",
                 &format!(
                     "binding watch segment stream opened requestId={} property={} owner={} generation={}",
@@ -1550,12 +1527,35 @@ impl CoreNodeRouter {
                 ),
             );
             let mut firstEventLogged = false;
+            let mut peerChangedSinceOpen = false;
 
             loop {
                 tokio::select! {
                     biased;
                     _ = &mut cancelReceiver => {
                         break 'outer;
+                    }
+                    // Check routing evidence before queued events; unchanged segments
+                    // must drain without repeating persistent route reads per event.
+                    routeChange = routeChanges.recv() => {
+                        if routeChange.is_none() { break 'outer; }
+                        if !self.bindingStillCurrent(&bindingKey, &binding) {
+                            break;
+                        }
+                    }
+                    peerChange = peerChanges.recv() => {
+                        if matches!(peerChange, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                            break 'outer;
+                        }
+                        // Connection replacement can be announced before the
+                        // old watch delivers EOF, without changing its owner.
+                        // Remember that evidence rather than consuming it and
+                        // then waiting forever for another notification at EOF.
+                        peerChangedSinceOpen = true;
+                        // Lagged notifications also require a fresh route check.
+                        if !self.bindingStillCurrent(&bindingKey, &binding) {
+                            break;
+                        }
                     }
                     maybeEvent = stream.recv() => {
                         let Some(mut event) = maybeEvent else {
@@ -1585,7 +1585,7 @@ impl CoreNodeRouter {
                         };
                         if !firstEventLogged {
                             firstEventLogged = true;
-                            AppLogger::i(
+                            AppLogger::trace(
                                 "CoreNodeRouter",
                                 &format!(
                                     "binding watch first event requestId={} property={} owner={} generation={} kind={:?}",
@@ -1594,6 +1594,10 @@ impl CoreNodeRouter {
                             );
                         }
                         if event.kind == CoreEventKind::Completed {
+                            if isEmbeddedStream {
+                                let _ = sender.send(event);
+                                break 'outer;
+                            }
                             AppLogger::e(
                                 "CoreNodeRouter",
                                 &format!(
@@ -1605,23 +1609,6 @@ impl CoreNodeRouter {
                         }
                         if initialSnapshotForwarded && event.kind == CoreEventKind::Snapshot {
                             event.kind = CoreEventKind::Changed;
-                        }
-                        if !self.bindingStillCurrent(&bindingKey, &binding) {
-                            AppLogger::v_with_level(
-                                "CoreNodeRouteTrace",
-                                &format!(
-                                    "binding_flow_stale_event requestId={} property={} key={} segment={} owner={} generation={} kind={:?}",
-                                    requestId,
-                                    propertyName,
-                                    bindingKey,
-                                    segmentCount,
-                                    binding.nodeId,
-                                    binding.generation,
-                                    event.kind
-                                ),
-                                VERBOSE_LEVEL_5,
-                            );
-                            break;
                         }
                         AppLogger::v_with_level(
                             "CoreNodeRouteTrace",
@@ -1638,7 +1625,7 @@ impl CoreNodeRouter {
                             VERBOSE_LEVEL_6,
                         );
                         if event.kind == CoreEventKind::Snapshot {
-                            AppLogger::i(
+                            AppLogger::trace(
                                 "CoreNodeRouter",
                                 &format!(
                                     "binding watch snapshot forwarded requestId={} property={} owner={} generation={}",
@@ -1664,29 +1651,11 @@ impl CoreNodeRouter {
                             break 'outer;
                         }
                     }
-                    delayResult = defaultHostRuntimeTaskSchedulerHost()
-                        .waitForHostRuntimeDelay(ROUTED_BINDING_WATCH_RECHECK_DELAY_MS) => {
-                        let _ = delayResult;
-                        if !self.bindingStillCurrent(&bindingKey, &binding) {
-                            AppLogger::v_with_level(
-                                "CoreNodeRouteTrace",
-                                &format!(
-                                    "binding_flow_generation_changed requestId={} property={} key={} segment={} owner={} generation={}",
-                                    requestId,
-                                    propertyName,
-                                    bindingKey,
-                                    segmentCount,
-                                    binding.nodeId,
-                                    binding.generation
-                                ),
-                                VERBOSE_LEVEL_5,
-                            );
-                            break;
-                        }
-                    }
+
                 }
             }
             if self.bindingStillCurrent(&bindingKey, &binding)
+                && !(isEmbeddedStream && peerChangedSinceOpen)
                 && self
                     .waitForBindingFlowRetryOrCancel(&mut cancelReceiver, &mut routeChanges, &mut peerChanges)
                     .await
@@ -1725,6 +1694,7 @@ impl CoreNodeRouter {
 
 /// Supplies built-in tools with the same live reachability view used by the router.
 struct CoreNodeToolRouteRuntime {
+    peerServices: Arc<std::sync::OnceLock<NodeServices>>,
     localNodeId: String,
     spaceStore: CoreSpaceStore,
     networkControlStore: NetworkControlStore,
@@ -1736,24 +1706,35 @@ impl CoreNodeToolRuntime for CoreNodeToolRouteRuntime {
     fn coreNodeRouteState(&self) -> Result<RuntimeCoreNodeRouteState, String> {
         let space = self.spaceStore.initialize()?;
         let profiles = self.spaceStore.deviceProfiles()?;
-        let peers = activePeerNodeIds(&self.localNodeId)?;
+        let peers = self.peerServices.get()
+            .ok_or_else(|| "Node services are not installed".to_string())?
+            .peers().activePeerNodeIds().map_err(|error| error.to_string())?;
+        let policy = RoutingPolicy::load(&self.networkControlStore)?;
         let mut nodes = Vec::with_capacity(space.members.len());
         for nodeId in space.members {
             let profile = profiles.get(&nodeId).ok_or_else(|| {
                 format!("Device profile is missing in the current device space: {nodeId}")
             })?;
+            let plan = policy.routePlan(&self.localNodeId, &self.spaceStore, &nodeId, &peers)?;
+            // Any resolved plan proves reachability, including the single-hop
+            // plan of a directly paired peer; relay metadata stays multi-hop only.
+            let reachable = nodeId == self.localNodeId || plan.is_some();
+            let (relayHops, relayPath) = match plan {
+                Some(plan) if plan.hops() > 1 => {
+                    (Some(plan.hops()), Some(plan.path.clone()))
+                }
+                _ => (None, None),
+            };
             nodes.push(RuntimeCoreNodeStatus {
                 displayName: profile.displayName.clone(),
                 userName: profile.userName.clone(),
                 platform: profile.platform.clone(),
                 model: profile.model.clone(),
-                reachable: coreNodeIsReachableThroughPeers(
-                    &self.localNodeId,
-                    &self.spaceStore,
-                    &self.networkControlStore,
-                    &nodeId,
-                    &peers,
-                )?,
+                reachable,
+                canExecute: profile.coreVersion.is_some()
+                    && self.networkControlStore.nodeHasCapability(&nodeId, "runtime.execute", None)?,
+                relayHops,
+                relayPath,
                 nodeId,
             });
         }
@@ -1762,27 +1743,6 @@ impl CoreNodeToolRuntime for CoreNodeToolRouteRuntime {
             nodes,
         })
     }
-}
-
-/// Reports whether the active Peer Link graph currently proves one device reachable.
-#[allow(non_snake_case)]
-fn coreNodeIsReachable(
-    localNodeId: &str,
-    spaceStore: &CoreSpaceStore,
-    networkControlStore: &NetworkControlStore,
-    targetNodeId: &str,
-) -> Result<bool, String> {
-    if targetNodeId == localNodeId {
-        return Ok(true);
-    }
-    let peers = activePeerNodeIds(localNodeId)?;
-    coreNodeIsReachableThroughPeers(
-        localNodeId,
-        spaceStore,
-        networkControlStore,
-        targetNodeId,
-        &peers,
-    )
 }
 
 /// Reports device reachability through one fixed active Peer Link snapshot.
@@ -1797,34 +1757,26 @@ fn coreNodeIsReachableThroughPeers(
     if targetNodeId == localNodeId {
         return Ok(true);
     }
-    if networkControlStore.nodeIsDisconnected(targetNodeId)? {
-        return Ok(false);
-    }
-    if !spaceStore.contains(targetNodeId.to_string())? {
-        return Ok(false);
-    }
-    let blockedPeers = peers
-        .iter()
-        .map(|nodeId| {
-            networkControlStore
-                .nodeIsDisconnected(nodeId)
-                .map(|blocked| (nodeId.clone(), blocked))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut permittedPeers = peers.clone();
-    for (nodeId, blocked) in blockedPeers {
-        if blocked {
-            permittedPeers.remove(&nodeId);
-        }
-    }
-    let transitNodeIds = networkControlStore.relayNodeIds()?;
-    spaceStore
-        .reachableNextHopThroughPeersWithTransitNodes(
-            targetNodeId.to_string(),
-            permittedPeers,
-            transitNodeIds,
-        )
-        .map(|nextHop| nextHop.is_some())
+    Ok(coreNodeRoutePlanThroughPeers(
+        localNodeId,
+        spaceStore,
+        networkControlStore,
+        targetNodeId,
+        peers,
+    )?
+    .is_some())
+}
+
+/// Resolves the multi-hop route plan reachable through one fixed active Peer Link snapshot.
+#[allow(non_snake_case)]
+fn coreNodeRoutePlanThroughPeers(
+    localNodeId: &str,
+    spaceStore: &CoreSpaceStore,
+    networkControlStore: &NetworkControlStore,
+    targetNodeId: &str,
+    peers: &BTreeSet<String>,
+) -> Result<Option<CoreSpaceRoutePlan>, String> {
+    RoutingPolicy::load(networkControlStore)?.routePlan(localNodeId, spaceStore, targetNodeId, peers)
 }
 
 /// Resolves the route that produced one embedded stream descriptor.
@@ -1919,19 +1871,6 @@ fn routeTtl(space: &CoreSpace) -> Result<u32, CoreLinkError> {
         .map_err(|_| CoreLinkError::new("SPACE_TOO_LARGE", "Space member count exceeds u32"))
 }
 
-/// Returns whether a routed operation failed before reaching its selected device.
-#[allow(non_snake_case)]
-fn isRouteUnavailableError(error: &CoreLinkError) -> bool {
-    matches!(
-        error.code.as_str(),
-        "CORE_NODE_UNREACHABLE"
-            | "PEER_LINK_CLOSED"
-            | "PEER_RESPONSE_CLOSED"
-            | "PEER_SEND_FAILED"
-            | "PEER_WATCH_SOURCE_CLOSED"
-    )
-}
-
 #[async_trait(?Send)]
 impl CoreLinkClient for CoreNodeRouter {
     /// Executes a one-shot request through the route selected by runtime state.
@@ -1953,33 +1892,116 @@ impl CoreLinkClient for CoreNodeRouter {
         CoreLinkSharedClient::watch(self, request).await
     }
 
+    /// Opens an input stream through the shared Router implementation.
     #[allow(non_snake_case)]
     async fn openPush(
         &mut self,
         request: CorePushRequest,
     ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
-        self.openPushSession(request).await
+        CoreLinkSharedClient::openPush(self, request).await
     }
 }
 
-#[async_trait(?Send)]
-impl CoreNodeLinkClient for CoreNodeRouter {
-    /// Clones this router before a transport task performs network waits.
-    #[allow(non_snake_case)]
-    fn cloneCoreNodeLinkClient(&self) -> Box<dyn CoreNodeLinkClient + Send> {
-        Box::new(self.clone())
+// 接收入口只接受 runtime 已鉴权的相邻节点；传输层不能直接把自报身份传进来。
+impl CoreNodeRouter {
+    /// Space 加入前只要求与对端存在当前配对，不要求配对方向；加入资格
+    /// 不取决于配对由谁发起，成员资格仍由对端审批决定。
+    fn requireDirectPeer(&self, peerNodeId: &str, direction: PairingDirection) -> Result<(), CoreLinkError> {
+        if peerNodeId == self.localNodeId || !self.nodeServices()
+            .map_err(CoreLinkError::internal)?.peers().hasPairing(peerNodeId, direction)?
+        {
+            return Err(CoreLinkError::new("PEER_NOT_AUTHORIZED", "A current direct pairing is required"));
+        }
+        if self.networkControlStore.nodeIsDisconnected(peerNodeId).map_err(CoreLinkError::internal)? {
+            return Err(CoreLinkError::new("CORE_NODE_REVOKED", "Peer is revoked from this Space"));
+        }
+        Ok(())
     }
 
-    /// Executes or forwards one routed call.
+    /// Executes or forwards one routed call. previousNodeId must come from runtime authentication,
+    /// never from peer endpoint metadata or a request argument.
     #[allow(non_snake_case)]
-    async fn routedCall(
+    pub async fn routedCall(
         &mut self,
         previousNodeId: String,
         request: RoutedCoreRequest<CoreCallRequest>,
     ) -> CoreCallResponse {
+        let context = format!("Space request {}::{} [{}]", request.payload.target, request.payload.methodName, request.payload.requestId.0);
+        let correlation = request.payload.requestId.clone();
+        crate::fault_isolation::call(&context, correlation, async {
         let requestId = request.payload.requestId.clone();
+        if let Err(error) = requireRoutableTarget(&request.payload.target) {
+            return CoreCallResponse::err(requestId, error);
+        }
+        if request.payload.target == NODE_SPACE_TARGET {
+            let result = (|| {
+                if request.targetNodeId != self.localNodeId
+                    || request.originNodeId != previousNodeId
+                    || request.ttl != 0
+                    || request.routeKind != RoutedCoreRequestKind::Target
+                {
+                    return Err(CoreLinkError::new("PEER_DIRECT_CALL_REQUIRED", "Node Space calls cannot be relayed"));
+                }
+                self.requireDirectPeer(&previousNodeId, PairingDirection::Either)?;
+                RuntimeRemoteLinkService::newWithRouter((*self.localCore).clone(), self.clone())
+                    .acceptPeerSpaceCall(&previousNodeId, request.payload)
+                    .map_err(crate::NodeSpaceService::spaceCallError)
+            })();
+            return CoreCallResponse { requestId, result };
+        }
+        if request.payload.target == NODE_SYNC_TARGET {
+            match self.validatePeerSyncRoute(&previousNodeId, &request)
+                .and_then(|atTarget| {
+                    let method = PeerSyncMethod::fromRequest(&request.payload)?;
+                    if method.requiresStorageProvider() {
+                        self.requirePeerStorageProviders(&request.originNodeId, &request.targetNodeId)?;
+                    }
+                    Ok((atTarget, method))
+                })
+            {
+                Err(error) => return CoreCallResponse::err(requestId, error),
+                Ok((true, PeerSyncMethod::SyncProgress)) => {
+                    let service = crate::SpacePersistenceSyncService::SpacePersistenceSyncService::new(
+                        self.localCore.clone(), self.clone(), self.spaceStore.clone());
+                    let progress = service.peerProgress(&request.originNodeId);
+                    return CoreCallResponse { requestId, result: operit_link::toCoreValue(progress).map_err(|e|CoreLinkError::internal(e.to_string())) };
+                }
+                Ok((true, PeerSyncMethod::SyncRequest)) => {
+                    let result = async {
+                        let args: crate::PeerSync::SyncRequest = operit_link::fromCoreValue(request.payload.args).map_err(|e|CoreLinkError::internal(e.to_string()))?;
+                        let service = crate::SpacePersistenceSyncService::SpacePersistenceSyncService::new(
+                            self.localCore.clone(), self.clone(), self.spaceStore.clone());
+                        let status = service.synchronizeRequestedPeer(request.originNodeId, args.limit, args.force).await?;
+                        operit_link::toCoreValue(status).map_err(|e|CoreLinkError::internal(e.to_string()))
+                    }.await;
+                    return CoreCallResponse { requestId, result };
+                }
+                Ok((true, method)) => return self.dispatchPeerSyncCall(method, request.payload).await,
+                Ok((false, _)) => return self.forwardCall(Some(&previousNodeId), request).await,
+            }
+        }
         match self.validateIncomingRoute(&previousNodeId, &request) {
             Ok(true) => {
+                if request.payload.target == DEVICE_TOOL_TARGET {
+                    return CoreCallResponse::err(requestId, CoreLinkError::new("DEVICE_TOOL_MODE_INVALID", "Device tools require a cancellable watch"));
+                }
+                if request.payload.target == crate::NodeSpaceService::NODE_SPACE_CONTROL_TARGET {
+                    if request.routeKind != RoutedCoreRequestKind::Target {
+                        return CoreCallResponse::err(requestId, CoreLinkError::new("CONTROL_ROUTE_INVALID", "Control exchange requires an explicit same-Space target"));
+                    }
+                    let service = RuntimeRemoteLinkService::newWithRouter((*self.localCore).clone(), self.clone());
+                    let result = crate::NodeSpaceService::acceptSpaceControlCall(&service, &request.originNodeId, request.payload)
+                        .map_err(crate::NodeSpaceService::spaceCallError);
+                    return CoreCallResponse { requestId, result };
+                }
+                if request.payload.target == NODE_SPACE_APPROVAL_TARGET {
+                    if request.routeKind != RoutedCoreRequestKind::Target {
+                        return CoreCallResponse::err(requestId, CoreLinkError::new("APPROVAL_ROUTE_INVALID", "Approval requires explicit same-Space routing"));
+                    }
+                    let result = RuntimeRemoteLinkService::newWithRouter((*self.localCore).clone(), self.clone())
+                        .acceptSpaceApprovalCall(&request.originNodeId, request.payload).await.map_err(CoreLinkError::internal);
+                    return CoreCallResponse { requestId, result };
+                }
                 if request.routeKind == RoutedCoreRequestKind::SpaceBinding {
                     return self
                     .callSpaceWithOrigin(request.payload, request.originNodeId)
@@ -1996,43 +2018,25 @@ impl CoreNodeLinkClient for CoreNodeRouter {
                     self.executeLocalCall(request.payload).await
                 }
             }
-            Ok(false) => {
-                let mut excludedPeerNodeIds = BTreeSet::new();
-                loop {
-                    let (peer, forwardedRequest) = match self.forwardRouteAvoiding(
-                        Some(&previousNodeId),
-                        &excludedPeerNodeIds,
-                        request.clone(),
-                    ) {
-                        Ok(value) => value,
-                        Err(error) => return CoreCallResponse::err(requestId, error),
-                    };
-                    let peerNodeId = peer.peerNodeId();
-                    let response = peer.routedCall(forwardedRequest).await;
-                    if response
-                        .result
-                        .as_ref()
-                        .err()
-                        .map(isRouteUnavailableError)
-                        .unwrap_or(false)
-                    {
-                        excludedPeerNodeIds.insert(peerNodeId);
-                        continue;
-                    }
-                    return response;
-                }
-            }
+            Ok(false) => self.forwardCall(Some(&previousNodeId), request).await,
             Err(error) => CoreCallResponse::err(requestId, error),
         }
+
+        }).await
     }
 
     /// Executes or forwards one routed watch snapshot.
     #[allow(non_snake_case)]
-    async fn routedWatchSnapshot(
+    pub async fn routedWatchSnapshot(
         &mut self,
         previousNodeId: String,
         request: RoutedCoreRequest<CoreWatchRequest>,
     ) -> Result<CoreEvent, CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.payload.target, request.payload.propertyName, request.payload.requestId.0);
+        crate::fault_isolation::link(&context, async {
+        // 节点控制 Service 是本机 Proxy 表面；远端只能进入业务路由。
+        requireRoutableTarget(&request.payload.target)?;
+
         if self.validateIncomingRoute(&previousNodeId, &request)? {
             if request.routeKind == RoutedCoreRequestKind::SpaceBinding {
                 return self
@@ -2046,30 +2050,23 @@ impl CoreNodeLinkClient for CoreNodeRouter {
                 operit_link::withCoreForceLocal(self.localCore.watchSnapshot(request.payload)).await
             };
         }
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRequest) = self.forwardRouteAvoiding(
-                Some(&previousNodeId),
-                &excludedPeerNodeIds,
-                request.clone(),
-            )?;
-            let peerNodeId = peer.peerNodeId();
-            match peer.routedWatchSnapshot(forwardedRequest).await {
-                Err(error) if isRouteUnavailableError(&error) => {
-                    excludedPeerNodeIds.insert(peerNodeId);
-                }
-                result => return result,
-            }
-        }
+        self.forwardWatchSnapshot(Some(&previousNodeId), request).await
+
+        }).await
     }
 
     /// Executes or forwards one routed watch.
     #[allow(non_snake_case)]
-    async fn routedWatch(
+    pub async fn routedWatch(
         &mut self,
         previousNodeId: String,
         request: RoutedCoreRequest<CoreWatchRequest>,
     ) -> Result<CoreEventStream, CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.payload.target, request.payload.propertyName, request.payload.requestId.0);
+        crate::fault_isolation::link(&context, async {
+        // 节点控制 Service 是本机 Proxy 表面；远端只能进入业务路由。
+        requireRoutableTarget(&request.payload.target)?;
+
         let atTarget = self.validateIncomingRoute(&previousNodeId, &request)?;
         operit_util::AppLogger::AppLogger::trace(
             "CoreNodeRouteTrace",
@@ -2087,6 +2084,9 @@ impl CoreNodeLinkClient for CoreNodeRouter {
             ),
         );
         if atTarget {
+            if request.payload.target == DEVICE_TOOL_TARGET {
+                return self.openDeviceToolWatch(request.payload, request.originNodeId, request.routeKind);
+            }
             if request.routeKind == RoutedCoreRequestKind::SpaceBinding {
                 return self
                     .watchSpaceWithOrigin(request.payload, request.originNodeId)
@@ -2101,30 +2101,33 @@ impl CoreNodeLinkClient for CoreNodeRouter {
                 operit_link::withCoreForceLocal(self.localCore.watch(request.payload)).await
             };
         }
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRequest) = self.forwardRouteAvoiding(
-                Some(&previousNodeId),
-                &excludedPeerNodeIds,
-                request.clone(),
-            )?;
-            let peerNodeId = peer.peerNodeId();
-            match peer.routedWatch(forwardedRequest).await {
-                Err(error) if isRouteUnavailableError(&error) => {
-                    excludedPeerNodeIds.insert(peerNodeId);
-                }
-                result => return result,
-            }
-        }
+        self.forwardWatch(Some(&previousNodeId), request).await
+
+        }).await
     }
 
     /// Executes or forwards one routed push open.
     #[allow(non_snake_case)]
-    async fn routedOpenPush(
+    pub async fn routedOpenPush(
         &mut self,
         previousNodeId: String,
         request: RoutedCoreRequest<CorePushRequest>,
     ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.payload.target, request.payload.methodName, request.payload.requestId.0);
+        crate::fault_isolation::link(&context, async {
+        // 节点控制 Service 是本机 Proxy 表面；远端只能进入业务路由。
+        requireRoutableTarget(&request.payload.target)?;
+
+        if request.payload.target == NODE_SYNC_TARGET {
+            let atTarget = self.validatePeerSyncRoute(&previousNodeId, &request)?;
+            crate::PeerSync::PeerSyncPushMethod::fromRequest(&request.payload)?;
+            self.requirePeerStorageProviders(&request.originNodeId, &request.targetNodeId)?;
+            if atTarget {
+                let inner = self.dispatchPeerSyncPush(request.payload)?;
+                return Ok(self.guardPeerSyncPush(request.originNodeId, request.targetNodeId, request.spaceId, inner));
+            }
+            return self.forwardPush(Some(&previousNodeId), request).await;
+        }
         if self.validateIncomingRoute(&previousNodeId, &request)? {
             if request.routeKind == RoutedCoreRequestKind::SpaceBinding {
                 return self
@@ -2133,26 +2136,14 @@ impl CoreNodeLinkClient for CoreNodeRouter {
             }
             return if request.routeKind == RoutedCoreRequestKind::SpaceRoute {
                 self.requirePushPermission(&request.payload, &request.originNodeId, &self.localNodeId)?;
-                self.localCore.openSpacePush(request.payload)
+                self.localCore.openSpacePush(request.payload).await
             } else {
                 self.localCore.openPush(request.payload)
             };
         }
-        let mut excludedPeerNodeIds = BTreeSet::new();
-        loop {
-            let (peer, forwardedRequest) = self.forwardRouteAvoiding(
-                Some(&previousNodeId),
-                &excludedPeerNodeIds,
-                request.clone(),
-            )?;
-            let peerNodeId = peer.peerNodeId();
-            match peer.routedOpenPush(forwardedRequest).await {
-                Err(error) if isRouteUnavailableError(&error) => {
-                    excludedPeerNodeIds.insert(peerNodeId);
-                }
-                result => return result,
-            }
-        }
+        self.forwardPush(Some(&previousNodeId), request).await
+
+        }).await
     }
 }
 
@@ -2160,6 +2151,9 @@ impl CoreNodeLinkClient for CoreNodeRouter {
 impl CoreLinkSharedClient for CoreNodeRouter {
     /// Executes a one-shot request on the CoreNode selected by generated metadata.
     async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
+        let context = format!("Space request {}::{} [{}]", request.target, request.methodName, request.requestId.0);
+        let correlation = request.requestId.clone();
+        crate::fault_isolation::call(&context, correlation, async {
         let requestId = request.requestId.clone();
         let generatedRoute = match crate::generated_core_call_route(&request) {
             Ok(route) => route,
@@ -2189,7 +2183,7 @@ impl CoreLinkSharedClient for CoreNodeRouter {
             }
         }
         if let GeneratedCoreRoute::Binding { key, .. } = &route {
-            operit_util::AppLogger::AppLogger::i(
+            operit_util::AppLogger::AppLogger::trace(
                 "CoreNodeRouter",
                 &format!(
                     "binding call route requestId={} path={} method={} key={} source={} target={}",
@@ -2208,7 +2202,7 @@ impl CoreLinkSharedClient for CoreNodeRouter {
         let methodName = request.methodName.clone();
         let requestId = request.requestId.0.clone();
         let response = self.callNode(targetNodeId.clone(), request).await;
-        operit_util::AppLogger::AppLogger::i(
+        operit_util::AppLogger::AppLogger::trace(
             "CoreNodeRouter",
             &format!(
                 "remote call returned requestId={} method={} target={} success={}",
@@ -2219,11 +2213,15 @@ impl CoreLinkSharedClient for CoreNodeRouter {
             ),
         );
         response
+
+        }).await
     }
 
     /// Reads a watch snapshot on the CoreNode selected by generated metadata.
     #[allow(non_snake_case)]
     async fn watchSnapshot(&self, request: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.target, request.propertyName, request.requestId.0);
+        crate::fault_isolation::link(&context, async {
         let route = crate::generated_core_watch_route(&request)?;
         if let GeneratedCoreRoute::Binding { key, .. } = &route {
             operit_util::AppLogger::AppLogger::trace(
@@ -2246,10 +2244,17 @@ impl CoreLinkSharedClient for CoreNodeRouter {
             return operit_link::withCoreForceLocal(self.localCore.watchSnapshot(request)).await;
         }
         self.watchNodeSnapshot(targetNodeId, request).await
+
+        }).await
     }
 
     /// Opens a watch stream on the CoreNode selected by generated metadata.
     async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.target, request.propertyName, request.requestId.0);
+        crate::fault_isolation::link(&context, async {
+        if request.target == DEVICE_TOOL_TARGET {
+            return self.openDeviceToolWatch(request, self.localNodeId.clone(), RoutedCoreRequestKind::Target);
+        }
         if request.target == CORE_STREAM_TARGET {
             operit_util::AppLogger::AppLogger::trace(
                 "CoreNodeRouteTrace",
@@ -2278,7 +2283,7 @@ impl CoreLinkSharedClient for CoreNodeRouter {
             );
         }
         if let GeneratedCoreRoute::Binding { key, .. } = &route {
-            operit_util::AppLogger::AppLogger::i(
+            operit_util::AppLogger::AppLogger::trace(
                 "CoreNodeRouter",
                 &format!(
                     "binding watch open requestId={} path={} property={} key={} source={}",
@@ -2320,10 +2325,29 @@ impl CoreLinkSharedClient for CoreNodeRouter {
             return operit_link::withCoreForceLocal(self.localCore.watch(request)).await;
         }
         self.watchNode(targetNodeId, request).await
+
+        }).await
+    }
+
+    /// Opens one input stream on the CoreNode selected by generated routing metadata.
+    async fn openPush(
+        &self,
+        request: operit_link::CorePushRequest,
+    ) -> Result<Box<dyn operit_link::CoreLinkPushSession>, operit_link::CoreLinkError> {
+        let context = format!("Space request {}::{} [{}]", request.target, request.methodName, request.requestId.0);
+        crate::fault_isolation::link(&context, async {
+        self.openPushSession(request).await
+
+        }).await
     }
 }
 
 impl CoreRouteRuntime for CoreNodeRouter {
+    /// Opens plugin input streams through the existing Binding-selected Link Push path.
+    fn openPush(&self, request: CorePushRequest) -> Pin<Box<dyn Future<Output = Result<Box<dyn CoreLinkPushSession>, CoreLinkError>>>> {
+        let router = self.clone();
+        Box::pin(async move { router.openSpacePush(request).await })
+    }
     /// Resolves one annotation binding before the wrapper enters a remote route.
     fn shouldRoute(&self, methodName: &str, args: &CoreValue) -> Result<bool, CoreLinkError> {
         if operit_link::coreForceLocal() {
@@ -2489,13 +2513,55 @@ impl CoreRouteRuntime for CoreNodeRouter {
     }
 }
 
+#[async_trait(?Send)]
+impl crate::PeerRouter::PeerRouter for CoreNodeRouter {
+    fn localNodeId(&self) -> String {
+        CoreNodeRouter::localNodeId(self)
+    }
+    async fn routedCall(
+        &self,
+        previousNodeId: String,
+        request: RoutedCoreRequest<CoreCallRequest>,
+    ) -> CoreCallResponse {
+        let mut router = self.clone();
+        CoreNodeRouter::routedCall(&mut router, previousNodeId, request).await
+    }
+    async fn routedWatchSnapshot(
+        &self,
+        previousNodeId: String,
+        request: RoutedCoreRequest<CoreWatchRequest>,
+    ) -> Result<CoreEvent, CoreLinkError> {
+        let mut router = self.clone();
+        CoreNodeRouter::routedWatchSnapshot(&mut router, previousNodeId, request).await
+    }
+    async fn routedWatch(
+        &self,
+        previousNodeId: String,
+        request: RoutedCoreRequest<CoreWatchRequest>,
+    ) -> Result<CoreEventStream, CoreLinkError> {
+        let mut router = self.clone();
+        CoreNodeRouter::routedWatch(&mut router, previousNodeId, request).await
+    }
+    async fn routedOpenPush(
+        &self,
+        previousNodeId: String,
+        request: RoutedCoreRequest<CorePushRequest>,
+    ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
+        let mut router = self.clone();
+        CoreNodeRouter::routedOpenPush(&mut router, previousNodeId, request).await
+    }
+    fn spaceChannelScope(&self, peerNodeId: &str) -> Result<Option<String>, CoreLinkError> {
+        CoreNodeRouter::spaceChannelScope(self, peerNodeId)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use operit_access_runtime::CoreNodePeerLink::{
-        connectInMemoryPeerLinks, peerLink, CoreNodeTransportClient, RoutedCoreRequest,
-        RoutedCoreRequestKind,
+    use crate::NodeServices::{
+        DiscoveredPeer, PairedPeer, PairingPrompt, PeerEndpoint, PeerTransport, PendingPairing,
     };
+    use crate::SpaceRuntime::SpaceRuntime;
     use operit_host_api::HostManager::{
         defaultHostRuntimeTaskSchedulerHost, setDefaultHostRuntimeTaskSchedulerHost,
     };
@@ -2503,9 +2569,8 @@ mod tests {
         FileEntry, FileExistence, FileInfo, FileSystemHost, FindFilesRequest, GrepCodeRequest,
         GrepCodeResult, HostEnvironmentDescriptor, HostError, HostResult, HostRuntimeAsyncTask,
         HostRuntimeTask, HostRuntimeTaskSchedulerHost, HostSecretStore, RuntimeSqliteConnection,
-        RuntimeSqliteHost, RuntimeSqliteTransaction, RuntimeStorageEntry, RuntimeStorageHost,
-        SqliteRow, SqliteValue,
-    };
+        RuntimeSqliteHost, RuntimeStorageEntry, RuntimeStorageHost,
+        };
     use operit_link::{
         CoreEventKind, CorePushRequest, CoreStream, CoreStreamSource, CORE_INTERNAL_TARGET,
     };
@@ -2528,10 +2593,15 @@ mod tests {
     use std::sync::{Mutex as StdMutex, Once, OnceLock};
     use std::time::Duration;
 
+    mod peer_fixture { include!("router_peer_fixture.rs"); }
+    use peer_fixture::{TestRouteTarget, TestPeerService, installTestPeer};
+    include!("device_tools_tests.rs");
+
     /// Stores runtime records in memory for route and Space integration tests.
     #[derive(Clone)]
     struct TestRuntimeStorageHost {
         files: Arc<StdMutex<BTreeMap<String, Vec<u8>>>>,
+        modifiedTimes: Arc<StdMutex<BTreeMap<String, i64>>>,
         runtimeRoot: std::path::PathBuf,
         workspaceRoot: std::path::PathBuf,
     }
@@ -2553,13 +2623,48 @@ mod tests {
             std::fs::create_dir_all(&workspaceRoot).expect("test workspace root must be creatable");
             Self {
                 files: Arc::new(StdMutex::new(BTreeMap::new())),
+                modifiedTimes: Arc::new(StdMutex::new(BTreeMap::new())),
                 runtimeRoot,
                 workspaceRoot,
             }
         }
     }
 
+    struct TestStorageWriteSession {
+        host: TestRuntimeStorageHost,
+        path: String,
+        bytes: Vec<u8>,
+    }
+
+    impl operit_host_api::RuntimeStorageWriteSession for TestStorageWriteSession {
+        fn writeChunk(&mut self, chunk: &[u8]) -> HostResult<()> {
+            self.bytes.extend_from_slice(chunk);
+            Ok(())
+        }
+        fn commit(self: Box<Self>) -> HostResult<()> {
+            self.host.files.lock().map_err(|e|HostError::new(e.to_string()))?
+                .insert(self.path, self.bytes);
+            Ok(())
+        }
+        fn discard(self: Box<Self>) -> HostResult<()> { Ok(()) }
+    }
+
     impl RuntimeStorageHost for TestRuntimeStorageHost {
+        fn openWriteSession(&self, path: &str) -> HostResult<Option<Box<dyn operit_host_api::RuntimeStorageWriteSession>>> {
+            Ok(Some(Box::new(TestStorageWriteSession { host: self.clone(), path: path.into(), bytes: Vec::new() })))
+        }
+        fn openTransactionDatabase(&self, path: &str) -> operit_host_api::HostResult<Box<dyn operit_host_api::RuntimeSqliteConnection>> {
+            operit_host_api::RuntimeSqliteHost::openSqliteDatabase(
+                &operit_host_native_storage::NativeRuntimeStorageHost::new(self.runtimeRoot.clone(),self.workspaceRoot.clone()),path)
+        }
+        /// Confirms synchronous in-memory publication without copying or rewriting bytes.
+        fn flushFile(&self, path: &str) -> operit_host_api::HostResult<()> {
+            if !self.exists(path)? {
+                return Err(operit_host_api::HostError::new("runtime storage entry not found"));
+            }
+            Ok(())
+        }
+
         /// Returns the physical runtime root used by path-only test callers.
         #[allow(non_snake_case)]
         fn runtimeRootDir(&self) -> Option<std::path::PathBuf> {
@@ -2583,6 +2688,18 @@ mod tests {
                 .ok_or_else(|| HostError::new(format!("missing runtime storage entry: {path}")))
         }
 
+        /// Carries source timestamps through the real file synchronization path.
+        fn modifiedAt(&self, path: &str) -> HostResult<i64> {
+            if !self.exists(path)? { return Err(HostError::new("missing runtime storage entry")); }
+            Ok(self.modifiedTimes.lock().unwrap().get(path).copied().unwrap_or(1))
+        }
+
+        fn setModifiedAt(&self, path: &str, time: i64) -> HostResult<()> {
+            if !self.exists(path)? { return Err(HostError::new("missing runtime storage entry")); }
+            self.modifiedTimes.lock().unwrap().insert(path.to_owned(), time);
+            Ok(())
+        }
+
         /// Reads one bounded range from an in-memory runtime storage file.
         #[allow(non_snake_case)]
         fn readBytesRange(&self, path: &str, offset: u64, length: usize) -> HostResult<Vec<u8>> {
@@ -2597,6 +2714,11 @@ mod tests {
                 .ok_or_else(|| HostError::new("runtime storage byte range overflows usize"))?
                 .min(content.len());
             Ok(content[start..end].to_vec())
+        }
+
+        /// Atomically publishes one complete in-memory test entry.
+        fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> operit_host_api::HostResult<()> {
+            self.writeBytes(path, content)
         }
 
         /// Writes one in-memory runtime storage file.
@@ -2659,6 +2781,13 @@ mod tests {
     /// Provides a file host shell for constructing unused local chat runtime state in tests.
     #[derive(Clone, Debug, Default)]
     struct TestFileSystemHost;
+
+    /// Wraps the route fixture's nonpersistent backend in the production VFS boundary.
+    fn testFileSystem() -> Arc<operit_vfs::VisualFileSystem::VisualFileSystem> {
+        Arc::new(operit_vfs::VisualFileSystem::VisualFileSystem::builtinOnly(
+            Arc::new(TestFileSystemHost), "/runtime".into(), "/workspace".into(),
+        ))
+    }
 
     impl TestFileSystemHost {
         /// Creates the standard file host error used by unsupported test operations.
@@ -2840,238 +2969,33 @@ mod tests {
         }
     }
 
-    /// Opens file-backed SQLite databases under the test runtime root.
-    struct TestSqliteHost {
-        root: std::path::PathBuf,
-    }
-
-    impl TestSqliteHost {
-        /// Creates a SQLite host rooted at one runtime directory.
-        fn new(root: std::path::PathBuf) -> Self {
-            Self { root }
-        }
-
-        /// Resolves one runtime-relative database path under the test root.
-        fn resolve(&self, path: &str) -> HostResult<std::path::PathBuf> {
-            let path = std::path::Path::new(path);
-            if path.is_absolute() {
-                return Err(HostError::new(format!(
-                    "test SQLite path must be relative: {}",
-                    path.display()
-                )));
-            }
-            let mut resolved = self.root.clone();
-            for component in path.components() {
-                match component {
-                    std::path::Component::Normal(segment) => resolved.push(segment),
-                    std::path::Component::CurDir => {}
-                    _ => {
-                        return Err(HostError::new(format!(
-                            "test SQLite path is invalid: {}",
-                            path.display()
-                        )))
-                    }
-                }
-            }
-            Ok(resolved)
-        }
-    }
-
-    impl RuntimeSqliteHost for TestSqliteHost {
-        /// Opens one SQLite database in the test runtime directory.
-        #[allow(non_snake_case)]
-        fn openSqliteDatabase(&self, path: &str) -> HostResult<Box<dyn RuntimeSqliteConnection>> {
-            let path = self.resolve(path)?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let connection = rusqlite::Connection::open(path)
-                .map_err(|error| HostError::new(error.to_string()))?;
-            connection
-                .execute_batch(
-                    r#"
-                    PRAGMA journal_mode = MEMORY;
-                    PRAGMA synchronous = OFF;
-                    PRAGMA temp_store = MEMORY;
-                    "#,
-                )
-                .map_err(|error| HostError::new(error.to_string()))?;
-            Ok(Box::new(TestSqliteConnection { connection }))
-        }
-    }
-
-    /// Wraps one rusqlite connection in the host SQLite trait.
-    struct TestSqliteConnection {
-        connection: rusqlite::Connection,
-    }
-
-    impl RuntimeSqliteConnection for TestSqliteConnection {
-        /// Executes one SQL batch on the wrapped connection.
-        #[allow(non_snake_case)]
-        fn executeBatch(&mut self, sql: &str) -> HostResult<()> {
-            self.connection
-                .execute_batch(sql)
-                .map_err(|error| HostError::new(error.to_string()))
-        }
-
-        /// Executes one parameterized SQL statement on the wrapped connection.
-        fn execute(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<usize> {
-            let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
-            self.connection
-                .execute(sql, rusqlite::params_from_iter(params))
-                .map_err(|error| HostError::new(error.to_string()))
-        }
-
-        /// Queries rows from the wrapped connection.
-        fn query(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<Vec<SqliteRow>> {
-            querySqliteRows(&self.connection, sql, params)
-        }
-
-        /// Returns the last inserted row id for the wrapped connection.
-        #[allow(non_snake_case)]
-        fn lastInsertRowId(&self) -> HostResult<i64> {
-            Ok(self.connection.last_insert_rowid())
-        }
-
-        /// Starts one SQLite transaction on the wrapped connection.
-        #[allow(non_snake_case)]
-        fn beginTransaction(&mut self) -> HostResult<Box<dyn RuntimeSqliteTransaction + '_>> {
-            let transaction = self
-                .connection
-                .transaction()
-                .map_err(|error| HostError::new(error.to_string()))?;
-            Ok(Box::new(TestSqliteTransaction { transaction }))
-        }
-    }
-
-    /// Wraps one rusqlite transaction in the host SQLite transaction trait.
-    struct TestSqliteTransaction<'a> {
-        transaction: rusqlite::Transaction<'a>,
-    }
-
-    impl RuntimeSqliteTransaction for TestSqliteTransaction<'_> {
-        /// Executes one parameterized SQL statement in the transaction.
-        fn execute(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<usize> {
-            let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
-            self.transaction
-                .execute(sql, rusqlite::params_from_iter(params))
-                .map_err(|error| HostError::new(error.to_string()))
-        }
-
-        /// Queries rows from the transaction.
-        fn query(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<Vec<SqliteRow>> {
-            querySqliteRows(&self.transaction, sql, params)
-        }
-
-        /// Returns the last inserted row id for the transaction.
-        #[allow(non_snake_case)]
-        fn lastInsertRowId(&self) -> HostResult<i64> {
-            Ok(self.transaction.last_insert_rowid())
-        }
-
-        /// Commits the transaction.
-        fn commit(self: Box<Self>) -> HostResult<()> {
-            self.transaction
-                .commit()
-                .map_err(|error| HostError::new(error.to_string()))
-        }
-    }
-
-    /// Provides common statement preparation for rusqlite connections and transactions.
-    trait TestRusqliteAccess {
-        /// Prepares one SQL statement against the underlying SQLite object.
-        #[allow(non_snake_case)]
-        fn prepareStatement<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>>;
-    }
-
-    impl TestRusqliteAccess for rusqlite::Connection {
-        /// Prepares one SQL statement against a connection.
-        #[allow(non_snake_case)]
-        fn prepareStatement<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
-            self.prepare(sql)
-        }
-    }
-
-    impl TestRusqliteAccess for rusqlite::Transaction<'_> {
-        /// Prepares one SQL statement against a transaction.
-        #[allow(non_snake_case)]
-        fn prepareStatement<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
-            self.prepare(sql)
-        }
-    }
-
-    /// Queries rows from one rusqlite access object.
-    #[allow(non_snake_case)]
-    fn querySqliteRows(
-        connection: &impl TestRusqliteAccess,
-        sql: &str,
-        params: Vec<SqliteValue>,
-    ) -> HostResult<Vec<SqliteRow>> {
-        let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
-        let mut statement = connection
-            .prepareStatement(sql)
-            .map_err(|error| HostError::new(error.to_string()))?;
-        let columns = statement
-            .column_names()
-            .into_iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        let mut rows = statement
-            .query(rusqlite::params_from_iter(params))
-            .map_err(|error| HostError::new(error.to_string()))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|error| HostError::new(error.to_string()))?
-        {
-            let mut values = Vec::new();
-            for index in 0..columns.len() {
-                let value = row
-                    .get::<_, rusqlite::types::Value>(index)
-                    .map_err(|error| HostError::new(error.to_string()))?;
-                values.push(fromRusqliteValue(value));
-            }
-            out.push(SqliteRow {
-                columns: columns.clone(),
-                values,
-            });
-        }
-        Ok(out)
-    }
-
-    /// Converts one host SQLite value to rusqlite's value type.
-    #[allow(non_snake_case)]
-    fn toRusqliteValue(value: SqliteValue) -> rusqlite::types::Value {
-        match value {
-            SqliteValue::Null => rusqlite::types::Value::Null,
-            SqliteValue::Integer(value) => rusqlite::types::Value::Integer(value),
-            SqliteValue::Real(value) => rusqlite::types::Value::Real(value),
-            SqliteValue::Text(value) => rusqlite::types::Value::Text(value),
-            SqliteValue::Blob(value) => rusqlite::types::Value::Blob(value),
-        }
-    }
-
-    /// Converts one rusqlite value to the host SQLite value type.
-    #[allow(non_snake_case)]
-    fn fromRusqliteValue(value: rusqlite::types::Value) -> SqliteValue {
-        match value {
-            rusqlite::types::Value::Null => SqliteValue::Null,
-            rusqlite::types::Value::Integer(value) => SqliteValue::Integer(value),
-            rusqlite::types::Value::Real(value) => SqliteValue::Real(value),
-            rusqlite::types::Value::Text(value) => SqliteValue::Text(value),
-            rusqlite::types::Value::Blob(value) => SqliteValue::Blob(value),
-        }
-    }
-
     /// Dispatches local Core requests through a real test SpaceRuntime.
     struct TestSpaceRuntimeSharedClient {
-        spaceRuntime: Arc<SpaceRuntime>,
+        spaceRuntime: Arc<dyn CoreLinkSharedClient + Send + Sync>,
+        bindingStore: Option<CoreNodeBindingStore>,
     }
 
     #[async_trait(?Send)]
     impl CoreLinkSharedClient for TestSpaceRuntimeSharedClient {
         /// Executes one local annotation-addressed call through SpaceRuntime.
         async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
+            if request.target == "core/server.application"
+                && request.methodName == "syncApplyImmediateBindingOperation"
+            {
+                let result = (|| {
+                    let CoreValue::Map(args) = &request.args else {
+                        return Err(CoreLinkError::internal("Missing binding arguments"));
+                    };
+                    let operation = operit_link::fromCoreValue(
+                        args.get("operation").cloned().ok_or_else(|| CoreLinkError::internal("Missing binding operation"))?,
+                    ).map_err(|error| CoreLinkError::internal(error.to_string()))?;
+                    self.bindingStore.as_ref().ok_or_else(|| CoreLinkError::internal("Missing binding store"))?
+                        .applyImmediateOperation(&operation).map_err(CoreLinkError::internal)?;
+                    operit_link::toCoreValue(serde_json::json!({"applied": true}))
+                        .map_err(|error| CoreLinkError::internal(error.to_string()))
+                })();
+                return CoreCallResponse { requestId: request.requestId, result };
+            }
             self.spaceRuntime.call(request).await
         }
 
@@ -3088,17 +3012,27 @@ mod tests {
         async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
             self.spaceRuntime.watch(request).await
         }
+
+        /// Opens an input stream through the injected Space test runtime.
+        async fn openPush(
+            &self,
+            request: operit_link::CorePushRequest,
+        ) -> Result<Box<dyn operit_link::CoreLinkPushSession>, operit_link::CoreLinkError> {
+            self.spaceRuntime.openPush(request).await
+        }
     }
 
     /// Stores one binding table entry for route integration tests.
     struct TestBindingRuntime {
         binding: StdMutex<CoreNodeBindingRecord>,
+        reads: std::sync::atomic::AtomicUsize,
     }
 
     impl TestBindingRuntime {
         /// Creates a binding runtime with one chat binding.
         fn new(key: &str, nodeId: String) -> Self {
             Self {
+                reads: std::sync::atomic::AtomicUsize::new(0),
                 binding: StdMutex::new(CoreNodeBindingRecord {
                     key: key.to_string(),
                     nodeId,
@@ -3124,6 +3058,7 @@ mod tests {
     impl CoreNodeBindingRuntime for TestBindingRuntime {
         /// Returns the single binding record owned by this test runtime.
         fn binding(&self, key: &str) -> Result<CoreNodeBindingRecord, CoreLinkError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             let binding = self
                 .binding
                 .lock()
@@ -3153,6 +3088,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_space_watch_tracks_remote_membership_without_reopening() {
+        let _globalGuard = routeTestGlobalLock().lock().await;
         use crate::RuntimeRemoteLinkService::RuntimeRemoteLinkService;
         use operit_store::CoreSpaceStore::CoreSpaceDeviceProfile;
         installTestRuntimeScheduler();
@@ -3166,6 +3102,7 @@ mod tests {
                 [localId.clone(), peerId.clone()]
                     .into_iter()
                     .map(|nodeId| CoreSpaceDeviceProfile {
+                        protocolVersion: None,
                         displayName: nodeId.clone(),
                         nodeId,
                         userName: String::new(),
@@ -3173,11 +3110,17 @@ mod tests {
                         model: "test".to_string(),
                         coreVersion: None,
                         updatedAt: 1,
+                        pairingIncarnation: None,
                     })
                     .collect(),
             )
             .unwrap();
-        let service = RuntimeRemoteLinkService::new(testLocalRuntime(storage.clone()));
+        let runtime = testLocalRuntime(storage.clone());
+        let router = CoreNodeRouter::new(runtime.clone()).unwrap();
+        let peers = TestPeerService::new(localId.clone(), peerId.clone(), Arc::new(TestClientEndpoint));
+        peers.close();
+        router.installNodeServices(NodeServices::new(peers)).unwrap();
+        let service = RuntimeRemoteLinkService::newWithRouter(runtime, router);
         let watch = service.deviceSpaceSnapshotFlow().unwrap();
         assert_eq!(watch.value().space.members.len(), 1);
         // Simulate the inbound Access handler using a separate store handle.
@@ -3222,21 +3165,20 @@ mod tests {
             .expect("test runtime storage host must expose a workspace root");
         operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost(storage.clone());
         operit_store::RuntimeStorageHost::setDefaultRuntimeSqliteHost(Arc::new(
-            TestSqliteHost::new(runtimeRoot.clone()),
+            operit_host_native_storage::NativeRuntimeStorageHost::new(runtimeRoot.clone(), workspaceRoot.clone()),
         ));
         operit_store::RuntimeStorageHost::setDefaultHostSecretStore(Arc::new(
             TestSecretStore::default(),
         ));
-        operit_util::RuntimeStoreRoot::setDefaultRuntimeStoreRootConfig(
-            operit_util::RuntimeStoreRoot::RuntimeStoreRootConfig::new(runtimeRoot, workspaceRoot),
-        );
+
         let chatRuntimeHolder = Arc::new(tokio::sync::Mutex::new(ChatRuntimeHolder::new(
-            Arc::new(TestFileSystemHost),
+            testFileSystem(),
         )));
         let spaceRuntime = Arc::new(SpaceRuntime::new(chatRuntimeHolder.clone()));
         let sharedClient: Arc<dyn CoreLinkSharedClient + Send + Sync> =
             Arc::new(TestSpaceRuntimeSharedClient {
                 spaceRuntime: spaceRuntime.clone(),
+                bindingStore: None,
             });
         (
             CoreNodeLocalRuntime::new(
@@ -3257,12 +3199,101 @@ mod tests {
         )
     }
 
+    /// Node-local dispatch accepts a Link service without constructing chat/application state.
+    #[tokio::test]
+    async fn local_space_dispatch_uses_injected_link_service() {
+        struct DeviceService(Arc<StdMutex<Vec<CoreValue>>>);
+        struct DeviceInput(Arc<StdMutex<Vec<CoreValue>>>);
+        #[async_trait]
+        impl CoreLinkPushSession for DeviceInput {
+            /// Records inputs sent to the injected Space service.
+            async fn send(&mut self, value: CoreValue) -> Result<(), CoreLinkError> {
+                self.0.lock().unwrap().push(value);
+                Ok(())
+            }
+            /// Completes the fixture input without using the application Push callback.
+            async fn close(self: Box<Self>) -> Result<(), CoreLinkError> { Ok(()) }
+        }
+        #[async_trait(?Send)]
+        impl CoreLinkSharedClient for DeviceService {
+            async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
+                CoreCallResponse::ok(request.requestId, request.args)
+            }
+            async fn watchSnapshot(
+                &self,
+                request: CoreWatchRequest,
+            ) -> Result<CoreEvent, CoreLinkError> {
+                Ok(CoreEvent {
+                    requestId: Some(request.requestId),
+                    target: request.target,
+                    propertyName: request.propertyName,
+                    kind: CoreEventKind::Snapshot,
+                    value: request.args,
+                })
+            }
+            async fn watch(
+                &self,
+                request: CoreWatchRequest,
+            ) -> Result<CoreEventStream, CoreLinkError> {
+                let (sender, receiver) = CoreEventStream::channel();
+                sender.send(self.watchSnapshot(request).await?).unwrap();
+                Ok(receiver)
+            }
+
+            /// Opens an input on the injected service instead of the application dispatcher.
+            async fn openPush(
+                &self,
+                request: operit_link::CorePushRequest,
+            ) -> Result<Box<dyn operit_link::CoreLinkPushSession>, operit_link::CoreLinkError> {
+                assert_eq!(request.target, "device");
+                assert_eq!(request.methodName, "input");
+                Ok(Box::new(DeviceInput(self.0.clone())))
+            }
+        }
+        let inputs = Arc::new(StdMutex::new(Vec::new()));
+        let client = Arc::new(DeviceService(inputs.clone()));
+        let runtime = CoreNodeLocalRuntime::new(
+            client.clone(),
+            client.clone(),
+            Arc::new(TestRuntimeStorageHost::default()),
+            Arc::new(|_| None),
+            Arc::new(|_| panic!("local dispatch must not install tool runtime")),
+            Arc::new(|_| panic!("Space dispatch must not use application push")),
+            client,
+        );
+        let value = CoreValue::String("device-state".into());
+        let response = runtime
+            .callSpace(CoreCallRequest::new(
+                "device-call",
+                "device",
+                "read",
+                value.clone(),
+            ))
+            .await;
+        assert_eq!(response.requestId.0, "device-call");
+        assert_eq!(response.result.unwrap(), value);
+        let request = CoreWatchRequest::new("device-watch", "device", "state", value.clone());
+        let snapshot = runtime.watchSpaceSnapshot(request.clone()).await.unwrap();
+        assert_eq!(snapshot.requestId.unwrap().0, "device-watch");
+        assert_eq!(snapshot.value, value);
+        let mut stream = runtime.watchSpace(request).await.unwrap();
+        assert_eq!(stream.recv().await.unwrap().value, value);
+        assert!(stream.recv().await.is_none());
+        let mut input = runtime.openSpacePush(CorePushRequest::new("device-input", "device", "input")).await.unwrap();
+        input.send(value.clone()).await.unwrap();
+        input.close().await.unwrap();
+        assert_eq!(*inputs.lock().unwrap(), vec![value]);
+    }
+
     /// Selects local sources without rewriting the persisted remote owner while offline.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offline_binding_uses_local_source_without_changing_owner() {
         let _globalGuard = routeTestGlobalLock().lock().await;
         installTestRuntimeScheduler();
         let router = testCoreNodeRouter("offline-client", "offline-owner", "offline-chat");
+        let peers = TestPeerService::new(router.localNodeId(), "offline-owner".into(), Arc::new(TestClientEndpoint));
+        peers.close();
+        router.installNodeServices(NodeServices::new(peers)).unwrap();
         router.spaceStore.setDirectPeers(Vec::new()).unwrap();
         let args = CoreValue::Map(BTreeMap::from([
             ("chatId".to_string(), CoreValue::String("offline-chat".to_string())),
@@ -3278,6 +3309,541 @@ mod tests {
             assert!(!router.shouldRouteWatch(method, &args).unwrap());
             assert!(router.shouldUseLocalWatchSource(method, &args).unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn core_node_route_state_reports_direct_peers_reachable() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let mut router = testCoreNodeRouter("route-state-core", "route-state-peer", "route-state-chat");
+        router.spaceStore.admitRemoteMember(
+            "route-state-ghost".into(), "Ghost".into(), "test".into(), "core".into(), "1".into(),
+        ).unwrap();
+        router.networkControlStore.admitMember("route-state-ghost".into()).unwrap();
+        let peers = TestPeerService::new(
+            "route-state-core".into(),
+            "route-state-peer".into(),
+            Arc::new(TestClientEndpoint),
+        );
+        router.installNodeServices(NodeServices::new(peers)).unwrap();
+        let runtime = CoreNodeToolRouteRuntime {
+            peerServices: router.peerServices.clone(),
+            localNodeId: router.localNodeId(),
+            spaceStore: router.spaceStore.clone(),
+            networkControlStore: router.networkControlStore.clone(),
+        };
+        let state = runtime.coreNodeRouteState().unwrap();
+        assert_eq!(state.currentNodeId, "route-state-core");
+        let status = |nodeId: &str| {
+            state
+                .nodes
+                .iter()
+                .find(|node| node.nodeId == nodeId)
+                .cloned()
+                .expect("every member must appear in the route state")
+        };
+        assert!(status("route-state-core").reachable);
+        // A directly paired peer resolves a single-hop plan; it used to be folded
+        // into the multi-hop-only relay metadata and misreported as unreachable.
+        let direct = status("route-state-peer");
+        assert!(direct.reachable, "a directly paired peer must be reported reachable");
+        assert_eq!(direct.relayHops, None, "a direct peer is not relayed");
+        let ghost = status("route-state-ghost");
+        assert!(!ghost.reachable, "a member without any route must stay unreachable");
+        assert_eq!(ghost.relayHops, None);
+    }
+
+    #[tokio::test]
+    async fn peer_sync_keeps_pairing_space_and_management_boundaries() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let mut router = testCoreNodeRouter("sync-local", "sync-peer", "sync-binding");
+        let peers = TestPeerService::new("sync-local".into(), "sync-peer".into(), Arc::new(TestClientEndpoint));
+        router.installNodeServices(NodeServices::new(peers)).unwrap();
+        let space = router.spaceStore.space().unwrap();
+        let request = RoutedCoreRequest {
+            spaceId: space.spaceId,
+            originNodeId: "sync-peer".into(),
+            targetNodeId: "sync-local".into(),
+            ttl: 0,
+            routeKind: RoutedCoreRequestKind::Target,
+            payload: PeerSyncMethod::CoreVersion.request("sync-test".into(), CoreValue::Null),
+        };
+        assert!(router.validatePeerSyncRoute("sync-peer", &request).unwrap());
+        assert!(router.routedCall("unpaired".into(), request.clone()).await.result.is_err());
+        let mut wrongSpace = request.clone();
+        wrongSpace.spaceId = "other-space".into();
+        assert!(router.routedCall("sync-peer".into(), wrongSpace).await.result.is_err());
+        let mut management = request.clone();
+        management.payload.target = "core/server.application".into();
+        assert!(router.routedCall("sync-peer".into(), management).await.result.is_err());
+        let mut wrongMethod = request.clone();
+        wrongMethod.payload.methodName = "startPairing".into();
+        assert!(router.routedCall("sync-peer".into(), wrongMethod).await.result.is_err());
+        router.networkControlStore.disconnectNode("sync-peer".into()).unwrap();
+        assert!(router.routedCall("sync-peer".into(), request).await.result.is_err());
+    }
+
+    /// Space peer calls need only a current pairing, never a specific pairing
+    /// direction: joining a Space must not depend on which side dialed, so an
+    /// inbound-only or outbound-only credential passes the peer gate while a
+    /// missing pairing and a policy disconnect stay rejected.
+    #[tokio::test]
+    async fn space_peer_gate_admits_any_current_pairing_direction() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let router = testCoreNodeRouter("space-local", "space-peer", "space-binding");
+        let peers = TestPeerService::new("space-local".into(), "space-peer".into(), Arc::new(TestClientEndpoint));
+        router.installNodeServices(NodeServices::new(peers.clone())).unwrap();
+
+        for (inbound, outbound) in [(true, false), (false, true), (true, true)] {
+            peers.setPairingDirections(inbound, outbound);
+            assert!(
+                router.requireDirectPeer("space-peer", PairingDirection::Either).is_ok(),
+                "a current pairing must pass regardless of direction (inbound={inbound} outbound={outbound})"
+            );
+        }
+        peers.setPairingDirections(false, false);
+        let error = router.requireDirectPeer("space-peer", PairingDirection::Either).unwrap_err();
+        assert_eq!(error.code, "PEER_NOT_AUTHORIZED");
+        peers.setPairingDirections(true, true);
+        router.networkControlStore.disconnectNode("space-peer".into()).unwrap();
+        let error = router.requireDirectPeer("space-peer", PairingDirection::Either).unwrap_err();
+        assert_eq!(error.code, "CORE_NODE_REVOKED");
+    }
+    /// A handoff must use the admitted peer sync surface, never the local-only application target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn route_handoff_installs_binding_through_peer_sync() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let sourceId = "handoff-source";
+        let targetId = "handoff-target";
+        let chatId = "handoff-chat";
+        let space = CoreSpace {
+            spaceId: "handoff-space".into(),
+            spaceName: "Handoff test".into(),
+            spaceRevision: 2,
+            members: vec![sourceId.into(), targetId.into()],
+        };
+        let (source, _) = testCoreNodeRouterInJoinedSpace(
+            sourceId, targetId, chatId, sourceId, space.clone(),
+        );
+        let (mut target, _) = testCoreNodeRouterInJoinedSpace(
+            targetId, sourceId, chatId, sourceId, space,
+        );
+        let targetBindingStore = CoreNodeBindingStore::new(target.localCore.runtimeStorageHost()).unwrap();
+        let targetRuntime = Arc::make_mut(&mut target.localCore);
+        targetRuntime.targetForSchema = Arc::new(|schema: &str| {
+            if schema == "application" { Some("core/server.application") } else { None }
+        });
+        targetRuntime.applicationClient = Arc::new(TestSpaceRuntimeSharedClient {
+            spaceRuntime: targetRuntime.spaceRuntime.clone(),
+            bindingStore: Some(targetBindingStore.clone()),
+        });
+        let sourceBindingStore = CoreNodeBindingStore::new(source.localCore.runtimeStorageHost()).unwrap();
+        sourceBindingStore.create(chatId, sourceId).unwrap();
+        let commit = sourceBindingStore.compareAndSet(chatId, sourceId, targetId).unwrap();
+        let peer = installTestPeer(&source, targetId.into(), TestCoreNodeRouterEndpoint::new(target)).unwrap();
+        let service = RuntimeRemoteLinkService::newWithRouter((*source.localCore).clone(), source.clone());
+
+        assert!(targetBindingStore.bindingOptional(chatId).unwrap().is_none());
+
+        service.installRouteBindingOnTarget(targetId, commit.operation.clone()).await
+            .expect("handoff must install the committed binding through the authenticated sync protocol");
+        assert_eq!(targetBindingStore.binding(chatId).unwrap(), commit.binding);
+        service.installRouteBindingOnTarget(sourceId, commit.operation).await
+            .expect("local binding installation must remain a no-op");
+        peer.close();
+    }
+
+    /// A stalled input must leave all slots and unrelated route changes available, including newly created chats.
+    #[tokio::test]
+    async fn stalled_chat_upload_keeps_navigation_and_other_chat_routes_available() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let storage = Arc::new(TestRuntimeStorageHost::default());
+        let (runtime, holder) = testLocalRuntimeWithHolder(storage);
+        let active = {
+            let mut holder = holder.lock().await;
+            let manager = &holder.getCore(ChatRuntimeSlot::MAIN).chatHistoryDelegate.chatHistoryManager;
+            for id in ["upload-active", "upload-other"] {
+                manager.saveChatHistory(operit_model::ChatEntity::ChatEntity::new(
+                    id.into(), id.into(), 0).toChatHistory(Vec::new())).unwrap();
+            }
+            manager.beginChatExecution("upload-active").unwrap()
+        };
+        let request = CorePushRequest::new("stalled-chat-upload", CORE_INTERNAL_TARGET, "sendUserMessageStream")
+            .withArgs(operit_link::toCoreValue(serde_json::json!({
+                "promptFunctionType": PromptFunctionType::CHAT, "participantId": null,
+                "chatIdOverride": "upload-active", "expectedByteLength": 3,
+                "proxySenderNameOverride": null, "chatProviderIdOverride": null,
+                "chatModelIdOverride": null, "attachments": [], "replyToMessage": null,
+                "turnOptions": ChatTurnOptions::default(),
+            })).unwrap());
+        let mut input = runtime.spaceRuntime.openPush(request).await.unwrap();
+        // Capacity is one. The second send proves that the actual generated consumer entered its upload wait.
+        for chunk in ["a", "b"] {
+            tokio::time::timeout(Duration::from_secs(2), input.send(CoreValue::String(chunk.into())))
+                .await.expect("the upload consumer must start").unwrap();
+        }
+        {
+            let mut holder = tokio::time::timeout(Duration::from_secs(2), holder.lock()).await
+                .expect("an upload must not reserve every chat runtime");
+            let core = holder.getCore(ChatRuntimeSlot::MAIN);
+            core.switchChatLocal("upload-other".into()).await.unwrap();
+            core.chatHistoryDelegate.chatHistoryManager.saveChatHistory(
+                operit_model::ChatEntity::ChatEntity::new("upload-new".into(), "New Chat".into(), 0)
+                    .toChatHistory(Vec::new())).unwrap();
+            holder.getCore(ChatRuntimeSlot::DETACHED("upload-window".into()))
+                .switchChatLocal("upload-new".into()).await.unwrap();
+        }
+        for id in ["upload-other", "upload-new", "upload-active"] {
+            let response = tokio::time::timeout(Duration::from_secs(2), runtime.callSpace(CoreCallRequest::new(
+                format!("route-{id}"), CORE_INTERNAL_TARGET, "beforeChangeRoute",
+                operit_link::toCoreValue(serde_json::json!({"chatId": id})).unwrap(),
+            ))).await.expect("another chat's route check must not wait for the upload");
+            if id == "upload-active" {
+                assert!(response.result.unwrap_err().message.contains("Conversation is executing"));
+            } else { response.result.unwrap(); }
+        }
+        assert!(input.close().await.unwrap_err().message.contains("Text upload incomplete"));
+        active.release().unwrap();
+        let holder = holder.lock().await;
+        assert!(!holder.cores[&ChatRuntimeSlot::MAIN].chatHistoryDelegate.chatHistoryManager
+            .hasUserMessage("upload-active".into()).unwrap());
+    }
+
+    /// Manual selection moves the binding without resuming a turn and preserves it on rejection.
+    #[tokio::test]
+    async fn manual_chat_execution_device_selection_checks_idle_and_does_not_resume() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        struct LifecycleClient {
+            calls: StdMutex<Vec<String>>,
+            busy: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait(?Send)]
+        impl CoreLinkSharedClient for LifecycleClient {
+            async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
+                self.calls.lock().unwrap().push(request.methodName.clone());
+                assert_eq!(request.methodName, "beforeChangeRoute", "manual selection must not start a turn");
+                if self.busy.load(Ordering::SeqCst) {
+                    CoreCallResponse::err(request.requestId, CoreLinkError::internal("chat is executing"))
+                } else {
+                    CoreCallResponse::ok(request.requestId, CoreValue::Null)
+                }
+            }
+            async fn watchSnapshot(&self, _: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
+                unreachable!()
+            }
+            async fn watch(&self, _: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+                unreachable!()
+            }
+            async fn openPush(&self, _: CorePushRequest) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
+                unreachable!()
+            }
+        }
+        let mut router = testCoreNodeRouter("select-local", "select-peer", "select-chat");
+        router.spaceStore.writeLocalDeviceProfile(
+            "Local".into(), "test".into(), "core".into(), "1".into(), Some("test-core".into()),
+        ).unwrap();
+        let store = CoreNodeBindingStore::new(router.localCore.runtimeStorageHost()).unwrap();
+        store.create("select-chat", "select-peer").unwrap();
+        router.bindingStore = Arc::new(store.clone());
+        let lifecycle = Arc::new(LifecycleClient {
+            calls: StdMutex::new(Vec::new()),
+            busy: std::sync::atomic::AtomicBool::new(true),
+        });
+        let (mut owner, _) = testCoreNodeRouterInJoinedSpace(
+            "select-peer", "select-local", "select-chat", "select-peer", router.spaceStore.initialize().unwrap(),
+        );
+        Arc::make_mut(&mut owner.localCore).spaceRuntime = lifecycle.clone();
+        let peer = installTestPeer(&router, "select-peer".into(), TestCoreNodeRouterEndpoint::new(owner)).unwrap();
+        let service = RuntimeRemoteLinkService::newWithRouter((*router.localCore).clone(), router);
+        let before = store.binding("select-chat").unwrap();
+        let error = service.changeChatExecutionDevice("select-chat".into(), "select-local".into())
+            .await.unwrap_err();
+        assert!(error.contains("chat is executing"), "{error}");
+        assert_eq!(store.binding("select-chat").unwrap(), before);
+        lifecycle.busy.store(false, Ordering::SeqCst);
+        let status = service.changeChatExecutionDevice("select-chat".into(), "select-local".into())
+            .await.unwrap();
+        assert_eq!(store.binding("select-chat").unwrap().nodeId, "select-local");
+        assert_eq!(status.ownerNodeId, "select-local");
+        assert!(status.ownerIsLocal);
+        assert_eq!(*lifecycle.calls.lock().unwrap(), vec!["beforeChangeRoute", "beforeChangeRoute"]);
+        peer.close();
+    }
+
+    #[tokio::test]
+    async fn core_route_candidates_report_live_execution_capacity() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let router = testCoreNodeRouter("capacity-local", "capacity-peer", "capacity-chat");
+        let link = installTestPeer(&router, "capacity-peer".into(), Arc::new(TestClientEndpoint)).unwrap();
+        let runtime = CoreNodeToolRouteRuntime {
+            peerServices: router.peerServices.clone(), localNodeId: router.localNodeId.clone(),
+            spaceStore: router.spaceStore.clone(), networkControlStore: router.networkControlStore.clone(),
+        };
+        for (role, hasCore, expected) in [("relay", true, false), ("edge", true, true),
+            ("user", true, true), ("user", false, false), ("edge", false, false)] {
+            let mut profile = router.spaceStore.deviceProfiles().unwrap().remove("capacity-peer").unwrap();
+            profile.coreVersion = hasCore.then(|| "test-core".into());
+            profile.updatedAt += 1;
+            router.spaceStore.importDeviceProfiles(vec![profile]).unwrap();
+            router.networkControlStore.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
+                nodeId: "capacity-peer".into(), roleId: role.into(),
+            }).unwrap();
+            let state = runtime.coreNodeRouteState().unwrap();
+            let candidate = state.nodes.iter().find(|node| node.nodeId == "capacity-peer").unwrap();
+            assert!(candidate.reachable);
+            assert_eq!(candidate.canExecute, expected);
+            if !expected {
+                let service = RuntimeRemoteLinkService::newWithRouter((*router.localCore).clone(), router.clone());
+                let before = router.bindingStore.binding("capacity-chat").unwrap();
+                let context = operit_tools::runtime_support::CoreRouteResumeContext {
+                    runtimeChatHistory: Vec::new(), workspacePath: None,
+                    promptFunctionType: operit_model::PromptFunctionType::PromptFunctionType::CHAT,
+                    enableThinking: false, participantId: String::new(), extensionOwner: String::new(),
+                    proxySenderName: None,
+                    notifyReplyOverride: None, chatProviderIdOverride: None, chatModelIdOverride: None,
+                    turnOptions: Default::default(),
+                };
+                let error = service.requestChangeRoute("capacity-chat".into(), "capacity-peer".into(), context)
+                    .await.unwrap_err();
+                assert!(error.contains("cannot host Core execution"), "{error}");
+                let error = service.changeChatExecutionDevice("capacity-chat".into(), "capacity-peer".into())
+                    .await.unwrap_err();
+                assert!(error.contains("cannot host Core execution"), "{error}");
+                assert_eq!(router.bindingStore.binding("capacity-chat").unwrap(), before);
+            }
+        }
+        link.close();
+    }
+
+    fn grantTestReplicaRole(control: &NetworkControlStore, node: &str) {
+        control.defineRole(operit_store::NetworkControlStore::NetworkControlRole {
+            roleId: "replica".into(), displayName: "Test replica".into(),
+            capabilities: BTreeSet::from(["storage.provide".into()]),
+        }).unwrap();
+        control.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
+            nodeId: node.into(), roleId: "replica".into(),
+        }).unwrap();
+    }
+
+    /// Verifies built-in storage roles authorize both replication endpoints without custom grants.
+    #[tokio::test]
+    async fn admin_user_and_relay_roles_provide_space_storage() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let router = testCoreNodeRouter("role-local", "role-peer", "role-binding");
+        for role in ["admin", "user", "relay"] {
+            router.networkControlStore.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
+                nodeId: "role-peer".into(), roleId: role.into(),
+            }).unwrap();
+            assert!(router.requirePeerStorageProviders("role-local", "role-peer").is_ok(), "{role}");
+            assert!(router.requirePeerStorageProviders("role-peer", "role-local").is_ok(), "{role}");
+        }
+    }
+
+    /// Verifies edge roles cannot replicate data and returning to the user role restores storage.
+    #[tokio::test]
+    async fn non_storage_members_cannot_enter_replication_or_blob_receivers() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let mut router = testCoreNodeRouter("storage-local", "storage-peer", "storage-binding");
+        router.installNodeServices(NodeServices::new(TestPeerService::new(
+            "storage-local".into(), "storage-peer".into(), Arc::new(TestClientEndpoint),
+        ))).unwrap();
+        let request = RoutedCoreRequest {
+            spaceId: router.spaceStore.space().unwrap().spaceId,
+            originNodeId: "storage-peer".into(), targetNodeId: "storage-local".into(),
+            ttl: 0, routeKind: RoutedCoreRequestKind::Target,
+            payload: PeerSyncMethod::SyncClock.request("storage-denied".into(), CoreValue::Null),
+        };
+        let before = router.localCore.runtimeStorageHost().list("runtime/").unwrap();
+        for method in [PeerSyncMethod::SyncClock, PeerSyncMethod::SyncOperationsSince,
+            PeerSyncMethod::SyncApplyOperations, PeerSyncMethod::SyncBlobExists, PeerSyncMethod::SyncReadBlobChunk,
+            PeerSyncMethod::SyncRequest, PeerSyncMethod::SyncProgress] {
+            let mut call = request.clone();
+            call.payload = method.request("storage-denied".into(),
+                operit_link::toCoreValue(serde_json::json!({"operations":[]})).unwrap());
+            assert_eq!(router.routedCall("storage-peer".into(), call).await.result.unwrap_err().code,
+                "SPACE_STORAGE_PERMISSION_DENIED");
+        }
+        let push = RoutedCoreRequest { spaceId: request.spaceId.clone(), originNodeId: request.originNodeId.clone(),
+            targetNodeId: request.targetNodeId.clone(), ttl: 0, routeKind: RoutedCoreRequestKind::Target,
+            payload: CorePushRequest::new("blob-denied", NODE_SYNC_TARGET, "syncReceiveBlob") };
+        let error = match router.routedOpenPush("storage-peer".into(), push).await {
+            Ok(_) => panic!("non-storage member must not open a blob receiver"), Err(error) => error,
+        };
+        assert_eq!(error.code, "SPACE_STORAGE_PERMISSION_DENIED");
+        let after = router.localCore.runtimeStorageHost().list("runtime/").unwrap();
+        assert_eq!(before.iter().map(|entry| (&entry.path, entry.size)).collect::<Vec<_>>(),
+            after.iter().map(|entry| (&entry.path, entry.size)).collect::<Vec<_>>());
+        // Same-space authority exchange is independent of a storage identity.
+        let mut control = request.clone();
+        control.payload = CoreCallRequest::new("control-allowed", crate::NodeSpaceService::NODE_SPACE_CONTROL_TARGET,
+            "exchange", operit_link::toCoreValue(Vec::<operit_store::SyncOperationStore::SyncOperation>::new()).unwrap());
+        assert!(router.routedCall("storage-peer".into(), control).await.result.is_ok());
+        grantTestReplicaRole(&router.networkControlStore, "storage-peer");
+        assert!(router.requirePeerStorageProviders("storage-peer", "storage-local").is_ok());
+        router.networkControlStore.clearIdentity("storage-peer".into()).unwrap();
+        assert!(router.requirePeerStorageProviders("storage-peer", "storage-local").is_ok());
+        router.networkControlStore.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
+            nodeId: "storage-peer".into(), roleId: "edge".into(),
+        }).unwrap();
+        assert_eq!(router.routedCall("storage-peer".into(), request).await.result.unwrap_err().code,
+            "SPACE_STORAGE_PERMISSION_DENIED");
+    }
+
+    struct CountingSyncPush(Arc<AtomicUsize>);
+    #[async_trait]
+    impl CoreLinkPushSession for CountingSyncPush {
+        async fn send(&mut self, _value: CoreValue) -> Result<(), CoreLinkError> {
+            self.0.fetch_add(1, Ordering::SeqCst); Ok(())
+        }
+        async fn close(self: Box<Self>) -> Result<(), CoreLinkError> {
+            self.0.fetch_add(1, Ordering::SeqCst); Ok(())
+        }
+    }
+
+    /// Verifies assigning an edge role stops an open blob stream before another write or commit.
+    #[tokio::test]
+    async fn storage_revocation_stops_an_already_open_blob_stream_before_commit() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let router = testCoreNodeRouter("stream-local", "stream-peer", "stream-binding");
+        grantTestReplicaRole(&router.networkControlStore, "stream-peer");
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut stream = router.guardPeerSyncPush("stream-peer".into(), "stream-local".into(),
+            router.spaceStore.space().unwrap().spaceId, Box::new(CountingSyncPush(count.clone())));
+        stream.send(CoreValue::Null).await.unwrap();
+        router.networkControlStore.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
+            nodeId: "stream-peer".into(), roleId: "edge".into(),
+        }).unwrap();
+        assert_eq!(stream.send(CoreValue::Null).await.unwrap_err().code, "SPACE_STORAGE_PERMISSION_DENIED");
+        assert_eq!(stream.close().await.unwrap_err().code, "SPACE_STORAGE_PERMISSION_DENIED");
+        assert_eq!(count.load(Ordering::SeqCst), 1, "no chunk or final commit reaches persistence after revocation");
+    }
+
+    #[tokio::test]
+    async fn storage_stream_checks_current_space_and_profile_after_open() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        for leave in [false, true] {
+            let router = testCoreNodeRouter("stream-local", "stream-peer", "stream-binding");
+            grantTestReplicaRole(&router.networkControlStore, "stream-peer");
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut stream = router.guardPeerSyncPush("stream-peer".into(), "stream-local".into(),
+                router.spaceStore.space().unwrap().spaceId, Box::new(CountingSyncPush(count.clone())));
+            stream.send(CoreValue::Null).await.unwrap();
+            if leave {
+                router.spaceStore.leave().unwrap();
+            } else {
+                let mut profile = router.spaceStore.deviceProfile("stream-peer").unwrap().unwrap();
+                profile.coreVersion = None;
+                profile.updatedAt += 1;
+                router.spaceStore.importDeviceProfiles(vec![profile]).unwrap();
+            }
+            assert_eq!(stream.send(CoreValue::Null).await.unwrap_err().code, "SPACE_STORAGE_PERMISSION_DENIED");
+            assert_eq!(stream.close().await.unwrap_err().code, "SPACE_STORAGE_PERMISSION_DENIED");
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_control_snapshot_releases_model_lock_before_callback() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let router = testCoreNodeRouter("snapshot-local", "snapshot-peer", "snapshot-binding");
+        grantTestReplicaRole(&router.networkControlStore, "snapshot-peer");
+        router.networkControlStore.withCurrentSpaceState(|space, state| {
+            assert_eq!(space.spaceId, state.spaceId);
+            assert!(state.nodeHasCapability("snapshot-peer", "storage.provide", None).unwrap());
+            router.networkControlStore.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
+                nodeId: "snapshot-peer".into(), roleId: "edge".into(),
+            }).unwrap();
+            assert!(state.nodeHasCapability("snapshot-peer", "storage.provide", None).unwrap());
+            assert!(!router.networkControlStore.nodeHasCapability("snapshot-peer", "storage.provide", None).unwrap());
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistence_worker_skips_non_storage_members_and_endpoint_engines() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let router = testCoreNodeRouter("worker-local", "worker-peer", "worker-binding");
+        let endpoint = TestRoutedCallEndpoint::newPolicyOnly();
+        let link = installTestPeer(&router, "worker-peer".into(), endpoint.clone()).unwrap();
+        let worker = crate::SpacePersistenceSyncService::SpacePersistenceSyncService::new(
+            router.localCore.clone(), router.clone(), router.spaceStore.clone(),
+        );
+        let syncStore = operit_store::SyncOperationStore::SyncOperationStore::new(
+            router.localCore.runtimeStorageHost(), operit_util::RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH);
+        let before = syncStore.localClock().unwrap();
+        assert!(!worker.storageReplicationAllowed("worker-peer").unwrap());
+        worker.synchronizeReachablePeer("worker-peer".into(), 512).await.unwrap();
+        assert_eq!(endpoint.callCount.load(Ordering::SeqCst), 2);
+        assert_eq!(syncStore.localClock().unwrap(), before);
+        grantTestReplicaRole(&router.networkControlStore, "worker-peer");
+        assert!(router.requirePeerStorageProviders("worker-local", "worker-peer").is_ok());
+        let mut profile = router.spaceStore.deviceProfiles().unwrap().remove("worker-peer").unwrap();
+        profile.coreVersion = None; profile.updatedAt += 1;
+        router.spaceStore.importDeviceProfiles(vec![profile.clone()]).unwrap();
+        let before = syncStore.localClock().unwrap();
+        // A lightweight endpoint has no Core store even with a broad user role.
+        assert!(!worker.storageReplicationAllowed("worker-peer").unwrap());
+        worker.synchronizeReachablePeer("worker-peer".into(), 512).await.unwrap();
+        assert_eq!(endpoint.methodNames(), vec!["exchange", "exchangePreferences", "exchange", "exchangePreferences"]);
+        assert_eq!(syncStore.localClock().unwrap(), before,
+            "skipped initial sync must not reset/advance replication clocks");
+        profile.coreVersion = Some("test-core-version".into()); profile.updatedAt += 1;
+        router.spaceStore.importDeviceProfiles(vec![profile]).unwrap();
+        assert!(worker.storageReplicationAllowed("worker-peer").unwrap());
+        link.close();
+    }
+
+    /// Checks that storage authorization changes without resetting an existing operation clock.
+    #[tokio::test]
+    async fn storage_grant_preserves_existing_replication_clock() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let router = testCoreNodeRouter("grant-local", "grant-peer", "grant-binding");
+        let worker = crate::SpacePersistenceSyncService::SpacePersistenceSyncService::new(
+            router.localCore.clone(),
+            router.clone(),
+            router.spaceStore.clone(),
+        );
+        let before = router
+            .localCore
+            .runtimeStorageHost()
+            .readBytes("runtime/sync/clocks.json")
+            .unwrap();
+        assert!(!worker.storageReplicationAllowed("grant-peer").unwrap());
+        grantTestReplicaRole(&router.networkControlStore, "grant-peer");
+        let afterGrant = router
+            .localCore
+            .runtimeStorageHost()
+            .readBytes("runtime/sync/clocks.json")
+            .unwrap();
+        let beforeClock: operit_store::SyncOperationStore::SyncClock =
+            serde_json::from_slice(&before).unwrap();
+        let afterClock: operit_store::SyncOperationStore::SyncClock =
+            serde_json::from_slice(&afterGrant).unwrap();
+        // Role definition and assignment are two new authoritative commands.
+        let mut expected = beforeClock.clone();
+        expected.setSequence("grant-local", beforeClock.sequenceFor("grant-local") + 2);
+        assert_eq!(afterClock, expected);
+        assert!(worker.storageReplicationAllowed("grant-peer").unwrap());
+        assert_eq!(
+            router
+                .localCore
+                .runtimeStorageHost()
+                .readBytes("runtime/sync/clocks.json")
+                .unwrap(),
+            afterGrant
+        );
     }
 
     /// Creates one real router with synthetic local runtime and in-memory route state.
@@ -3296,7 +3862,7 @@ mod tests {
             .initializeNamed("route-test-space".to_string())
             .expect("test space must initialize");
         let networkControlStore = NetworkControlStore::new(storage.clone()).unwrap();
-        spaceStore.writeLocalDeviceProfile("Test".into(), "test".into(), "core".into(), "1".into()).unwrap();
+        spaceStore.writeLocalDeviceProfile("Test".into(), "test".into(), "core".into(), "1".into(), None).unwrap();
         networkControlStore.initializeCurrentSpace().unwrap();
         let joinedSpace = CoreSpace {
             spaceId: localSpace.spaceId.clone(),
@@ -3315,13 +3881,15 @@ mod tests {
         spaceStore.admitRemoteMember(targetNodeId.into(), "Target".into(), "test".into(), "core".into(), "1".into()).unwrap();
         networkControlStore.admitMember(targetNodeId.to_string()).unwrap();
         networkControlStore.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
-            nodeId: targetNodeId.to_string(), roleId: "runner".into(),
+            nodeId: targetNodeId.to_string(), roleId: "edge".into(),
         }).unwrap();
         let bindingStore: Arc<dyn CoreNodeBindingRuntime> = Arc::new(TestBindingRuntime::new(
             bindingKey,
             targetNodeId.to_string(),
         ));
         CoreNodeRouter {
+            deviceToolService: Arc::new(std::sync::OnceLock::new()),
+            peerServices: Arc::new(OnceLock::new()),
             localCore: Arc::new(testLocalRuntime(storage)),
             bindingStore,
             localNodeId: localNodeId.to_string(),
@@ -3338,11 +3906,13 @@ mod tests {
         router.spaceStore.admitRemoteMember(
             "edge-client".into(), "Edge".into(), "test".into(), "edge".into(), "1".into(),
         ).unwrap();
+        router.networkControlStore.admitMember("edge-client".into()).unwrap();
+        router.networkControlStore.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
+            nodeId: "edge-client".into(), roleId: "relay".into(),
+        }).unwrap();
+        assert!(!router.networkControlStore.nodeHasCapability("edge-client", "runtime.execute", None).unwrap());
         let target = TestRoutedCallEndpoint::new();
-        let link = connectInMemoryPeerLinks(
-            router.localNodeId(), Arc::new(TestClientEndpoint),
-            "edge-executor".into(), target.clone(),
-        ).unwrap();
+        let link = installTestPeer(&router, "edge-executor".into(), target.clone()).unwrap();
         let request = RoutedCoreRequest {
             spaceId: router.spaceStore.space().unwrap().spaceId,
             originNodeId: "edge-client".into(),
@@ -3357,123 +3927,19 @@ mod tests {
         let response = router.routedCall("edge-client".into(), request.clone()).await;
         assert!(response.result.is_ok(), "{:?}", response.result);
         assert_eq!(target.callCount.load(Ordering::SeqCst), 1);
-        router.networkControlStore.clearIdentity("edge-executor".into()).unwrap();
-        let denied = router.routedCall("edge-client".into(), request).await;
-        let error = denied.result.unwrap_err();
-        assert_eq!(error.code, "ROUTE_PERMISSION_DENIED");
-        assert_eq!(
-            error.details,
-            Some(CoreValue::Map(BTreeMap::from([
-                ("callerNodeId".into(), CoreValue::String("edge-client".into())),
-                ("method".into(), CoreValue::String("sendUserMessage".into())),
-                (
-                    "requiredCapability".into(),
-                    CoreValue::String("runtime.execute".into()),
-                ),
-                ("subject".into(), CoreValue::String("target".into())),
-                (
-                    "targetNodeId".into(),
-                    CoreValue::String("edge-executor".into()),
-                ),
-            ])))
-        );
-        assert_eq!(target.callCount.load(Ordering::SeqCst), 1);
+        // Resetting the identity retains ordinary member access to the
+        // existing chat Binding; execution capacity is checked when selecting it.
+        router
+            .networkControlStore
+            .clearIdentity("edge-executor".into())
+            .unwrap();
+        let retried = router.routedCall("edge-client".into(), request).await;
+        assert!(retried.result.is_ok(), "{:?}", retried.result);
+        assert_eq!(target.callCount.load(Ordering::SeqCst), 2);
         link.close();
     }
 
-    /// Exercises Edge transport, the canonical incoming PeerConnection, Binding
-    /// resolution, and an outgoing PeerLink carrying a live chat watch.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn edge_peer_chat_watch_crosses_adjacent_router() {
-        use operit_edge_transport::{EdgePeerLink, EdgeSpaceRouteClient, LinkChannel};
-        use operit_access_runtime::CoreNodePeerLink::{attachPeerLinkCarrier, PeerLinkCarrier};
-        use operit_link::{LinkFrame, LinkFramePayload, PeerFrame};
-        struct Channel {
-            tx: tokio::sync::mpsc::UnboundedSender<LinkFrame>,
-            rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<LinkFrame>>,
-        }
-        #[async_trait]
-        impl LinkChannel for Channel {
-            async fn send(&self, frame: LinkFrame) -> Result<(), String> {
-                self.tx.send(frame).map_err(|e| e.to_string())
-            }
-            async fn receive(&self) -> Result<Option<LinkFrame>, String> {
-                Ok(self.rx.lock().await.recv().await)
-            }
-            async fn close(&self) {}
-        }
-        struct Carrier(tokio::sync::mpsc::UnboundedSender<LinkFrame>);
-        #[async_trait]
-        impl PeerLinkCarrier for Carrier {
-            async fn sendPeerFrame(&self, frame: PeerFrame) -> Result<(), String> {
-                self.0.send(LinkFrame { messageId: frame.messageId.clone(),
-                    payload: LinkFramePayload::PeerFrame(frame) }).map_err(|e| e.to_string())
-            }
-            fn closePeerLinkCarrier(&self) {}
-        }
-        let _guard = routeTestGlobalLock().lock().await;
-        installTestRuntimeScheduler();
-        let router = testCoreNodeRouter("edge-watch-core", "edge-watch-executor", "edge-chat");
-        router.networkControlStore.setIdentity(
-            operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
-                nodeId: "edge-watch-executor".into(),
-                roleId: "user".into(),
-            },
-        ).unwrap();
-        assert!(router.networkControlStore.nodeHasCapability(
-            "edge-watch-executor", "chat.read", None,
-        ).unwrap());
-        assert!(router.networkControlStore.nodeHasCapability(
-            "edge-watch-executor", "runtime.execute", None,
-        ).unwrap());
-        router.spaceStore.admitRemoteMember("edge-watch-client".into(), "Edge".into(),
-            "test".into(), "edge".into(), "1".into()).unwrap();
-        router.networkControlStore.admitMember("edge-watch-client".into()).unwrap();
-        router.networkControlStore.setIdentity(
-            operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
-                nodeId: "edge-watch-client".into(),
-                roleId: "user".into(),
-            },
-        ).unwrap();
-        let source = TestSpaceEndpoint::new();
-        let executorLink = connectInMemoryPeerLinks(router.localNodeId(),
-            Arc::new(TestClientEndpoint), "edge-watch-executor".into(), source.clone()).unwrap();
-        let (edgeTx, mut coreRx) = tokio::sync::mpsc::unbounded_channel::<LinkFrame>();
-        let (coreTx, edgeRx) = tokio::sync::mpsc::unbounded_channel();
-        let attached = attachPeerLinkCarrier(router.localNodeId(), "edge-watch-client".into(),
-            "edge-watch-channel".into(), Arc::new(Carrier(coreTx)),
-            TestCoreNodeRouterEndpoint::new(router.clone()), router.spaceStore.clone()).unwrap();
-        let receiverLink = attached.clone();
-        let receiverTask = tokio::spawn(async move {
-            while let Some(frame) = coreRx.recv().await {
-                let LinkFramePayload::PeerFrame(frame) = frame.payload else { panic!("expected PeerFrame") };
-                receiverLink.receiveFrame(frame).await.unwrap();
-            }
-        });
-        let peer = EdgePeerLink::new(Arc::new(Channel { tx: edgeTx, rx: Mutex::new(edgeRx) }));
-        let client = EdgeSpaceRouteClient::throughAdjacent(
-            peer,
-            router.spaceStore.space().unwrap().spaceId,
-            "edge-watch-client".into(),
-            router.localNodeId(),
-            3,
-        );
-        let mut stream = tokio::time::timeout(Duration::from_secs(5),
-            CoreLinkSharedClient::watch(&client, CoreWatchRequest::new("edge-chat-watch",
-                CORE_INTERNAL_TARGET, "chatMessagesFlow", CoreValue::Map(BTreeMap::from([
-                    ("chatId".into(), CoreValue::String("edge-chat".into())),
-                ]))))).await.unwrap().unwrap();
-        let initial = tokio::time::timeout(Duration::from_secs(5), stream.recv()).await.unwrap().unwrap();
-        assert_eq!(initial.kind, CoreEventKind::Snapshot);
-        source.messages.set_value(vec![RoutedChatMessage { text: "from executor".into(), contentStream: None }]);
-        let event = tokio::time::timeout(Duration::from_secs(5), stream.recv()).await.unwrap().unwrap();
-        let messages: Vec<RoutedChatMessage> = operit_link::fromCoreValue(event.value).unwrap();
-        assert_eq!(messages[0].text, "from executor");
-        drop(stream);
-        receiverTask.abort();
-        attached.close("test complete".into());
-        executorLink.close();
-    }
+
 
     /// Creates one router inside an explicit two-node Space projection.
     #[allow(non_snake_case)]
@@ -3515,7 +3981,7 @@ mod tests {
         let mut singleton = joinedSpace.clone();
         singleton.members = vec![localNodeId.to_string()];
         spaceStore.adopt(singleton).unwrap();
-        spaceStore.writeLocalDeviceProfile("Test".into(), "test".into(), "core".into(), "1".into()).unwrap();
+        spaceStore.writeLocalDeviceProfile("Test".into(), "test".into(), "core".into(), "1".into(), None).unwrap();
         let networkControlStore = NetworkControlStore::new(storage.clone()).unwrap();
         networkControlStore.initializeCurrentSpace().unwrap();
         let members = joinedSpace.members.clone();
@@ -3527,7 +3993,7 @@ mod tests {
             networkControlStore.admitMember(member.clone()).unwrap();
             networkControlStore.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
                 nodeId: member.clone(),
-                roleId: if member == bindingNodeId { "runner".into() } else { "user".into() },
+                roleId: if member == bindingNodeId { "edge".into() } else { "user".into() },
             }).unwrap();
         }
         spaceStore
@@ -3543,6 +4009,8 @@ mod tests {
         let bindingRuntime: Arc<dyn CoreNodeBindingRuntime> = bindingStore.clone();
         (
             CoreNodeRouter {
+                deviceToolService: Arc::new(std::sync::OnceLock::new()),
+                peerServices: Arc::new(OnceLock::new()),
                 localCore: Arc::new(localRuntime),
                 bindingStore: bindingRuntime,
                 localNodeId: localNodeId.to_string(),
@@ -3561,7 +4029,7 @@ mod tests {
         CoreNodeIdentityStore::new(storage.clone())
             .writeNodeId(localNodeId.to_string())
             .expect("test node identity must be writable");
-        CoreNodeRouter::new(testLocalRuntime(storage))
+        CoreNodeRouter::new(testLocalRuntime(storage)).unwrap()
     }
 
     /// Returns the sender feeding the long-lived local Tokio executor used by host tasks.
@@ -3594,6 +4062,13 @@ mod tests {
     struct TestHostRuntimeTaskScheduler;
 
     impl HostRuntimeTaskSchedulerHost for TestHostRuntimeTaskScheduler {
+        /// Reads the test Host's process-local monotonic timer clock.
+        fn monotonicTimeMillis(&self) -> HostResult<u64> {
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            Ok(START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64)
+        }
+
+
         /// Starts one synchronous test task on a native thread.
         fn scheduleHostRuntimeTask(
             &self,
@@ -3606,6 +4081,17 @@ mod tests {
 
         /// Starts one asynchronous test task on the shared local Tokio executor.
         fn scheduleHostRuntimeAsyncTask(
+            &self,
+            _taskName: &str,
+            task: HostRuntimeAsyncTask,
+        ) -> HostResult<()> {
+            testHostAsyncTaskSender()
+                .send(task)
+                .map_err(|error| operit_host_api::HostError::new(error.to_string()))
+        }
+
+        /// Executes cooperative work on the host-owned asynchronous executor.
+        fn scheduleHostRuntimeCooperativeAsyncTask(
             &self,
             _taskName: &str,
             task: HostRuntimeAsyncTask,
@@ -3754,6 +4240,7 @@ mod tests {
     struct TestRoutedCallEndpoint {
         callCount: AtomicUsize,
         methods: StdMutex<Vec<String>>,
+        policyOnly: bool,
     }
 
     impl TestRoutedCallEndpoint {
@@ -3762,7 +4249,12 @@ mod tests {
             Arc::new(Self {
                 callCount: AtomicUsize::new(0),
                 methods: StdMutex::new(Vec::new()),
+                policyOnly: false,
             })
+        }
+
+        fn newPolicyOnly() -> Arc<Self> {
+            Arc::new(Self { callCount: AtomicUsize::new(0), methods: StdMutex::new(Vec::new()), policyOnly: true })
         }
 
         /// Returns every routed method name received by this endpoint.
@@ -3784,9 +4276,7 @@ mod tests {
     impl TestRealChatSpaceEndpoint {
         /// Creates a Space endpoint that dispatches through generated ChatServiceCore routes.
         fn new() -> Arc<Self> {
-            let holder = Arc::new(tokio::sync::Mutex::new(ChatRuntimeHolder::new(Arc::new(
-                TestFileSystemHost,
-            ))));
+            let holder = Arc::new(tokio::sync::Mutex::new(ChatRuntimeHolder::new(testFileSystem())));
             let spaceRuntime = Arc::new(SpaceRuntime::new(holder.clone()));
             Arc::new(Self {
                 holder,
@@ -3820,7 +4310,7 @@ mod tests {
                 mutable_shared_stream(usize::MAX),
                 mutable_shared_stream(usize::MAX),
             );
-            let source = coreResponseStreamSource(responseStream.clone(), streamId.to_string());
+            let source = coreResponseStreamSource(responseStream.clone(), streamId.to_string(), None);
             let mut message = ChatMessage::new("ai".to_string());
             message.contentStream =
                 Some(CoreStream::fromSourceWithId(streamId.to_string(), source));
@@ -3834,46 +4324,14 @@ mod tests {
     }
 
     #[async_trait]
-    impl CoreNodeTransportClient for TestRealChatSpaceEndpoint {
-        /// Rejects direct calls because this endpoint is reached through SpaceRoute.
-        async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
-            CoreCallResponse::err(
-                request.requestId,
-                CoreLinkError::new(
-                    "UNEXPECTED_TEST_CALL",
-                    "direct call is not part of this test",
-                ),
-            )
-        }
+    impl TestRouteTarget for TestRealChatSpaceEndpoint {
 
-        /// Rejects direct snapshots because this endpoint is reached through SpaceRoute.
-        #[allow(non_snake_case)]
-        async fn watchSnapshot(
-            &self,
-            request: CoreWatchRequest,
-        ) -> Result<CoreEvent, CoreLinkError> {
-            Err(CoreLinkError::watchNotFound(&request.registryKey()))
-        }
 
-        /// Rejects direct watches because this endpoint is reached through SpaceRoute.
-        async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
-            Err(CoreLinkError::watchNotFound(&request.registryKey()))
-        }
 
-        /// Rejects direct push streams because this endpoint is reached through SpaceRoute.
-        #[allow(non_snake_case)]
-        async fn openPush(
-            &self,
-            request: CorePushRequest,
-        ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
-            Err(CoreLinkError::new(
-                "UNEXPECTED_TEST_PUSH",
-                format!(
-                    "direct push is not part of this test: {}",
-                    request.methodName
-                ),
-            ))
-        }
+
+
+
+
 
         /// Rejects routed calls because this test exercises routed Flow watches.
         #[allow(non_snake_case)]
@@ -3937,46 +4395,14 @@ mod tests {
     }
 
     #[async_trait]
-    impl CoreNodeTransportClient for TestSpaceEndpoint {
-        /// Rejects direct calls because the test exercises routed watches only.
-        async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
-            CoreCallResponse::err(
-                request.requestId,
-                CoreLinkError::new(
-                    "UNEXPECTED_TEST_CALL",
-                    "direct call is not part of this test",
-                ),
-            )
-        }
+    impl TestRouteTarget for TestSpaceEndpoint {
 
-        /// Rejects direct watch snapshots because the test exercises routed watches only.
-        #[allow(non_snake_case)]
-        async fn watchSnapshot(
-            &self,
-            request: CoreWatchRequest,
-        ) -> Result<CoreEvent, CoreLinkError> {
-            Err(CoreLinkError::watchNotFound(&request.registryKey()))
-        }
 
-        /// Rejects direct watches because the test exercises routed watches only.
-        async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
-            Err(CoreLinkError::watchNotFound(&request.registryKey()))
-        }
 
-        /// Rejects direct push streams because the test exercises routed watches only.
-        #[allow(non_snake_case)]
-        async fn openPush(
-            &self,
-            request: CorePushRequest,
-        ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
-            Err(CoreLinkError::new(
-                "UNEXPECTED_TEST_PUSH",
-                format!(
-                    "direct push is not part of this test: {}",
-                    request.methodName
-                ),
-            ))
-        }
+
+
+
+
 
         /// Rejects routed calls because the test exercises routed watches only.
         #[allow(non_snake_case)]
@@ -4039,46 +4465,14 @@ mod tests {
     }
 
     #[async_trait]
-    impl CoreNodeTransportClient for TestRoutedCallEndpoint {
-        /// Rejects direct calls because this endpoint only accepts routed Space calls.
-        async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
-            CoreCallResponse::err(
-                request.requestId,
-                CoreLinkError::new(
-                    "UNEXPECTED_TEST_CALL",
-                    "direct call is not part of this route wrapper test",
-                ),
-            )
-        }
+    impl TestRouteTarget for TestRoutedCallEndpoint {
 
-        /// Rejects direct snapshots because this endpoint only accepts routed Space calls.
-        #[allow(non_snake_case)]
-        async fn watchSnapshot(
-            &self,
-            request: CoreWatchRequest,
-        ) -> Result<CoreEvent, CoreLinkError> {
-            Err(CoreLinkError::watchNotFound(&request.registryKey()))
-        }
 
-        /// Rejects direct watches because this endpoint only accepts routed Space calls.
-        async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
-            Err(CoreLinkError::watchNotFound(&request.registryKey()))
-        }
 
-        /// Rejects direct push streams because this endpoint only accepts routed Space calls.
-        #[allow(non_snake_case)]
-        async fn openPush(
-            &self,
-            request: CorePushRequest,
-        ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
-            Err(CoreLinkError::new(
-                "UNEXPECTED_TEST_PUSH",
-                format!(
-                    "direct push is not part of this route wrapper test: {}",
-                    request.methodName
-                ),
-            ))
-        }
+
+
+
+
 
         /// Records one annotation-routed Space call and returns a unit response.
         #[allow(non_snake_case)]
@@ -4087,6 +4481,23 @@ mod tests {
             _previousNodeId: String,
             request: RoutedCoreRequest<CoreCallRequest>,
         ) -> CoreCallResponse {
+            if self.policyOnly {
+                assert_eq!(request.routeKind, RoutedCoreRequestKind::Target);
+                if request.payload.target == crate::NodeSpaceService::NODE_SPACE_TARGET {
+                    assert_eq!(request.payload.methodName, "projectionProtocol");
+                    let protocol = serde_json::json!({"protocol": crate::PeerProtocol::PeerProtocol::current(), "version":1,"nodeId":request.targetNodeId,
+                        "endpoint":false,"authorityMode":"localReplay","maxMessageBytes":65536,
+                        "snapshotPaging":false,"projectionReference":false});
+                    return CoreCallResponse::ok(request.payload.requestId, operit_link::toCoreValue(protocol).unwrap());
+                }
+                assert_eq!(request.payload.target, crate::NodeSpaceService::NODE_SPACE_CONTROL_TARGET);
+                assert!(matches!(request.payload.methodName.as_str(), "exchange" | "exchangePreferences"), "no business RPC is allowed");
+                self.callCount.fetch_add(1, Ordering::SeqCst);
+                let response = if request.payload.methodName == "exchangePreferences" { request.payload.args.clone() }
+                    else { operit_link::toCoreValue(Vec::<operit_store::SyncOperationStore::SyncOperation>::new()).unwrap() };
+                self.methods.lock().unwrap().push(request.payload.methodName);
+                return CoreCallResponse::ok(request.payload.requestId, response);
+            }
             assert_eq!(request.routeKind, RoutedCoreRequestKind::SpaceRoute);
             assert_eq!(
                 request.payload.target,
@@ -4179,46 +4590,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl CoreNodeTransportClient for TestCoreNodeRouterEndpoint {
-        /// Executes a direct Core call through the wrapped router.
-        async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
-            self.run_on_router_executor("test-router-direct-call", move |router| {
-                Box::pin(async move { CoreLinkSharedClient::call(&router, request).await })
-            })
-            .await
+    impl TestRouteTarget for TestCoreNodeRouterEndpoint {
+        fn installServices(&self, services: NodeServices) -> Result<(), String> {
+            self.router.installNodeServices(services)
         }
 
-        /// Reads a direct Core watch snapshot through the wrapped router.
-        #[allow(non_snake_case)]
-        async fn watchSnapshot(
-            &self,
-            request: CoreWatchRequest,
-        ) -> Result<CoreEvent, CoreLinkError> {
-            self.run_on_router_executor("test-router-direct-watch-snapshot", move |router| {
-                Box::pin(async move { CoreLinkSharedClient::watchSnapshot(&router, request).await })
-            })
-            .await
-        }
 
-        /// Opens a direct Core watch through the wrapped router.
-        async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
-            self.run_on_router_executor("test-router-direct-watch", move |router| {
-                Box::pin(async move { CoreLinkSharedClient::watch(&router, request).await })
-            })
-            .await
-        }
 
-        /// Opens a direct Core push through the wrapped router.
-        #[allow(non_snake_case)]
-        async fn openPush(
-            &self,
-            request: CorePushRequest,
-        ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
-            self.run_on_router_executor("test-router-direct-push", move |mut router| {
-                Box::pin(async move { CoreLinkClient::openPush(&mut router, request).await })
-            })
-            .await
-        }
+
+
+
+
+
 
         /// Executes a routed Core call through the wrapped router.
         #[allow(non_snake_case)]
@@ -4277,46 +4660,14 @@ mod tests {
     struct TestClientEndpoint;
 
     #[async_trait]
-    impl CoreNodeTransportClient for TestClientEndpoint {
-        /// Rejects direct calls because the client endpoint only receives peer events.
-        async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
-            CoreCallResponse::err(
-                request.requestId,
-                CoreLinkError::new(
-                    "UNEXPECTED_TEST_CALL",
-                    "client call is not part of this test",
-                ),
-            )
-        }
+    impl TestRouteTarget for TestClientEndpoint {
 
-        /// Rejects direct watch snapshots because the client endpoint only receives peer events.
-        #[allow(non_snake_case)]
-        async fn watchSnapshot(
-            &self,
-            request: CoreWatchRequest,
-        ) -> Result<CoreEvent, CoreLinkError> {
-            Err(CoreLinkError::watchNotFound(&request.registryKey()))
-        }
 
-        /// Rejects direct watches because the client endpoint only receives peer events.
-        async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
-            Err(CoreLinkError::watchNotFound(&request.registryKey()))
-        }
 
-        /// Rejects direct pushes because the client endpoint only receives peer events.
-        #[allow(non_snake_case)]
-        async fn openPush(
-            &self,
-            request: CorePushRequest,
-        ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
-            Err(CoreLinkError::new(
-                "UNEXPECTED_TEST_PUSH",
-                format!(
-                    "client push is not part of this test: {}",
-                    request.methodName
-                ),
-            ))
-        }
+
+
+
+
 
         /// Rejects routed calls because the client endpoint only receives peer events.
         #[allow(non_snake_case)]
@@ -4376,6 +4727,7 @@ mod tests {
         localNodeId: String,
         targetNodeId: String,
         spaceId: String,
+        peers: Arc<TestPeerService>,
     }
 
     impl CoreRouteRuntime for TestPeerRouteRuntime {
@@ -4408,10 +4760,9 @@ mod tests {
             let localNodeId = self.localNodeId.clone();
             let targetNodeId = self.targetNodeId.clone();
             let spaceId = self.spaceId.clone();
+            let peers = self.peers.clone();
             Box::pin(async move {
-                let peer = peerLink(&localNodeId, &targetNodeId)
-                    .map_err(|error| CoreLinkError::new("PEER_LINK_CLOSED", error))?;
-                peer.routedWatch(RoutedCoreRequest {
+                peers.watch(&targetNodeId.clone(), RoutedCoreRequest {
                     spaceId,
                     originNodeId: localNodeId.clone(),
                     targetNodeId,
@@ -4617,6 +4968,289 @@ mod tests {
             .expect("Core event stream ended before the expected event")
     }
 
+    /// Idle routed watches must not continually re-read bindings/topology from storage.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binding_watch_is_idle_until_routing_evidence_changes() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let local = "idle-watch-client";
+        let remote = "idle-watch-owner";
+        let key = "idle-watch-chat";
+        let (router, _holder, binding) = testCoreNodeRouterInJoinedSpaceWithBindingRuntime(
+            local, remote, key, remote,
+            CoreSpace {
+                spaceId: "idle-watch-space".into(),
+                spaceName: "Idle watch".into(),
+                spaceRevision: 2,
+                members: vec![local.into(), remote.into()],
+            },
+        );
+        let source = TestSpaceEndpoint::new();
+        let peer = installTestPeer(&router, remote.into(), source).unwrap();
+        let request = CoreWatchRequest::new(
+            "idle-watch-request", CORE_INTERNAL_TARGET, "chatMessagesFlow",
+            CoreValue::Map(BTreeMap::from([("chatId".into(), CoreValue::String(key.into()))])),
+        );
+        let mut watch = router.watchBindingFlow(key.into(), request, local.into(), None).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), watch.recv()).await.unwrap().unwrap();
+        assert_eq!(first.kind, CoreEventKind::Snapshot);
+        // Let queued setup notifications drain before measuring a silent window.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let reads = binding.reads.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(binding.reads.load(Ordering::SeqCst), reads,
+            "an unchanged routed watch must wait for events, not poll storage");
+
+        // A persistent mutation must still rebind an otherwise silent stream.
+        binding.setNodeId(local.into());
+        router.spaceStore.writeLocalDeviceProfile(local.into(), "test".into(), "test".into(), "1".into(), None).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), watch.recv()).await.unwrap().unwrap();
+        assert_eq!(next.kind, CoreEventKind::Changed);
+        assert!(binding.reads.load(Ordering::SeqCst) > reads);
+        drop(watch);
+        peer.close();
+    }
+
+    /// Drains a remote burst and completion in order without reloading routing for each event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binding_watch_drains_burst_without_per_event_route_reads() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let (local, remote, key) = ("burst-client", "burst-owner", "burst-chat");
+        let (router, _holder, binding) = testCoreNodeRouterInJoinedSpaceWithBindingRuntime(
+            local, remote, key, remote, CoreSpace {
+                spaceId: "burst-space".into(), spaceName: "Burst".into(),
+                spaceRevision: 2, members: vec![local.into(), remote.into()],
+            },
+        );
+        let endpoint = TestSpaceEndpoint::new();
+        let (segments, mut opened) = tokio::sync::mpsc::unbounded_channel();
+        endpoint.streamPool.adoptAll(vec![operit_link::CoreStreamAttachment {
+            streamId: "burst-stream".into(),
+            source: Arc::new(CoreStreamSource::new(move |_| {
+                let (sender, receiver) = CoreEventStream::channel();
+                segments.send(sender).unwrap();
+                Ok(receiver)
+            })),
+        }]);
+        let peer = installTestPeer(&router, remote.into(), endpoint).unwrap();
+        let request = CoreWatchRequest::new("burst-watch", CORE_STREAM_TARGET, "openCoreStream",
+            CoreValue::Map(BTreeMap::from([
+                ("streamId".into(), CoreValue::String("burst-stream".into())),
+                (CORE_ROUTE_STREAM_SOURCE_MODE_ARGUMENT.into(), CoreValue::String("watch".into())),
+                (CORE_ROUTE_STREAM_SOURCE_METHOD_ARGUMENT.into(), CoreValue::String("chatMessagesFlow".into())),
+                (CORE_ROUTE_STREAM_SOURCE_ARGS_ARGUMENT.into(), CoreValue::Map(BTreeMap::from([
+                    ("chatId".into(), CoreValue::String(key.into())),
+                ]))),
+            ])));
+        let mut watch = router.watchBindingFlow(key.into(), request.clone(), local.into(), None).unwrap();
+        let sender = tokio::time::timeout(Duration::from_secs(5), opened.recv()).await.unwrap().unwrap();
+        let event = |index: i32| CoreEvent {
+            requestId: Some(request.requestId.clone()), target: request.target.clone(),
+            propertyName: request.propertyName.clone(),
+            kind: if index == 350 { CoreEventKind::Completed } else { CoreEventKind::Changed },
+            value: CoreValue::String(index.to_string()),
+        };
+        sender.send(event(-1)).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), watch.recv()).await.unwrap().unwrap();
+        assert_eq!(first.value, CoreValue::String("-1".into()));
+        let reads = binding.reads.load(Ordering::SeqCst);
+        for index in 0..=350 { sender.send(event(index)).unwrap(); }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for index in 0..=350 {
+                let event = watch.recv().await.unwrap();
+                assert_eq!(event.value, CoreValue::String(index.to_string()));
+                assert_eq!(event.kind, if index == 350 { CoreEventKind::Completed } else { CoreEventKind::Changed });
+            }
+            assert!(watch.recv().await.is_none());
+        }).await.unwrap();
+        assert_eq!(binding.reads.load(Ordering::SeqCst), reads,
+            "a queued burst must not repeat persistent route validation per event");
+        peer.close();
+    }
+
+    /// Processes binding changes before queued old-segment events without per-event validation.
+    #[tokio::test]
+    async fn binding_watch_checks_route_changes_before_queued_events() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let (local, remote, key) = ("changed-client", "changed-peer", "changed-chat");
+        let (router, _holder, binding) = testCoreNodeRouterInJoinedSpaceWithBindingRuntime(
+            local, remote, key, local, CoreSpace {
+                spaceId: "changed-space".into(), spaceName: "Changed".into(),
+                spaceRevision: 2, members: vec![local.into(), remote.into()],
+            },
+        );
+        let peer = installTestPeer(&router, remote.into(), TestSpaceEndpoint::new()).unwrap();
+        let request = CoreWatchRequest::new("changed-watch", CORE_INTERNAL_TARGET, "chatMessagesFlow",
+            CoreValue::Map(BTreeMap::from([("chatId".into(), CoreValue::String(key.into()))])));
+        let (source, stream) = CoreEventStream::channel();
+        let (sender, mut events) = CoreEventStream::channel();
+        let (cancel, cancelled) = oneshot::channel();
+        let mut pump = Box::pin(router.pumpBindingFlow(
+            key.into(), request.clone(), sender, cancelled, local.into(), Some(stream),
+            router.nodeServices().unwrap().peers().subscribePeerChanges(),
+        ));
+        // Poll until the original segment is waiting, then queue both pieces of evidence.
+        assert!(futures_util::FutureExt::now_or_never(pump.as_mut()).is_none());
+        binding.binding.lock().unwrap().generation += 1;
+        router.spaceStore.writeLocalDeviceProfile(local.into(), "test".into(), "test".into(), "1".into(), None).unwrap();
+        source.send(CoreEvent {
+            requestId: Some(request.requestId), target: request.target,
+            propertyName: request.propertyName, kind: CoreEventKind::Changed,
+            value: CoreValue::String("obsolete segment".into()),
+        }).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = pump.as_mut() => panic!("logical watch ended during route change"),
+                event = events.recv() => event.unwrap(),
+            }
+        }).await.unwrap();
+        assert_eq!(event.kind, CoreEventKind::Snapshot);
+        assert_ne!(event.value, CoreValue::String("obsolete segment".into()));
+        cancel.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), pump).await.unwrap();
+        peer.close();
+    }
+
+    /// A reader awakened by journal publication must observe the committed Binding cache.
+    #[test]
+    fn binding_notification_reader_waits_for_committed_cache() {
+        let store = CoreNodeBindingStore::new(Arc::new(TestRuntimeStorageHost::default())).unwrap();
+        store.create("notification-chat", "before").unwrap();
+        let (observed, result) = std::sync::mpsc::channel();
+        let writerThread = std::thread::current().id();
+        let started = AtomicBool::new(false);
+        let reader = store.clone();
+        let _subscription = operit_store::SyncOperationStore::subscribeSyncMutations(move || {
+            if std::thread::current().id() != writerThread || started.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let reader = reader.clone();
+            let observed = observed.clone();
+            let (entering, entered) = std::sync::mpsc::channel();
+            let (finished, finish) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                entering.send(()).unwrap();
+                observed.send(reader.binding("notification-chat")).unwrap();
+                let _ = finished.send(());
+            });
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Hold the writer inside publication while the reader attempts its read.
+            let _ = finish.recv_timeout(Duration::from_millis(100));
+        });
+        let committed = store.compareAndSet("notification-chat", "before", "after").unwrap();
+        assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(), committed.binding);
+    }
+
+    /// A failed open must not become a permanently completed embedded response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedded_binding_watch_recovers_after_initial_open_failure() {
+        assertEmbeddedWatchRecovery(true, false).await;
+    }
+
+    /// A transport EOF is not the producer's explicit Completed event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedded_binding_watch_recovers_after_transport_closes() {
+        assertEmbeddedWatchRecovery(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedded_binding_watch_recovers_when_peer_change_precedes_eof() {
+        assertEmbeddedWatchRecovery(false, true).await;
+    }
+
+    async fn assertEmbeddedWatchRecovery(failFirstOpen: bool, peerChangeBeforeEof: bool) {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let local = "embedded-recovery-client";
+        let remote = "embedded-recovery-owner";
+        let chatId = "embedded-recovery-chat";
+        let streamId = "embedded-recovery-stream";
+        let router = testCoreNodeRouter(local, remote, chatId);
+        let endpoint = TestSpaceEndpoint::new();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let (attempts, mut attempted) = tokio::sync::mpsc::unbounded_channel();
+        let (segments, mut opened) = tokio::sync::mpsc::unbounded_channel();
+        endpoint.streamPool.adoptAll(vec![operit_link::CoreStreamAttachment {
+            streamId: streamId.into(),
+            source: Arc::new(CoreStreamSource::new({
+                let opens = opens.clone();
+                move |request| {
+                    let attempt = opens.fetch_add(1, Ordering::SeqCst);
+                    attempts.send(attempt).unwrap();
+                    if failFirstOpen && attempt == 0 {
+                        return Err(CoreLinkError::new("CORE_NODE_UNREACHABLE", "simulated opening race"));
+                    }
+                    let (sender, receiver) = CoreEventStream::channel();
+                    segments.send((request, sender)).unwrap();
+                    Ok(receiver)
+                }
+            })),
+        }]);
+        let peer = TestPeerService::new(local.into(), remote.into(), endpoint.clone());
+        router.installNodeServices(NodeServices::new(peer.clone())).unwrap();
+        let request = CoreWatchRequest::new(
+            "embedded-recovery-watch", CORE_STREAM_TARGET, "openCoreStream",
+            CoreValue::Map(BTreeMap::from([
+                ("streamId".into(), CoreValue::String(streamId.into())),
+                (CORE_ROUTE_STREAM_SOURCE_MODE_ARGUMENT.into(), CoreValue::String("watch".into())),
+                (CORE_ROUTE_STREAM_SOURCE_METHOD_ARGUMENT.into(), CoreValue::String("chatMessagesFlow".into())),
+                (CORE_ROUTE_STREAM_SOURCE_ARGS_ARGUMENT.into(), CoreValue::Map(BTreeMap::from([
+                    ("chatId".into(), CoreValue::String(chatId.into())),
+                ]))),
+            ])),
+        );
+        let mut watch = router.watchSpace(request).await.expect("logical watch must survive an opening race");
+        tokio::time::timeout(Duration::from_secs(5), attempted.recv()).await.unwrap().unwrap();
+        if !failFirstOpen {
+            let (request, sender) = tokio::time::timeout(Duration::from_secs(5), opened.recv()).await.unwrap().unwrap();
+            sender.send(CoreEvent {
+                requestId: Some(request.requestId), target: request.target,
+                propertyName: request.propertyName, kind: CoreEventKind::Changed,
+                value: CoreValue::String("before disconnect".into()),
+            }).unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), watch.recv()).await.unwrap().unwrap();
+            assert_eq!(event.value, CoreValue::String("before disconnect".into()));
+            if peerChangeBeforeEof {
+                peer.attach(endpoint.clone());
+                // The router's biased select consumes peer evidence before
+                // forwarding this event; close only after it was forwarded.
+                sender.send(CoreEvent {
+                    requestId: None, target: CORE_STREAM_TARGET.into(),
+                    propertyName: "openCoreStream".into(), kind: CoreEventKind::Changed,
+                    value: CoreValue::String("still connected".into()),
+                }).unwrap();
+                let event = tokio::time::timeout(Duration::from_secs(5), watch.recv()).await.unwrap().unwrap();
+                assert_eq!(event.value, CoreValue::String("still connected".into()));
+            }
+            drop(sender); // Physical connection closes without a producer Completed event.
+        }
+        // The same peer can replace a connection without changing the persisted owner.
+        if !peerChangeBeforeEof {
+            peer.attach(endpoint);
+        }
+        let (request, sender) = tokio::time::timeout(Duration::from_secs(5), opened.recv())
+            .await.expect("embedded watch must reopen after peer recovery").unwrap();
+        sender.send(CoreEvent {
+            requestId: Some(request.requestId.clone()), target: request.target.clone(),
+            propertyName: request.propertyName.clone(), kind: CoreEventKind::Changed,
+            value: CoreValue::String("after reconnect".into()),
+        }).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), watch.recv()).await.unwrap().unwrap();
+        assert_eq!(event.value, CoreValue::String("after reconnect".into()));
+        sender.send(CoreEvent {
+            requestId: Some(request.requestId), target: request.target,
+            propertyName: request.propertyName, kind: CoreEventKind::Completed,
+            value: CoreValue::Null,
+        }).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), watch.recv()).await.unwrap().unwrap();
+        assert_eq!(event.kind, CoreEventKind::Completed);
+        assert!(tokio::time::timeout(Duration::from_secs(5), watch.recv()).await.unwrap().is_none());
+        assert_eq!(opens.load(Ordering::SeqCst), 2, "normal completion must not reopen the producer");
+        peer.close();
+    }
+
     /// Verifies an async annotation wrapper routes public Rust calls to the selected remote Core.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rust_internal_annotated_call_routes_when_binding_owner_is_remote() {
@@ -4640,12 +5274,7 @@ mod tests {
                 joinedSpace,
             );
         let target = TestRoutedCallEndpoint::new();
-        let peerHandle = connectInMemoryPeerLinks(
-            localNodeId.clone(),
-            TestCoreNodeRouterEndpoint::new(localRouter.clone()),
-            targetNodeId.clone(),
-            target.clone(),
-        )
+        let peerHandle = installTestPeer(&localRouter, targetNodeId.clone(), target.clone())
         .expect("in-memory PeerLink must connect route wrapper call endpoints");
         let _routeGuard = installTestCoreRouteRuntime(Arc::new(localRouter));
 
@@ -4681,15 +5310,9 @@ mod tests {
         let targetNodeId = "core-node-source".to_string();
         let spaceId = "space-route-test".to_string();
         let source = TestSpaceEndpoint::new();
-        let client = Arc::new(TestClientEndpoint);
-        let peerHandle = connectInMemoryPeerLinks(
-            localNodeId.clone(),
-            client,
-            targetNodeId.clone(),
-            source.clone(),
-        )
-        .expect("in-memory PeerLink must connect test endpoints");
+        let peerHandle = TestPeerService::new(localNodeId.clone(), targetNodeId.clone(), source.clone());
         let routeRuntime = Arc::new(TestPeerRouteRuntime {
+            peers: peerHandle.clone(),
             localNodeId,
             targetNodeId,
             spaceId,
@@ -4751,12 +5374,7 @@ mod tests {
         let chatId = "chat-router-a".to_string();
         let router = testCoreNodeRouter(&localNodeId, &targetNodeId, &chatId);
         let source = TestSpaceEndpoint::new();
-        let peerHandle = connectInMemoryPeerLinks(
-            localNodeId.clone(),
-            Arc::new(TestClientEndpoint),
-            targetNodeId.clone(),
-            source.clone(),
-        )
+        let peerHandle = installTestPeer(&router, targetNodeId.clone(), source.clone())
         .expect("in-memory PeerLink must connect router and Space endpoint");
         let routeRuntime: Arc<dyn CoreRouteRuntime> = Arc::new(router);
         let args = CoreValue::Map(BTreeMap::from([(
@@ -4814,12 +5432,7 @@ mod tests {
         let chatId = "chat-real-flow-a".to_string();
         let router = testCoreNodeRouter(&localNodeId, &targetNodeId, &chatId);
         let source = TestRealChatSpaceEndpoint::new();
-        let peerHandle = connectInMemoryPeerLinks(
-            localNodeId.clone(),
-            Arc::new(TestClientEndpoint),
-            targetNodeId.clone(),
-            source.clone(),
-        )
+        let peerHandle = installTestPeer(&router, targetNodeId.clone(), source.clone())
         .expect("in-memory PeerLink must connect router and real Space endpoint");
         let routeRuntime: Arc<dyn CoreRouteRuntime> = Arc::new(router);
         let args = CoreValue::Map(BTreeMap::from([(
@@ -4872,7 +5485,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn routed_real_chat_messages_flow_embedded_stream_receives_live_chunks_after_open() {
+    async fn routed_real_chat_messages_flow_embedded_stream_replays_history_and_receives_live_chunks() {
         let _globalGuard = routeTestGlobalLock().lock().await;
         installTestRuntimeScheduler();
         let localNodeId = "core-node-real-chat-live-client".to_string();
@@ -4880,12 +5493,7 @@ mod tests {
         let chatId = "chat-real-flow-live".to_string();
         let router = testCoreNodeRouter(&localNodeId, &targetNodeId, &chatId);
         let source = TestRealChatSpaceEndpoint::new();
-        let peerHandle = connectInMemoryPeerLinks(
-            localNodeId.clone(),
-            Arc::new(TestClientEndpoint),
-            targetNodeId.clone(),
-            source.clone(),
-        )
+        let peerHandle = installTestPeer(&router, targetNodeId.clone(), source.clone())
         .expect("in-memory PeerLink must connect router and live Space endpoint");
         let routeRuntime: Arc<dyn CoreRouteRuntime> = Arc::new(router);
         let args = CoreValue::Map(BTreeMap::from([(
@@ -4902,6 +5510,7 @@ mod tests {
         let liveStream = source
             .publishLiveChatMessageStream(&chatId, "chat-message-stream:real-chat-live-route-test")
             .await;
+        liveStream.emit_chunk("already streaming before joining".to_string());
         let messages = waitForRoutedChatMessages(&routedFlow).await;
         let stream = messages
             .iter()
@@ -4920,17 +5529,30 @@ mod tests {
                 stream.descriptor.args.clone(),
             ))
             .expect("real live embedded ChatMessage stream must reopen through CoreNodeRouter");
+        // Each observer starts with a reset for its own renderer, then replays
+        // ordered chunks before receiving live updates.
+        let reset = receiveEvent(&mut openedStream).await;
+        let reset: MarkdownStreamEvent = operit_link::fromCoreValue(reset.value).unwrap();
+        assert_eq!(reset.eventType, "reset");
+        let replay = receiveEvent(&mut openedStream).await;
+        assert_eq!(replay.kind, CoreEventKind::Changed);
+        let replayEvent: MarkdownStreamEvent = operit_link::fromCoreValue(replay.value).unwrap();
+        assert_eq!(replayEvent.chatId, "chat-message-stream:real-chat-live-route-test");
+        assert_eq!(replayEvent.eventType, "chunk");
+        assert_eq!(replayEvent.value.as_deref(), Some("already streaming before joining"));
+        // Emit only after replay arrived, so this verifies a live subscription,
+        // not just buffered chunks collected after an already-completed turn.
         liveStream.emit_chunk("hello after live open".to_string());
         liveStream.close();
-        let reset = receiveEvent(&mut openedStream).await;
-        assert_eq!(reset.kind, CoreEventKind::Changed);
-        let resetEvent: MarkdownStreamEvent =
-            operit_link::fromCoreValue(reset.value).expect("Markdown reset event must decode");
-        assert_eq!(resetEvent.eventType, "reset");
-        let chunk = receiveEvent(&mut openedStream).await;
-        assert_eq!(chunk.kind, CoreEventKind::Changed);
-        let event: MarkdownStreamEvent =
-            operit_link::fromCoreValue(chunk.value).expect("Markdown chunk event must decode");
+        let event: MarkdownStreamEvent = loop {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), openedStream.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(chunk.kind, CoreEventKind::Changed);
+            let event: MarkdownStreamEvent = operit_link::fromCoreValue(chunk.value).unwrap();
+            if event.eventType == "chunk" {
+                break event;
+            }
+        };
         assert_eq!(
             event.chatId,
             "chat-message-stream:real-chat-live-route-test"
@@ -4975,12 +5597,7 @@ mod tests {
             &targetNodeId,
             joinedSpace,
         );
-        let peerHandle = connectInMemoryPeerLinks(
-            localNodeId.clone(),
-            TestCoreNodeRouterEndpoint::new(localRouter.clone()),
-            targetNodeId.clone(),
-            TestCoreNodeRouterEndpoint::new(targetRouter),
-        )
+        let peerHandle = installTestPeer(&localRouter, targetNodeId.clone(), TestCoreNodeRouterEndpoint::new(targetRouter))
         .expect("in-memory PeerLink must connect both real CoreNodeRouters");
         let _routeGuard = installTestCoreRouteRuntime(Arc::new(localRouter));
         let routedFlow = {
@@ -5040,116 +5657,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rust_internal_chat_messages_flow_stays_open_across_binding_owner_changes() {
-        let _globalGuard = routeTestGlobalLock().lock().await;
-        installTestRuntimeScheduler();
-        let localNodeId = "core-node-flow-owner-a".to_string();
-        let targetNodeId = "core-node-flow-owner-b".to_string();
-        let chatId = "chat-flow-owner-switch".to_string();
-        let joinedSpace = CoreSpace {
-            spaceId: "space-flow-owner-switch-test".to_string(),
-            spaceName: "Route Flow Owner Switch Test Space".to_string(),
-            spaceRevision: 2,
-            members: vec![localNodeId.clone(), targetNodeId.clone()],
-        };
-        let (localRouter, localHolder, localBinding) =
-            testCoreNodeRouterInJoinedSpaceWithBindingRuntime(
-                &localNodeId,
-                &targetNodeId,
-                &chatId,
-                &localNodeId,
-                joinedSpace.clone(),
-            );
-        let (targetRouter, targetHolder) = testCoreNodeRouterInJoinedSpace(
-            &targetNodeId,
-            &localNodeId,
-            &chatId,
-            &targetNodeId,
-            joinedSpace,
-        );
-        let peerHandle = connectInMemoryPeerLinks(
-            localNodeId.clone(),
-            TestCoreNodeRouterEndpoint::new(localRouter.clone()),
-            targetNodeId.clone(),
-            TestCoreNodeRouterEndpoint::new(targetRouter),
-        )
-        .expect("in-memory PeerLink must connect both routed Flow owners");
-        operit_link::withCoreForceLocal(async {
-            let mut holder = targetHolder.lock().await;
-            let _ = holder
-                .getCore(ChatRuntimeSlot::MAIN)
-                .chatMessagesFlow(chatId.clone())
-                .await;
-        })
-        .await;
-        let _routeGuard = installTestCoreRouteRuntime(Arc::new(localRouter));
-        let routedFlow = {
-            let mut holder = localHolder.lock().await;
-            holder
-                .getCore(ChatRuntimeSlot::MAIN)
-                .chatMessagesFlow(chatId.clone())
-                .await
-        };
-
-        {
-            let mut holder = localHolder.lock().await;
-            holder
-                .getCore(ChatRuntimeSlot::MAIN)
-                .chatHistoryDelegate
-                .publishChatMessage(
-                    &chatId,
-                    ChatMessage::new_with_markdown(
-                        "ai".to_string(),
-                        "local-before-switch".to_string(),
-                    ),
-                );
-        }
-        waitForRoutedChatText(&routedFlow, "local-before-switch").await;
-
-        localBinding.setNodeId(targetNodeId.clone());
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        {
-            let mut holder = targetHolder.lock().await;
-            holder
-                .getCore(ChatRuntimeSlot::MAIN)
-                .chatHistoryDelegate
-                .publishChatMessage(
-                    &chatId,
-                    ChatMessage::new_with_markdown(
-                        "ai".to_string(),
-                        "remote-after-switch".to_string(),
-                    ),
-                );
-        }
-        waitForRoutedChatText(&routedFlow, "remote-after-switch").await;
-
-        localBinding.setNodeId(localNodeId.clone());
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        let messagesAfterOwnerSwitch = routedFlow.value();
-        assert!(
-            messagesAfterOwnerSwitch
-                .iter()
-                .any(|message| message.displayText() == "remote-after-switch"),
-            "a replacement segment Snapshot must not roll the logical Flow back"
-        );
-        {
-            let mut holder = localHolder.lock().await;
-            holder
-                .getCore(ChatRuntimeSlot::MAIN)
-                .chatHistoryDelegate
-                .publishChatMessage(
-                    &chatId,
-                    ChatMessage::new_with_markdown(
-                        "ai".to_string(),
-                        "local-after-switch-back".to_string(),
-                    ),
-                );
-        }
-        waitForRoutedChatText(&routedFlow, "local-after-switch-back").await;
-        peerHandle.close();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rust_internal_route_preserves_structured_embedded_stream_events() {
         let _globalGuard = routeTestGlobalLock().lock().await;
         installTestRuntimeScheduler();
@@ -5176,12 +5683,7 @@ mod tests {
             &targetNodeId,
             joinedSpace,
         );
-        let peerHandle = connectInMemoryPeerLinks(
-            localNodeId.clone(),
-            TestCoreNodeRouterEndpoint::new(localRouter.clone()),
-            targetNodeId.clone(),
-            TestCoreNodeRouterEndpoint::new(targetRouter),
-        )
+        let peerHandle = installTestPeer(&localRouter, targetNodeId.clone(), TestCoreNodeRouterEndpoint::new(targetRouter))
         .expect("in-memory PeerLink must connect both structured CoreNodes");
         let _routeGuard = installTestCoreRouteRuntime(Arc::new(localRouter));
         let expectedEvents = vec![
@@ -5347,8 +5849,13 @@ mod tests {
             &targetNodeId,
             joinedSpace,
         );
+        // 注入服务与连接上线是两件事：先安装离线服务，再测试同一服务的晚到连接。
+        let endpoint = TestCoreNodeRouterEndpoint::new(targetRouter);
+        let peers = TestPeerService::new(localNodeId.clone(), targetNodeId.clone(), endpoint.clone());
+        peers.close();
+        localRouter.installNodeServices(NodeServices::new(peers.clone())).unwrap();
         let _routeGuard = installTestCoreRouteRuntime(Arc::new(localRouter.clone()));
-        let (routedFlow, peerHandle) = tokio::time::timeout(Duration::from_secs(5), async {
+        let (routedFlow, ()) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
                 async {
                     let mut holder = localHolder.lock().await;
@@ -5356,12 +5863,7 @@ mod tests {
                 },
                 async {
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    connectInMemoryPeerLinks(
-                        localNodeId.clone(),
-                        TestCoreNodeRouterEndpoint::new(localRouter.clone()),
-                        targetNodeId.clone(),
-                        TestCoreNodeRouterEndpoint::new(targetRouter),
-                    ).expect("late peer must connect the pending remote watch")
+                    peers.attach(endpoint);
                 }
             )
         }).await.expect("the first snapshot must survive failed opening attempts");
@@ -5385,7 +5887,7 @@ mod tests {
         }
         let completed = waitForRoutedChatState(&routedFlow, &InputProcessingState::Completed).await;
         assert!(!completed.isLoading);
-        peerHandle.close();
+        peers.close();
     }
 
     /// Verifies a routed chat StateFlow opens from the local Core while its selected owner has no live channel.
@@ -5395,11 +5897,14 @@ mod tests {
         installTestRuntimeScheduler();
         let router = testCoreNodeRouterWithoutBinding("core-node-local-without-binding");
         let _routeGuard = installTestCoreRouteRuntime(Arc::new(router));
-        let mut clientHolder = ChatRuntimeHolder::new(Arc::new(TestFileSystemHost));
+        let mut clientHolder = ChatRuntimeHolder::new(testFileSystem());
         let flow = clientHolder
             .getCore(ChatRuntimeSlot::MAIN)
             .chatMessagesFlow("chat-without-binding-record".to_string())
             .await;
         assert!(flow.value().is_empty());
     }
+    mod chat_input_menu_tests { use super::*; include!("router_chat_input_menu_tests.rs"); }
+    mod device_space_tests { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/device_space/mod.rs")); }
+
 }

@@ -1,8 +1,9 @@
+use super::ApiKeyProvider::KeyGetter;
 use async_trait::async_trait;
 use serde_json::Value;
 
 use super::OpenAIProvider::OpenAIProvider;
-use super::ThinkingConfiguration::ThinkingConfigurationApplier;
+use super::ThinkingDialect::ThinkingDialect;
 use crate::chat::llmprovider::AIService::{AIService, AiServiceError, SendMessageRequest};
 use crate::runtime_support::ProviderRuntimeContext;
 use operit_util::stream::RevisableTextStream::RevisableTextStreamLike;
@@ -17,7 +18,7 @@ impl OpenRouterProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         api_endpoint: String,
-        api_key: String,
+        key_getter: KeyGetter,
         model_name: String,
         provider_type: String,
         custom_headers: Vec<(String, String)>,
@@ -47,7 +48,7 @@ impl OpenRouterProvider {
         Self {
             inner: OpenAIProvider::new_with_capabilities(
                 api_endpoint,
-                api_key,
+                key_getter,
                 model_name,
                 "OPENROUTER_PARENT".to_string(),
                 merged_headers,
@@ -65,16 +66,7 @@ impl OpenRouterProvider {
         request: &SendMessageRequest,
     ) -> Result<Value, AiServiceError> {
         let mut body = self.inner.create_request_body(request)?;
-        ThinkingConfigurationApplier::apply(
-            &mut body,
-            "OPENROUTER",
-            &self.inner.model_name,
-            &self.inner.api_endpoint,
-            request.enable_thinking,
-            request.thinking_quality_level,
-            &request.thinking_configurations,
-            &request.thinking_option_id,
-        )?;
+        ThinkingDialect::OpenRouter.apply(&mut body, &request.thinking)?;
         Ok(body)
     }
 }

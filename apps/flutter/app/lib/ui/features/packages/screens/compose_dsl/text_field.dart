@@ -11,6 +11,7 @@ class _ComposeTextField extends StatefulWidget {
     required this.readOnly,
     required this.obscureText,
     required this.singleLine,
+    this.expandToFill = false,
     required this.minLines,
     required this.maxLines,
     required this.keyboardType,
@@ -28,7 +29,12 @@ class _ComposeTextField extends StatefulWidget {
     required this.supportingText,
     required this.helperText,
     required this.border,
+    this.decoration,
+    this.cursorWidth,
+    this.cursorHeight,
+    this.suffixIconConstraints,
     required this.onChanged,
+    this.onSubmitted,
   });
 
   final String identity;
@@ -37,6 +43,7 @@ class _ComposeTextField extends StatefulWidget {
   final bool readOnly;
   final bool obscureText;
   final bool singleLine;
+  final bool expandToFill;
   final int? minLines;
   final int? maxLines;
   final TextInputType? keyboardType;
@@ -53,10 +60,15 @@ class _ComposeTextField extends StatefulWidget {
   final Widget? suffix;
   final Widget? supportingText;
   final String? helperText;
-  final InputBorder border;
+  final InputBorder? border;
+  final InputDecoration? decoration;
+  final double? cursorWidth;
+  final double? cursorHeight;
+  final BoxConstraints? suffixIconConstraints;
 
   /// Resolves function for the Compose DSL renderer.
   final Future<Object?> Function(String) onChanged;
+  final Future<Object?> Function(String)? onSubmitted;
 
   /// Creates persistent state for this DSL widget.
   @override
@@ -69,6 +81,31 @@ class _ComposeTextFieldState extends State<_ComposeTextField> {
   late String _lastAppliedExternalValue;
   final List<String> _pendingEchoes = <String>[];
   Future<void> _dispatchTail = Future<void>.value();
+  bool _submitting = false;
+
+  /// Flushes pending text edits before submitting the exact current value once.
+  Future<void> _submit(String value) async {
+    if (_submitting ||
+        !widget.enabled ||
+        widget.readOnly ||
+        widget.onSubmitted == null) {
+      return;
+    }
+    _submitting = true;
+    final identity = widget.identity;
+    try {
+      await _dispatchTail;
+      if (!mounted ||
+          widget.identity != identity ||
+          !widget.enabled ||
+          widget.readOnly) {
+        return;
+      }
+      await widget.onSubmitted?.call(value);
+    } finally {
+      _submitting = false;
+    }
+  }
 
   /// Serializes edits and records values before the JavaScript round trip starts.
   void _enqueueEdit(String value) {
@@ -155,18 +192,33 @@ class _ComposeTextFieldState extends State<_ComposeTextField> {
   /// Builds the widget for the current DSL state.
   @override
   Widget build(BuildContext context) {
+    if (widget.expandToFill) {
+      return LayoutBuilder(
+        builder: (context, constraints) =>
+            _buildField(expands: constraints.hasBoundedHeight),
+      );
+    }
+    return _buildField();
+  }
+
+  /// Fills bounded multiline editors while retaining internal text scrolling.
+  Widget _buildField({bool expands = false}) {
     return TextField(
       controller: _controller,
       focusNode: _focusNode,
       enabled: widget.enabled,
       readOnly: widget.readOnly,
       obscureText: widget.obscureText,
-      maxLines: widget.maxLines,
-      minLines: widget.minLines,
+      expands: expands,
+      maxLines: expands ? null : widget.maxLines,
+      minLines: expands ? null : widget.minLines,
+      textAlignVertical: expands ? TextAlignVertical.top : null,
       keyboardType: widget.keyboardType,
       textInputAction: widget.textInputAction,
       style: widget.textStyle,
-      decoration: InputDecoration(
+      cursorWidth: widget.cursorWidth ?? 2,
+      cursorHeight: widget.cursorHeight,
+      decoration: (widget.decoration ?? const InputDecoration()).copyWith(
         labelText: widget.labelText,
         label: widget.label,
         hintText: widget.hintText,
@@ -174,13 +226,15 @@ class _ComposeTextFieldState extends State<_ComposeTextField> {
         errorText: widget.isError ? '' : null,
         prefixIcon: widget.prefixIcon,
         suffixIcon: widget.suffixIcon,
+        suffixIconConstraints: widget.suffixIconConstraints,
         prefix: widget.prefix,
         suffix: widget.suffix,
         helperText: widget.helperText,
         helper: widget.supportingText,
-        border: widget.border,
+        border: widget.decoration?.border ?? widget.border,
       ),
       onChanged: _enqueueEdit,
+      onSubmitted: widget.onSubmitted == null ? null : _submit,
     );
   }
 }

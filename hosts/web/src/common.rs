@@ -42,6 +42,11 @@ pub(crate) fn call_managed_runtime_process(method: &str, args: &[JsValue]) -> Ho
     call_function(&module, method, args)
 }
 
+/// Calls the independent browser storage-maintenance Host.
+pub(crate) fn call_data_rescue(method: &str, args: &[JsValue]) -> HostResult<JsValue> {
+    call_function(&bridge_module("dataRescue")?, method, args)
+}
+
 pub(crate) fn call_storage(method: &str, args: &[JsValue]) -> HostResult<JsValue> {
     let module = bridge_module("runtimeStorage")?;
     call_function(&module, method, args)
@@ -523,6 +528,7 @@ pub(crate) fn program_to_js(program: ManagedRuntimeProgram) -> JsValue {
         ManagedRuntimeProgram::Python => JsValue::from_str("python"),
         ManagedRuntimeProgram::Uv => JsValue::from_str("uv"),
         ManagedRuntimeProgram::Pnpm => JsValue::from_str("pnpm"),
+        ManagedRuntimeProgram::Command(name) => JsValue::from_str(&name),
     }
 }
 
@@ -536,6 +542,7 @@ pub(crate) fn system_setting_data(value: JsValue) -> HostResult<SystemSettingDat
 
 pub(crate) fn app_operation_data(value: JsValue) -> HostResult<AppOperationData> {
     Ok(AppOperationData {
+        installState: None,
         operationType: read_string_property(&value, "operationType")?,
         packageName: read_string_property(&value, "packageName")?,
         success: read_bool_property(&value, "success")?,

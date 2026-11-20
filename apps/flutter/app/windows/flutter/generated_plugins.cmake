@@ -4,13 +4,20 @@
 
 list(APPEND FLUTTER_PLUGIN_LIST
   audioplayers_windows
+  camera_windows
   desktop_drop
   desktop_multi_window
   desktop_widgets_windows
   dynamic_color
   file_selector_windows
+  floating_windows
+  fvp
+  geolocator_windows
+  operit_keep_alive
+  operit_system_fonts
   printing
   record_windows
+  share_plus
   url_launcher_windows
   webview_all_windows
 )

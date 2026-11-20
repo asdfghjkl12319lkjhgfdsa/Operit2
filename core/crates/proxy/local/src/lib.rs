@@ -4,7 +4,7 @@ extern crate self as operit_proxy_local;
 
 use async_trait::async_trait;
 use operit_host_api::HostManager::HostManager;
-use operit_host_api::{FileSystemHost, RuntimeStorageHost};
+use operit_host_api::RuntimeStorageHost;
 use operit_link::{
     CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream, CoreLinkClient,
     CoreLinkError, CoreLinkPushSession, CoreLinkSharedClient, CoreValue, CoreWatchRequest,
@@ -32,10 +32,20 @@ pub fn pluginSdkSurface() -> operit_plugin_sdk_ipc::PluginSdkSurface {
 
 #[derive(Clone)]
 pub struct LocalCoreProxy {
+    peerServices: Arc<std::sync::OnceLock<operit_node_runtime::NodeServices::NodeServices>>,
     application: Arc<Mutex<OperitApplication>>,
+    // Factory access shares live services without contending with application calls.
+    applicationServices: Arc<OperitApplication>,
+    applicationSharedClient: Arc<std::sync::Mutex<std::sync::Weak<LocalApplicationSharedClient<Self>>>>,
+    // Retains the shared command view; its executor holds only a Weak reference.
+    #[cfg(not(target_arch = "wasm32"))]
+    _coreCommandRuntime: Option<Arc<OperitApplication>>,
     chatRuntimeHolder: Arc<tokio::sync::Mutex<ChatRuntimeHolder>>,
+    spaceRuntime: Arc<operit_node_runtime::SpaceRuntime::SpaceRuntime>,
     hostManager: HostManager,
     toolRuntimeSupport: Arc<dyn ToolRuntimeSupport>,
+    deviceToolService: Arc<dyn operit_tools::tools::DeviceTools::DeviceToolService>,
+    toolPkgShutdown: Arc<dyn Fn() + Send + Sync>,
     coreStreamPool: Arc<CoreStreamPool>,
 }
 
@@ -50,6 +60,13 @@ impl LocalCoreProxy {
         })
     }
 
+    /// Returns this application's incoming device tool service.
+    pub fn deviceToolService(&self) -> Arc<dyn operit_tools::tools::DeviceTools::DeviceToolService> {
+        self.deviceToolService.clone()
+    }
+    pub fn bindDeviceToolRuntime(&self, runtime: Arc<dyn operit_tools::tools::DeviceTools::DeviceToolRuntime>) -> Result<(), String> {
+        self.toolRuntimeSupport.bindDeviceToolRuntime(runtime)
+    }
     /// Returns the host manager captured by this local proxy.
     pub fn hostManager(&self) -> &HostManager {
         &self.hostManager
@@ -108,16 +125,96 @@ impl LocalCoreProxy {
         generated_open_reverse_stream(self, request)
     }
     /// Creates a local link client backed by an in-process application.
-    pub fn new(application: OperitApplication) -> Self {
+    pub fn new(#[allow(unused_mut)] mut application: OperitApplication) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let coreCommandRuntime = Self::installCoreCommandExecutor(&mut application);
         let toolRuntimeSupport = application.toolHandler.runtimeSupport();
+        let deviceToolService = Arc::new(application.toolHandler.clone());
         let chatRuntimeHolder = application.chatRuntimeHolder.clone();
+        let spaceRuntime = Arc::new(operit_node_runtime::SpaceRuntime::SpaceRuntime::new(
+            chatRuntimeHolder.clone(),
+        ));
+        let toolPkgShutdown = Arc::new(application.toolHandler.getOrCreatePackageManager()
+            .lock().expect("package manager mutex poisoned").executionEngineShutdown());
         Self {
+            peerServices: Arc::new(std::sync::OnceLock::new()),
             hostManager: application.hostManager.clone(),
             toolRuntimeSupport,
+            deviceToolService,
+            toolPkgShutdown,
+            applicationServices: Arc::new(application.sharedCoreCommandRuntime()),
             application: Arc::new(Mutex::new(application)),
+            applicationSharedClient: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
+            #[cfg(not(target_arch = "wasm32"))]
+            _coreCommandRuntime: coreCommandRuntime,
             chatRuntimeHolder,
+            spaceRuntime,
             coreStreamPool: Arc::new(CoreStreamPool::new()),
         }
+    }
+
+    /// Releases container-owned workers without taking the asynchronous application lock.
+    #[allow(non_snake_case)]
+    pub fn shutdownToolPkgExecutionEngines(&self) {
+        (self.toolPkgShutdown)();
+    }
+
+    /// Binds plugin CLI calls to this application's live services, including Flutter hosts.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn installCoreCommandExecutor(
+        application: &mut OperitApplication,
+    ) -> Option<Arc<OperitApplication>> {
+        if application.hostManager.coreCommandExecutor.is_some() {
+            return None;
+        }
+        Some(Arc::new_cyclic(
+            |runtime: &std::sync::Weak<OperitApplication>| {
+                let runtime = runtime.clone();
+                let executor: operit_host_api::HostManager::CoreCommandExecutor =
+                    Arc::new(move |args| {
+                        let runtime = runtime.clone();
+                        Box::pin(async move {
+                            let runtime = runtime.upgrade().ok_or_else(|| {
+                                "Core command runtime has been released.".to_string()
+                            })?;
+                            let scheduler = runtime
+                                .hostManager
+                                .hostRuntimeTaskSchedulerHost
+                                .clone()
+                                .ok_or_else(|| {
+                                    "Core command execution requires a task scheduler host."
+                                        .to_string()
+                                })?;
+                            let mut commandApplication = runtime.sharedCoreCommandRuntime();
+                            let (sender, receiver) = tokio::sync::oneshot::channel();
+                            scheduler
+                                .scheduleHostRuntimeAsyncTask(
+                                    "core-tool-command",
+                                    Box::new(move || {
+                                        Box::pin(async move {
+                                            let result = operit_command_core::run_core_command(
+                                                &mut commandApplication,
+                                                &args,
+                                            )
+                                            .await
+                                            .map(|output| {
+                                                format!("{}{}", output.stdout, output.stderr)
+                                            });
+                                            let _ = sender.send(result);
+                                        })
+                                    }),
+                                )
+                                .map_err(|error| error.message)?;
+                            receiver
+                                .await
+                                .map_err(|error| format!("Core command task stopped: {error}"))?
+                        })
+                    });
+                application.hostManager.coreCommandExecutor = Some(executor.clone());
+                application.toolHandler.setCoreCommandExecutor(executor);
+                application.sharedCoreCommandRuntime()
+            },
+        ))
     }
 
     /// Returns mutable access to the hosted local application.
@@ -142,21 +239,24 @@ impl LocalCoreProxy {
         self.chatRuntimeHolder.clone()
     }
 
-    /// Creates the server-internal client that dispatches only to the local application object.
+    /// Shares the live application client across generated facades without retaining a cycle.
     #[allow(non_snake_case)]
     pub fn localApplicationSharedClient(&self) -> Arc<dyn CoreLinkSharedClient + Send + Sync> {
-        Arc::new(LocalApplicationSharedClient::new(Arc::new(self.clone()), "core/application"))
+        let mut shared = self.applicationSharedClient.lock()
+            .expect("Local application client lock poisoned");
+        if let Some(client) = shared.upgrade() {
+            return client;
+        }
+        let client = Arc::new(LocalApplicationSharedClient::new(Arc::new(self.clone()), "core/application"));
+        *shared = Arc::downgrade(&client);
+        client
     }
 
-    /// Builds the native server capability container for this local Core.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Builds the shared node capability container over this Core's Host APIs.
     pub fn coreNodeLocalRuntime(
         &self,
     ) -> operit_node_runtime::CoreNodeRouter::CoreNodeLocalRuntime {
         let proxy = Arc::new(self.clone());
-        let spaceRuntime = Arc::new(operit_node_runtime::SpaceRuntime::SpaceRuntime::new(
-            self.chatRuntimeHolder(),
-        ));
         let sharedClient: Arc<dyn CoreLinkSharedClient + Send + Sync> = proxy.clone();
         let applicationClient = self.localApplicationSharedClient();
         let bindCoreNodeToolRuntime = {
@@ -174,17 +274,14 @@ impl LocalCoreProxy {
             Arc::new(LocalCoreProxy::generatedTargetForSchema),
             bindCoreNodeToolRuntime,
             openPush,
-            spaceRuntime,
-        )
+            self.spaceRuntime.clone(),
+        ).withPeerServices(self.peerServices.clone())
     }
 
     /// Returns the file-system capability owned by this local core.
     #[allow(non_snake_case)]
-    pub fn fileSystemHost(&self) -> Arc<dyn FileSystemHost> {
-        self.hostManager
-            .fileSystemHost
-            .clone()
-            .expect("LocalCoreProxy requires a FileSystemHost")
+    pub fn filesystem(&self) -> Arc<operit_vfs::VisualFileSystem::VisualFileSystem> {
+        Arc::new(self.hostManager.vfs().expect("LocalCoreProxy requires VFS"))
     }
 }
 
@@ -233,7 +330,7 @@ impl CoreLinkSharedClient for LocalCoreProxy {
             request.requestId.0, request.target, request.propertyName
         );
         let (result, attachments) = operit_link::withCoreStreamCapture(
-            generated_dispatch_core_proxy_watch_snapshot_async(self, request),
+            operit_link::isolation::future(&context, generated_dispatch_core_proxy_watch_snapshot_async(self, request)),
         )
         .await;
         self.adoptCoreStreamAttachments(attachments);
@@ -251,12 +348,20 @@ impl CoreLinkSharedClient for LocalCoreProxy {
             "watch request={} object={} property={}",
             request.requestId.0, request.target, request.propertyName
         );
-        generated_dispatch_core_proxy_watch_async(self, request)
+        operit_link::isolation::future(&context, generated_dispatch_core_proxy_watch_async(self, request))
             .await
             .map_err(|mut error| {
                 error.message = format!("{} [{context}]", error.message);
                 error
             })
+    }
+
+    /// Opens one generated reverse stream through the shared local Core client.
+    async fn openPush(
+        &self,
+        request: operit_link::CorePushRequest,
+    ) -> Result<Box<dyn operit_link::CoreLinkPushSession>, operit_link::CoreLinkError> {
+        self.openPushLocal(request)
     }
 }
 
@@ -303,14 +408,23 @@ impl LocalApplicationBridgeTarget for LocalCoreProxy {
             self.streamAttachmentAdopter(),
         )
     }
+
+    /// Opens one generated application input stream through the local reverse-stream dispatcher.
+    async fn openLocalApplicationPush(
+        &self,
+        request: operit_link::CorePushRequest,
+    ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
+        self.openPushLocal(request)
+    }
 }
 
 impl LocalCoreProxy {
     #[allow(non_snake_case)]
     async fn dispatchCall(&self, request: CoreCallRequest) -> Result<CoreValue, CoreLinkError> {
-        let (result, attachments) =
-            operit_link::withCoreStreamCapture(generated_dispatch_core_proxy_call(self, request))
-                .await;
+        let context = format!("Local request {}::{} [{}]", request.target, request.methodName, request.requestId.0);
+        let (result, attachments) = operit_link::withCoreStreamCapture(
+            operit_link::isolation::future(&context, generated_dispatch_core_proxy_call(self, request)),
+        ).await;
         self.adoptCoreStreamAttachments(attachments);
         result
     }
@@ -329,8 +443,9 @@ impl LocalCoreProxy {
 
     #[allow(non_snake_case)]
     fn dispatchWatchSnapshot(&self, request: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
+        let context = format!("Local watch snapshot {}::{} [{}]", request.target, request.propertyName, request.requestId.0);
         let (result, attachments) = operit_link::withCoreStreamCaptureSync(|| {
-            generated_dispatch_core_proxy_watch_snapshot(self, request)
+            operit_link::isolation::sync(&context, || generated_dispatch_core_proxy_watch_snapshot(self, request))
         });
         self.adoptCoreStreamAttachments(attachments);
         result
@@ -341,7 +456,8 @@ impl LocalCoreProxy {
         if request.target == operit_link::CORE_STREAM_TARGET {
             return self.openCoreStreamWatch(request);
         }
-        generated_dispatch_core_proxy_watch(self, request)
+        let context = format!("Local watch {}::{} [{}]", request.target, request.propertyName, request.requestId.0);
+        operit_link::isolation::sync(&context, || generated_dispatch_core_proxy_watch(self, request))
     }
 
     /// Transfers serialized stream sources into this proxy's owned pool.
@@ -370,12 +486,12 @@ mod tests {
         CoreEventKind, CoreStreamAttachment, CoreStreamSource, CORE_STREAM_TARGET,
     };
     use operit_util::RuntimeStorageLayout::{RUNTIME_ROOT_DIR_PATH, WORKSPACE_DIR_PATH};
-    use operit_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
+
     use std::collections::BTreeMap;
 
-    /// Verifies generated watch dispatch treats the protocol stream pool id as a stream source.
+    /// Keeps factory calls and watches independent of the application lock and stream pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn generated_async_watch_dispatch_opens_core_stream_pool() {
+    async fn generated_factories_ignore_application_lock_and_open_core_stream_pool() {
         let mut hostManager = HostManager::withFileSystemHost(Arc::new(PosixFileSystemHost::new()));
         let root = std::env::temp_dir().join(format!(
             "operit-proxy-local-generated-dispatch-{}",
@@ -385,10 +501,7 @@ mod tests {
         let workspaceRoot = root.join(WORKSPACE_DIR_PATH);
         std::fs::create_dir_all(&runtimeRoot).expect("test runtime root must be created");
         std::fs::create_dir_all(&workspaceRoot).expect("test workspace root must be created");
-        setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(
-            runtimeRoot.clone(),
-            workspaceRoot.clone(),
-        ));
+
         let storageHost = Arc::new(NativeRuntimeStorageHost::new(runtimeRoot, workspaceRoot));
         hostManager.runtimeStorageHost = Some(storageHost.clone());
         hostManager.runtimeSqliteHost = Some(storageHost);
@@ -401,25 +514,36 @@ mod tests {
             LocalCoreProxy::generatedTargetForSchema("application.packageManager")
                 .expect("package manager must be generated");
         let application_guard = proxy.application.lock().await;
-        let mut pending_watch = Box::pin(CoreLinkSharedClient::watch(
-            &proxy,
-            CoreWatchRequest::new(
-                "contended-package-watch",
-                package_manager_id,
-                "__test_missing_property",
-                CoreValue::Map(BTreeMap::new()),
-            ),
+        assert!(Arc::ptr_eq(
+            &proxy.applicationServices.packageManager(),
+            &application_guard.packageManager(),
         ));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut pending_watch)
+        let timeout = std::time::Duration::from_secs(2);
+        for (method, args) in [
+            ("getToolPkgNavigationEntries", serde_json::json!({"useEnglish": false})),
+            ("getToolPkgUiRoutes", serde_json::json!({"useEnglish": false, "runtime": "compose_dsl"})),
+        ] {
+            let request = CoreCallRequest::new(
+                method, package_manager_id, method, operit_link::toCoreValue(args).unwrap(),
+            );
+            let response = tokio::time::timeout(timeout, CoreLinkSharedClient::call(&proxy, request))
                 .await
-                .is_err(),
-            "an async factory watch must wait instead of returning Application is busy"
-        );
+                .expect("sidebar catalog calls must not wait for the application lock");
+            assert!(response.result.is_ok(), "{response:?}");
+        }
+        let watch_result = tokio::time::timeout(
+            timeout,
+            CoreLinkSharedClient::watch(
+                &proxy,
+                CoreWatchRequest::new(
+                    "contended-package-watch",
+                    package_manager_id,
+                    "__test_missing_property",
+                    CoreValue::Map(BTreeMap::new()),
+                ),
+            ),
+        ).await.expect("factory watches must not wait for the application lock");
         drop(application_guard);
-        let watch_result = tokio::time::timeout(std::time::Duration::from_secs(2), pending_watch)
-            .await
-            .expect("watch must resume after the parent lock is released");
         let error = match watch_result {
             Err(error) => error,
             Ok(_) => panic!("unknown property must fail after resolving the factory"),

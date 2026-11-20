@@ -13,16 +13,17 @@ import '../proxy/generated/CoreProxyModels.g.dart';
 
 /// Delivers application events through the active system-notification host.
 class AppNotificationService with WidgetsBindingObserver {
-  AppNotificationService._();
+  /// Creates notification delivery over the selected runtime clients.
+  AppNotificationService({GeneratedCoreProxyClients? clients})
+    : _clients =
+          clients ?? const GeneratedCoreProxyClients(ProxyCoreRuntimeBridge());
 
   /// Returns the process-wide application notification service.
-  static final AppNotificationService instance = AppNotificationService._();
+  static final AppNotificationService instance = AppNotificationService();
 
   static const String _logTag = 'AppNotification';
   static const MethodChannel _runtimeChannel = MethodChannel('operit/runtime');
-  static const GeneratedCoreProxyClients _clients = GeneratedCoreProxyClients(
-    ProxyCoreRuntimeBridge(),
-  );
+  final GeneratedCoreProxyClients _clients;
 
   StreamSubscription<RuntimeHostInteractionRequest>? _subscription;
   bool _isForeground = true;
@@ -71,6 +72,7 @@ class AppNotificationService with WidgetsBindingObserver {
       case RuntimeHostInteractionKind.webVisit:
       case RuntimeHostInteractionKind.composeWebViewController:
       case RuntimeHostInteractionKind.composeFilePicker:
+      case RuntimeHostInteractionKind.composeFileSave:
       case RuntimeHostInteractionKind.systemCaptureScreenshot:
       case RuntimeHostInteractionKind.systemLanguageCode:
       case RuntimeHostInteractionKind.systemRecognizeText:
@@ -83,7 +85,6 @@ class AppNotificationService with WidgetsBindingObserver {
       case RuntimeHostInteractionKind.ttsSynthesis:
       case RuntimeHostInteractionKind.ttsPlayback:
       case RuntimeHostInteractionKind.localInference:
-      case RuntimeHostInteractionKind.webAccessPairing:
         throw StateError(
           'unexpected application notification kind: ${request.kind.name}',
         );
@@ -116,6 +117,13 @@ class AppNotificationService with WidgetsBindingObserver {
     }
   }
 
+  /// Releases event delivery and lifecycle tracking when the service is stopped.
+  Future<void> dispose() async {
+    WidgetsBinding.instance.removeObserver(this);
+    await _subscription?.cancel();
+    _subscription = null;
+  }
+
   /// Sends one system notification only while this application is not foregrounded.
   Future<void> _sendWhenBackground(
     String title,
@@ -123,11 +131,29 @@ class AppNotificationService with WidgetsBindingObserver {
     required String? chatId,
   }) async {
     if (await _isApplicationForeground()) {
-      ClientLogger.d(
+      ClientLogger.v(
         'notification suppressed applicationForeground=true',
         tag: _logTag,
+        verboseLevel: VerboseLevel.level5,
       );
       return;
+    }
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.macOS) {
+      final snapshot = await _runtimeChannel.invokeMapMethod<String, Object?>(
+        'hostOnboardingPermissionSnapshot',
+        <String, Object?>{'hostId': 'macos'},
+      );
+      final permission = snapshot?['macos.notifications'];
+      if (permission is! Map || permission['status'] is! String) {
+        throw StateError('macOS notification permission snapshot is missing');
+      }
+      if (permission['status'] != 'Satisfied') {
+        ClientLogger.i(
+          'notification suppressed permission=${permission['status']}',
+          tag: _logTag,
+        );
+        return;
+      }
     }
     await _clients.servicesRuntimeHostInteractionService.sendSystemNotification(
       title: title,

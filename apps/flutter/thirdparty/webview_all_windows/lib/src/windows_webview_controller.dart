@@ -148,12 +148,14 @@ class WindowsWebViewController extends PlatformWebViewController {
   final native_webview.WebviewController _webviewController;
   final Map<String, JavaScriptChannelParams> _javaScriptChannelParams =
       <String, JavaScriptChannelParams>{};
+  final Set<String> _userScriptIdentifiers = <String>{};
   final Map<String, String> _javaScriptChannelScriptIds = <String, String>{};
   final Map<String, String> _virtualHostMappings = <String, String>{};
   final List<StreamSubscription<dynamic>> _subscriptions =
       <StreamSubscription<dynamic>>[];
 
-  Future<void>? _initializationFuture;
+  late final Future<void> _initializationFuture;
+  Future<void>? _disposeFuture;
   WindowsNavigationDelegate? _currentNavigationDelegate;
   String? _currentUrl;
   String? _pageStartedUrl;
@@ -204,10 +206,10 @@ class WindowsWebViewController extends PlatformWebViewController {
     return native_webview.WebviewController.getWebViewVersion();
   }
 
-  /// Returns the process-local Flutter texture id for the real WebView surface.
-  Future<int> browserSurfaceTextureId() async {
+  /// Returns the process-local native platform-view ID for the real WebView surface.
+  Future<int> browserSurfacePlatformViewId() async {
     await _ensureInitialized();
-    return _webviewController.surfaceTextureId;
+    return _webviewController.surfacePlatformViewId;
   }
 
   /// Resizes the real WebView compositor surface.
@@ -277,10 +279,9 @@ class WindowsWebViewController extends PlatformWebViewController {
   /// Applies the host color preference after the native WebView is ready.
   Future<void> setPreferredColorScheme(Brightness brightness) async {
     await _ensureInitialized();
-    await const MethodChannel('operit/webview_theme').invokeMethod<void>(
-      'setPreferredColorScheme',
-      brightness.name,
-    );
+    await const MethodChannel(
+      'operit/webview_theme',
+    ).invokeMethod<void>('setPreferredColorScheme', brightness.name);
   }
 
   Future<void> _initialize() async {
@@ -319,8 +320,27 @@ class WindowsWebViewController extends PlatformWebViewController {
     ]);
   }
 
-  Future<void> _ensureInitialized() async {
-    await _initializationFuture!;
+  /// Reuses the controller's initialization future so rebuilds keep the surface mounted.
+  Future<void> _ensureInitialized() => _initializationFuture;
+
+  /// Releases the WebView2 instance once, including when initialization is pending.
+  @override
+  Future<void> dispose() => _disposeFuture ??= _dispose();
+
+  /// Removes event listeners before closing the native controller.
+  Future<void> _dispose() async {
+    try {
+      await _initializationFuture;
+    } finally {
+      try {
+        await Future.wait(
+          _subscriptions.map((subscription) => subscription.cancel()),
+        );
+      } finally {
+        _subscriptions.clear();
+        await _webviewController.dispose();
+      }
+    }
   }
 
   void _handleUrlChanged(String url) {
@@ -597,6 +617,20 @@ class WindowsWebViewController extends PlatformWebViewController {
   }
 
   @override
+  String get localResourceScheme => 'https';
+
+  @override
+  Future<void> setLocalResourceHandler(
+    WebViewLocalResourceHandler? handler,
+  ) async {
+    await _ensureInitialized();
+    await WebViewLocalResourceBridge.setHandler(
+      _webviewController.surfacePlatformViewId,
+      handler,
+    );
+  }
+
+  @override
   Future<void> loadFile(String absoluteFilePath) async {
     await _ensureInitialized();
     final file = File(absoluteFilePath);
@@ -735,15 +769,45 @@ class WindowsWebViewController extends PlatformWebViewController {
   }
 
   @override
-  Future<Object> runJavaScriptReturningResult(String javaScript) async {
+  Future<Object?> runJavaScriptReturningResult(String javaScript) async {
     await _ensureInitialized();
-    final dynamic result = await _webviewController.executeScript(javaScript);
-    if (result == null) {
-      throw ArgumentError(
-        'The JavaScript returned `null` or `undefined`, which is unsupported.',
-      );
+    return _webviewController.executeScript(javaScript);
+  }
+
+  /// Registers a WebView2 document-created script and retains its native handle.
+  @override
+  Future<String> addUserScript(WebViewUserScript userScript) async {
+    await _ensureInitialized();
+    final identifier = await _webviewController
+        .addScriptToExecuteOnDocumentCreated(
+          buildUserScriptSource(
+            userScript,
+            platformHandlesMainFrameOnly: false,
+          ),
+        );
+    if (identifier == null) {
+      throw StateError('WebView2 did not return a script handle');
     }
-    return result as Object;
+    _userScriptIdentifiers.add(identifier);
+    return identifier;
+  }
+
+  /// Removes one registered application script without affecting channel scripts.
+  @override
+  Future<void> removeUserScript(String identifier) async {
+    await _ensureInitialized();
+    if (!_userScriptIdentifiers.remove(identifier)) {
+      throw ArgumentError.value(identifier, 'identifier');
+    }
+    await _webviewController.removeScriptToExecuteOnDocumentCreated(identifier);
+  }
+
+  /// Removes all registered application scripts from future documents.
+  @override
+  Future<void> removeAllUserScripts() async {
+    for (final identifier in _userScriptIdentifiers.toList()) {
+      await removeUserScript(identifier);
+    }
   }
 
   @override
@@ -773,9 +837,10 @@ class WindowsWebViewController extends PlatformWebViewController {
     ''';
     final scriptId = await _webviewController
         .addScriptToExecuteOnDocumentCreated(script);
-    if (scriptId != null) {
-      _javaScriptChannelScriptIds[name] = scriptId;
+    if (scriptId == null) {
+      throw StateError('WebView2 did not return a channel script handle');
     }
+    _javaScriptChannelScriptIds[name] = scriptId;
   }
 
   @override

@@ -173,6 +173,7 @@ pub struct NetHostBrowserEvaluateOptions {
 /// Supplies local files to an active browser file chooser.
 pub struct NetHostBrowserFileUploadOptions {
     /// Lists the local file paths selected for upload; omission cancels the chooser.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<String>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -516,8 +517,45 @@ pub enum NetCookieManagerSetCookies {
     Variant1(String),
     Variant2(BTreeMap<String, String>),
 }
+/// Selects an engine-owned text WebSocket operation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetWebSocketRequest {
+    #[serde(rename = "open")]
+    Open { url: String, connect_timeout_seconds: u64 },
+    #[serde(rename = "open_binary")]
+    OpenBinary { url: String, connect_timeout_seconds: u64 },
+    #[serde(rename = "read")]
+    Read { handle: String },
+    #[serde(rename = "send")]
+    Send { handle: String, text: String },
+    #[serde(rename = "send_binary")]
+    SendBinary { handle: String, base64: String },
+    #[serde(rename = "close")]
+    Close { handle: String },
+}
+
+/// Preserves ordered WebSocket lifecycle and UTF-8 message events.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NetWebSocketEvent {
+    #[serde(rename = "opened")]
+    Opened,
+    #[serde(rename = "message")]
+    Message { text: String },
+    #[serde(rename = "binary")]
+    Binary { base64: String },
+    #[serde(rename = "closed")]
+    Closed,
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
 /// Performs HTTP requests and controls the browser automation tools available at runtime.
 pub trait NetHost: Send + Sync {
+    /// Controls one engine-owned text WebSocket through the networking Host.
+    /// @since ToolPkg API 2.0.0
+    fn webSocket(&self, request: NetWebSocketRequest) -> JsFuture<WebSocketResultData>;
     ///
     ///Perform HTTP GET request
     ///@param url - URL to request

@@ -2,28 +2,26 @@
 
 import 'dart:async';
 import 'PluginHotReload.dart';
+import 'WorkActivityPresentationService.dart';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
+import 'package:operit_keep_alive/operit_keep_alive.dart';
 import 'package:flutter/widgets.dart';
 
 import '../bridge/ProxyCoreRuntimeBridge.dart';
 import '../host/RuntimeHostInteractionSubscriber.dart';
-import '../link_access/LinkAccessHost.dart';
 import '../logging/ClientLogger.dart';
 import '../notifications/AppNotificationService.dart';
 import '../proxy/generated/CoreProxyClients.g.dart';
 import '../proxy/generated/CoreProxyModels.g.dart';
 import '../runtime/RuntimeBootstrapManager.dart';
 import '../runtime/RuntimeDeviceInfoProvider.dart';
-import '../runtime/RemotePairingBridge.dart';
 
 class CoreApplicationService with WidgetsBindingObserver {
   CoreApplicationService._();
 
   static final CoreApplicationService instance = CoreApplicationService._();
   static const String _logTag = 'CoreApplication';
-  static const MethodChannel _runtimeChannel = MethodChannel('operit/runtime');
   static const GeneratedCoreProxyClients _coreClients =
       GeneratedCoreProxyClients(ProxyCoreRuntimeBridge());
 
@@ -33,9 +31,9 @@ class CoreApplicationService with WidgetsBindingObserver {
       StreamController<Object>.broadcast();
 
   bool _initialized = false;
-  bool _localBackgroundServiceStartAttempted = false;
-  bool _linkHostStartAttempted = false;
-  bool _webAccessBootstrapAttempted = false;
+  bool _ownsRuntime = true;
+  AppLifecycleState? _lastEmittedLifecycleState;
+  KeepAliveLease? _coreResidency;
   Future<void>? _runtimeServicesStart;
   Object? _pendingStartupError;
 
@@ -49,42 +47,60 @@ class CoreApplicationService with WidgetsBindingObserver {
   }
 
   /// Installs process-level Core lifecycle listeners.
-  void initialize() {
+  void initialize({bool ownsRuntime = true}) {
     if (_initialized) {
-      ClientLogger.d(
+      ClientLogger.v(
         'initialize skipped alreadyInitialized=true',
         tag: _logTag,
+        verboseLevel: VerboseLevel.level1,
       );
       return;
     }
     final stopwatch = Stopwatch()..start();
-    ClientLogger.i('initialize start', tag: _logTag);
+    ClientLogger.v(
+      'initialize start',
+      tag: _logTag,
+      verboseLevel: VerboseLevel.level1,
+    );
     _initialized = true;
+    _ownsRuntime = ownsRuntime;
+    if (_ownsRuntime) {
+      OperitKeepAlive.instance.report.addListener(_handleResidencyChanged);
+    }
     PluginHotReload.register(_coreClients);
     WidgetsBinding.instance.addObserver(this);
     _runtimeManager.addListener(_handleRuntimeBootstrapChanged);
+    unawaited(_syncHostSubscriber());
     unawaited(_startRuntimeServices());
-    ClientLogger.i(
+    ClientLogger.v(
       'initialize done elapsedMs=${stopwatch.elapsedMilliseconds}',
       tag: _logTag,
+      verboseLevel: VerboseLevel.level1,
     );
   }
 
   /// Forwards Flutter lifecycle changes through the normalized runtime event ingress.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed &&
-        _runtimeManager.runtimeConfigured) {
+    if (!_runtimeManager.runtimeConfigured) return;
+    if (state == AppLifecycleState.resumed) {
       unawaited(_syncHostSubscriber());
+      if (_ownsRuntime) {
+        unawaited(
+          WorkActivityPresentationService.instance.refreshCapabilities(),
+        );
+      }
     }
     unawaited(_emitLifecycleEvent(state));
   }
 
   /// Emits one lifecycle event after the selected runtime becomes callable.
   Future<void> _emitLifecycleEvent(AppLifecycleState state) async {
-    if (!_runtimeManager.runtimeConfigured) {
+    if (!_runtimeManager.runtimeConfigured ||
+        _lastEmittedLifecycleState == state) {
       return;
     }
+    _lastEmittedLifecycleState = state;
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     final topic = switch (state) {
       AppLifecycleState.resumed => RuntimeEventTopic.appLifecycleResumed,
@@ -156,10 +172,18 @@ class CoreApplicationService with WidgetsBindingObserver {
   Future<void> _startRuntimeServices() {
     final activeStart = _runtimeServicesStart;
     if (activeStart != null) {
-      ClientLogger.d('runtime services start already active', tag: _logTag);
+      ClientLogger.v(
+        'runtime services start already active',
+        tag: _logTag,
+        verboseLevel: VerboseLevel.level1,
+      );
       return activeStart;
     }
-    ClientLogger.i('runtime services start scheduled', tag: _logTag);
+    ClientLogger.v(
+      'runtime services start scheduled',
+      tag: _logTag,
+      verboseLevel: VerboseLevel.level1,
+    );
     final start = _startRuntimeServicesOnce();
     _runtimeServicesStart = start;
     return start.whenComplete(() {
@@ -169,43 +193,71 @@ class CoreApplicationService with WidgetsBindingObserver {
     });
   }
 
-  /// Starts host subscriptions and LinkHost outside the widget lifecycle.
+  /// Starts host subscriptions and configured node listeners outside the widget lifecycle.
   Future<void> _startRuntimeServicesOnce() async {
     final stopwatch = Stopwatch()..start();
-    if (!_runtimeManager.runtimeConfigured) {
-      ClientLogger.i(
-        'runtime services waiting for configuration',
-        tag: _logTag,
-      );
-      return;
-    }
     try {
+      if (!_runtimeManager.runtimeConfigured) return;
       ClientLogger.attachPersistentStorage();
-      ClientLogger.i(
-        'runtime services start localConfirmed=${_runtimeManager.config.confirmed}',
-        tag: _logTag,
-      );
-      await _startLocalBackgroundService();
-      await _syncHostSubscriber();
-      AppNotificationService.instance.initialize();
-      if (!_runtimeManager.config.confirmed) {
-        ClientLogger.i(
-          'runtime services start done localStorageConfirmed=false elapsedMs=${stopwatch.elapsedMilliseconds}',
-          tag: _logTag,
-        );
+      if (!_ownsRuntime) {
+        await _syncHostSubscriber();
+        AppNotificationService.instance.initialize();
         return;
       }
-      final deviceInfo = await RuntimeDeviceInfoProvider.current();
-      await _coreClients.linkAccess.linkAccessStore.initializeIdentity(
-        deviceInfo: deviceInfo,
+      ClientLogger.v(
+        'runtime services start localConfirmed=${_runtimeManager.config.confirmed}',
+        tag: _logTag,
+        verboseLevel: VerboseLevel.level1,
       );
-      await _coreClients.server.runtimeRemoteLinkService
-          .updateCurrentDeviceUserName(
-            userName: _runtimeManager.activeIdentity.name,
+      await _retainCoreRuntime();
+      await _syncHostSubscriber();
+      AppNotificationService.instance.initialize();
+      await WorkActivityPresentationService.instance.initialize();
+      final deviceInfo = await RuntimeDeviceInfoProvider.current();
+      Future<void> spaceStep(
+        String operation,
+        Future<void> Function() run,
+      ) async {
+        try {
+          await run();
+        } catch (error, stackTrace) {
+          ClientLogger.e(
+            operation,
+            tag: _logTag,
+            error: error,
+            stackTrace: stackTrace,
           );
-      await _ensureLinkHostStarted();
-      await _coreClients.server.runtimeRemoteLinkService.startSpaceSync();
-      await _bootstrapWebAccessSession();
+        }
+      }
+
+      await spaceStep('Initialize Space device presentation', () async {
+        await _coreClients.server.runtimeRemoteLinkService.initializeDeviceInfo(
+          supplied: deviceInfo,
+        );
+      });
+      await spaceStep('Update Space device user name', () async {
+        await _coreClients.server.runtimeRemoteLinkService
+            .updateCurrentDeviceUserName(
+              userName: _runtimeManager.activeIdentity.name,
+            );
+      });
+      // 配置和监听生命周期归 runtime；Dart 只调用生成的类型化 Proxy。
+      final peerService = _coreClients.server.runtimeRemoteLinkService;
+      final config = await peerService.localHostConfig();
+      if (config == null) {
+        throw StateError('Runtime listener preferences were not initialized');
+      }
+      // Activate only configured transports whose inbound Host operation exists.
+      final capabilities = await peerService.listenerCapabilities();
+      final transports = config.transports
+          .where(capabilities.transports.contains)
+          .toList();
+      if (transports.isNotEmpty || config.discovery != null) {
+        await peerService.startListening(transports: transports);
+      }
+      await spaceStep('Start Space synchronization', () async {
+        await _coreClients.server.runtimeRemoteLinkService.startSpaceSync();
+      });
       ClientLogger.i(
         'runtime services start done elapsedMs=${stopwatch.elapsedMilliseconds}',
         tag: _logTag,
@@ -225,108 +277,63 @@ class CoreApplicationService with WidgetsBindingObserver {
     }
   }
 
-  /// Automatically pairs the browser runtime with the native Web Access host.
-  Future<void> _bootstrapWebAccessSession() async {
-    if (_webAccessBootstrapAttempted) {
-      return;
-    }
-    final launchInfo = LinkAccessHost.instance.webAccessLaunchInfo;
-    if (launchInfo == null) {
-      return;
-    }
-    _webAccessBootstrapAttempted = true;
-    final sessions = await _coreClients.linkAccess.linkAccessStore
-        .outboundSessions();
-    PairedRemoteSessionRecord? session;
-    for (final candidate in sessions.values) {
-      if (candidate.baseUrl == launchInfo.baseUrl) {
-        session = candidate;
-        break;
-      }
-    }
-    late final String name;
-    late final String coreDeviceId;
-    if (session != null) {
-      name = remotePairingSessionNameFromRecord(session);
-      coreDeviceId = session.coreDeviceId;
-    } else {
-      final created = await const RemotePairingBridge().bootstrap(
-        baseUrl: launchInfo.baseUrl,
-        token: launchInfo.token,
-      );
-      name = remotePairingSessionNameFromRecord(created);
-      coreDeviceId = created.coreDeviceId;
-    }
-    await _coreClients.server.runtimeRemoteLinkService.joinPairedDeviceSpace(
-      name: name,
+  /// Retains the process-owned Core independently of pages and window visibility.
+  Future<void> _retainCoreRuntime() async {
+    if (_coreResidency != null) return;
+    final lease = await OperitKeepAlive.instance.acquire(
+      reason: 'Core runtime',
     );
+    _coreResidency = lease;
     ClientLogger.i(
-      'web access bootstrap completed coreDeviceId=$coreDeviceId',
+      'Core residency protection=${lease.report.protection.name} '
+      'closeToTray=${lease.report.closeToTray} detail=${lease.report.detail}',
       tag: _logTag,
     );
   }
 
-  /// Starts LinkHost once the local runtime storage is confirmed.
-  Future<void> _ensureLinkHostStarted() async {
-    if (_linkHostStartAttempted) {
-      ClientLogger.d(
-        'link host initialize skipped attempted=true',
-        tag: _logTag,
-      );
-      return;
-    }
-    _linkHostStartAttempted = true;
-    final linkHostStopwatch = Stopwatch()..start();
-    ClientLogger.i('link host initialize start', tag: _logTag);
-    await LinkAccessHost.instance.initializeFromConfig();
+  /// Records actual host protection changes, including expiration and native resource loss.
+  void _handleResidencyChanged() {
+    final report = OperitKeepAlive.instance.report.value;
+    if (report == null) return;
     ClientLogger.i(
-      'link host initialize done elapsedMs=${linkHostStopwatch.elapsedMilliseconds}',
-      tag: _logTag,
-    );
-  }
-
-  /// Starts the Android foreground Core service for a local runtime.
-  Future<void> _startLocalBackgroundService() async {
-    if (_localBackgroundServiceStartAttempted ||
-        kIsWeb ||
-        defaultTargetPlatform != TargetPlatform.android) {
-      ClientLogger.d(
-        'local background service not started attempted=$_localBackgroundServiceStartAttempted isWeb=$kIsWeb platform=$defaultTargetPlatform',
-        tag: _logTag,
-      );
-      return;
-    }
-    final stopwatch = Stopwatch()..start();
-    ClientLogger.i('local background service start', tag: _logTag);
-    _localBackgroundServiceStartAttempted = true;
-    await _runtimeChannel.invokeMethod<void>('startLocalCoreService');
-    ClientLogger.i(
-      'local background service done elapsedMs=${stopwatch.elapsedMilliseconds}',
+      'Core residency changed protection=${report.protection.name} '
+      'leases=${report.activeLeases} detail=${report.detail}',
       tag: _logTag,
     );
   }
 
   /// Synchronizes owner-host event handling with the selected runtime role.
   Future<void> _syncHostSubscriber() async {
-    final shouldInstall = _ownsHostInteractions;
+    final shouldInstall =
+        _runtimeManager.runtimeConfigured && _ownsHostInteractions;
     final installed = RuntimeHostInteractionSubscriber.isInstalled;
     if (shouldInstall && !installed) {
       final subscriberStopwatch = Stopwatch()..start();
-      ClientLogger.i('host subscriber install start', tag: _logTag);
+      ClientLogger.v(
+        'host subscriber install start',
+        tag: _logTag,
+        verboseLevel: VerboseLevel.level1,
+      );
       RuntimeHostInteractionSubscriber.install();
-      ClientLogger.i(
+      ClientLogger.v(
         'host subscriber install done elapsedMs=${subscriberStopwatch.elapsedMilliseconds}',
         tag: _logTag,
+        verboseLevel: VerboseLevel.level1,
       );
       return;
     }
     if (!shouldInstall && installed) {
       final subscriberStopwatch = Stopwatch()..start();
-      ClientLogger.i('host subscriber uninstall start', tag: _logTag);
+      ClientLogger.v(
+        'host subscriber uninstall start',
+        tag: _logTag,
+        verboseLevel: VerboseLevel.level1,
+      );
       await RuntimeHostInteractionSubscriber.uninstall();
-      ClientLogger.i(
+      ClientLogger.v(
         'host subscriber uninstall done elapsedMs=${subscriberStopwatch.elapsedMilliseconds}',
         tag: _logTag,
+        verboseLevel: VerboseLevel.level1,
       );
     }
   }

@@ -83,6 +83,7 @@ class _GitHubOAuthLoginDialogState extends State<GitHubOAuthLoginDialog> {
     });
   }
 
+  /// Ends the login flow before its embedded browser surface unmounts.
   @override
   void dispose() {
     _cancelled = true;
@@ -331,6 +332,7 @@ class _GitHubOAuthLoginDialogState extends State<GitHubOAuthLoginDialog> {
   Widget build(BuildContext context) {
     final loginStart = _loginStart;
     return Dialog(
+      constraints: const BoxConstraints(maxWidth: _dialogWidth),
       clipBehavior: Clip.antiAlias,
       child: SizedBox(
         width: _dialogWidth,
@@ -421,7 +423,7 @@ class _GitHubOAuthLoginDialogState extends State<GitHubOAuthLoginDialog> {
     final controller = _browserController;
     return Stack(
       children: <Widget>[
-        if (loginStart != null && controller != null)
+        if (controller != null)
           Positioned.fill(child: WebViewWidget(controller: controller))
         else
           const Center(child: CircularProgressIndicator()),

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use regex::Regex;
 use serde_json::{json, Value};
@@ -6,8 +7,9 @@ use serde_json::{json, Value};
 use crate::chat::config::FunctionalPrompts::FunctionalPrompts;
 use crate::chat::enhance::MultiServiceManager::MultiServiceManager;
 use crate::chat::hooks::SummaryHookRegistry::{SummaryHookContext, SummaryHookRegistry};
+use crate::chat::llmprovider::ThinkingDialect::RequestThinking;
 use crate::chat::llmprovider::AIService::{
-    collect_stream_chunks, AiServiceError, SendMessageRequest,
+    collect_stream_chunks, AiServiceError, SendMessageRequest, TokenCounts,
 };
 use crate::runtime_support::ProviderRuntimeContext;
 use operit_model::FunctionType::FunctionType;
@@ -15,8 +17,43 @@ use operit_model::ModelParameter::ModelParameter;
 use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
 use operit_store::repository::UsageStatisticsStore::{UsageRequestSource, UsageStatisticsStore};
 use operit_util::ChatMarkupRegex::{attr_value, ChatMarkupRegex};
+use operit_vfs::VfsPath;
+use operit_tools::ToolExecutionManager::ToolExecutionManager;
+use operit_util::stream::Stream::Stream;
+use crate::chat::llmprovider::MediaLinkParser::unescape_xml_attribute;
 
 const APPLY_FILE_TOOL_NAME: &str = "apply_file";
+pub type SummaryProgressCallback = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+/// Identifies the automatic threshold check that requested compaction.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryTriggerPoint {
+    BeforeSend,
+    AfterReply,
+}
+
+/// Captures measurements from a threshold check with a positive token window.
+#[derive(Clone, Copy, Debug)]
+pub struct SummaryTriggerContext {
+    pub current_tokens: i64,
+    pub max_tokens: i32,
+    pub token_usage_threshold: f64,
+    pub trigger_point: SummaryTriggerPoint,
+}
+
+impl SummaryTriggerContext {
+    /// Projects the captured decision into the existing summary hook contract.
+    fn metadata(self) -> Value {
+        json!({
+            "currentTokens": self.current_tokens,
+            "maxTokens": self.max_tokens,
+            "tokenUsageThreshold": self.token_usage_threshold,
+            "usageRatio": self.current_tokens as f64 / f64::from(self.max_tokens),
+            "triggerPoint": self.trigger_point,
+        })
+    }
+}
 
 /// Controls how much tool metadata is exposed in prompt history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,9 +74,7 @@ pub struct PrepareConversationHistoryRequest {
     pub workspace_folders: Vec<String>,
     pub prompt_function_type: String,
     pub custom_system_prompt_template: Option<String>,
-    pub role_card_id: Option<String>,
-    pub enable_group_orchestration_hint: bool,
-    pub group_participant_names_text: Option<String>,
+    pub participant_id: Option<String>,
     pub proxy_sender_name: Option<String>,
     pub has_image_recognition: bool,
     pub has_audio_recognition: bool,
@@ -49,11 +84,9 @@ pub struct PrepareConversationHistoryRequest {
     pub use_tool_call_api: bool,
     pub chat_model_has_direct_image: bool,
     pub tool_exposure_mode: ToolExposureMode,
-    pub active_prompt_metadata: BTreeMap<String, String>,
+    pub prompt_metadata: BTreeMap<String, String>,
     pub user_preferences_text: String,
     pub intro_prompt: String,
-    pub waifu_rules_text: String,
-    pub avatar_mood_rules_text: String,
     pub disable_user_preference_description: bool,
     pub ai_name: String,
 }
@@ -72,19 +105,24 @@ pub struct HistoryHookContext {
 }
 
 /// Dispatches prompt-history hooks around conversation preparation.
-pub trait PromptHistoryHookDispatcher {
+pub trait PromptHistoryHookDispatcher: Send + Sync {
     /// Applies registered hooks to the supplied history context.
-    fn dispatch_prompt_history_hooks(&self, context: HistoryHookContext) -> HistoryHookContext;
+    fn dispatch_prompt_history_hooks(
+        &self,
+        context: HistoryHookContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<HistoryHookContext, String>> + Send + '_>,
+    >;
 }
 
 /// Composes the system prompt used at the start of prepared chat history.
-pub trait SystemPromptComposer {
+pub trait SystemPromptComposer: Send + Sync {
     /// Builds a system prompt from the current request and language mode.
-    fn get_system_prompt_with_custom_prompts(
-        &self,
-        request: &PrepareConversationHistoryRequest,
+    fn get_system_prompt_with_custom_prompts<'a>(
+        &'a self,
+        request: &'a PrepareConversationHistoryRequest,
         use_english: bool,
-    ) -> String;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>;
 }
 
 /// Converts stored chat turns into provider-facing conversation history.
@@ -100,23 +138,25 @@ impl ConversationService {
     }
 
     /// Prepares chat history by injecting system prompts, normalizing tool turns, and running hooks.
-    pub fn prepare_conversation_history(
+    pub async fn prepare_conversation_history(
         &self,
         request: PrepareConversationHistoryRequest,
         history_hooks: &dyn PromptHistoryHookDispatcher,
         system_prompt_composer: &dyn SystemPromptComposer,
         use_english: bool,
-    ) -> Vec<PromptTurn> {
-        let before_context = history_hooks.dispatch_prompt_history_hooks(HistoryHookContext {
-            stage: "before_prepare_history".to_string(),
-            chat_id: request.chat_id.clone(),
-            prompt_function_type: request.prompt_function_type.clone(),
-            processed_input: request.processed_input.clone(),
-            chat_history: request.chat_history.clone(),
-            prepared_history: Vec::new(),
-            use_english: None,
-            metadata: build_prepare_history_metadata(&request),
-        });
+    ) -> Result<Vec<PromptTurn>, String> {
+        let before_context = history_hooks
+            .dispatch_prompt_history_hooks(HistoryHookContext {
+                stage: "before_prepare_history".to_string(),
+                chat_id: request.chat_id.clone(),
+                prompt_function_type: request.prompt_function_type.clone(),
+                processed_input: request.processed_input.clone(),
+                chat_history: request.chat_history.clone(),
+                prepared_history: Vec::new(),
+                use_english: None,
+                metadata: build_prepare_history_metadata(&request),
+            })
+            .await?;
         let effective_chat_history = before_context.chat_history.clone();
         let mut prepared_history = Vec::new();
 
@@ -124,12 +164,11 @@ impl ConversationService {
             .iter()
             .any(|turn| turn.kind == PromptTurnKind::SYSTEM)
         {
-            let system_prompt =
-                system_prompt_composer.get_system_prompt_with_custom_prompts(&request, use_english);
+            let system_prompt = system_prompt_composer
+                .get_system_prompt_with_custom_prompts(&request, use_english)
+                .await?;
             let final_system_prompt = build_final_system_prompt(
-                &request.avatar_mood_rules_text,
                 &system_prompt,
-                &request.waifu_rules_text,
                 &request.user_preferences_text,
                 request.disable_user_preference_description,
             );
@@ -157,13 +196,52 @@ impl ConversationService {
                 _ => prepared_history.push(turn.clone()),
             }
         }
-        let after_context = history_hooks.dispatch_prompt_history_hooks(HistoryHookContext {
-            stage: "after_prepare_history".to_string(),
-            prepared_history,
-            use_english: Some(use_english),
-            ..before_context
-        });
-        after_context.prepared_history
+        let after_context = history_hooks
+            .dispatch_prompt_history_hooks(HistoryHookContext {
+                stage: "after_prepare_history".to_string(),
+                prepared_history,
+                use_english: Some(use_english),
+                ..before_context
+            })
+            .await?;
+        Ok(after_context.prepared_history)
+    }
+
+    /// Converts stored locators only in the provider-facing copy of conversation history.
+    pub(crate) fn use_relative_attachment_paths(history: &mut [PromptTurn], base: &str) {
+        static ATTRIBUTES: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let attributes = ATTRIBUTES.get_or_init(|| Regex::new(
+            r#"(?i)(\b(?:id|path)\s*=\s*)(?:"([^"]*)"|'([^']*)')"#,
+        ).expect("attachment attribute regex must compile"));
+        for turn in history {
+            if turn.kind != PromptTurnKind::USER { continue; }
+            let mut content = turn.content.clone();
+            for (start, end) in ChatMarkupRegex::attachment_ranges(&turn.content).into_iter().rev() {
+                let Some(openEnd) = content[start..end].find('>') else { continue; };
+                let end = start + openEnd;
+                let rewritten = attributes.replace_all(&content[start..end], |capture: &regex::Captures<'_>| {
+                    let path = unescape_xml_attribute(capture.get(2).or_else(|| capture.get(3)).unwrap().as_str());
+                    if !["/app/", "/operitapp/", "/mnt/", "/virtual/"].iter().any(|root| path.starts_with(root)) {
+                        return capture[0].to_string();
+                    }
+                    match VfsPath::relativeFileToolPath(base, &path) {
+                        Ok(relative) => format!("{}\"{}\"", &capture[1], relative.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;").replace('\'', "&#39;")),
+                        Err(_) => capture[0].to_string(),
+                    }
+                }).into_owned();
+                content.replace_range(start..end, &rewritten);
+            }
+            for (start, end) in ChatMarkupRegex::workspace_attachment_ranges(&content).into_iter().rev() {
+                let Some(openEnd) = content[start..end].find('>') else { continue; };
+                let bodyStart = start + openEnd + 1;
+                let Some(closeStart) = content[bodyStart..end].rfind('<') else { continue; };
+                let bodyEnd = bodyStart + closeStart;
+                if let Ok(relative) = VfsPath::relativeFileToolPath(base, &content[bodyStart..bodyEnd]) {
+                    content.replace_range(bodyStart..bodyEnd, &relative);
+                }
+            }
+            turn.content = content;
+        }
     }
 
     /// Splits mixed text and XML-like assistant output into ordered tag segments.
@@ -372,7 +450,19 @@ impl ConversationService {
         previousSummary: Option<String>,
         multiServiceManager: &mut MultiServiceManager,
     ) -> Result<String, AiServiceError> {
+        self.generateSummaryWithProgress(messages, previousSummary, multiServiceManager, None, None).await.map(|(content, _)| content)
+    }
+
+    pub async fn generateSummaryWithProgress(
+        &self,
+        messages: Vec<PromptTurn>,
+        previousSummary: Option<String>,
+        multiServiceManager: &mut MultiServiceManager,
+        progress: Option<SummaryProgressCallback>,
+        trigger: Option<SummaryTriggerContext>,
+    ) -> Result<(String, TokenCounts), AiServiceError> {
         let useEnglish = false;
+        let previousSummary = previousSummary.map(|summary| ChatMarkupRegex::remove_meta_tags(&summary));
         let mut systemPrompt =
             FunctionalPrompts::buildSummarySystemPrompt(previousSummary.as_deref(), useEnglish);
         let modelParameters =
@@ -383,9 +473,11 @@ impl ConversationService {
             let service = summaryService.lock().await;
             service.provider_model()
         };
-        let mut summaryHistory = stripGeminiThoughtSignatureMetaTurns(messages);
+        let mut summaryHistory = stripSummaryMetaTurns(messages);
         let mut summaryPrompt = FunctionalPrompts::summaryUserMessage(useEnglish).to_string();
-        let baseSummaryMetadata = std::collections::HashMap::from([
+        let executionContext = ToolExecutionManager::currentToolRuntimeContext();
+        let summaryChatId = executionContext.as_ref().and_then(|context| context.callerChatId.clone());
+        let mut baseSummaryMetadata = std::collections::HashMap::from([
             ("providerModel".to_string(), json!(providerModel)),
             (
                 "sourceMessageCount".to_string(),
@@ -393,19 +485,38 @@ impl ConversationService {
             ),
         ]);
 
+        if let Some(context) = executionContext {
+            baseSummaryMetadata.insert("executionContext".to_string(), json!({
+                "chatId": context.callerChatId,
+                "participantId": context.callerParticipantId,
+            }));
+        }
+        if let Some(trigger) = trigger {
+            baseSummaryMetadata.insert("trigger".to_string(), trigger.metadata());
+        }
+
+        let beforePrepareBaseContext = SummaryHookContext {
+            stage: "before_prepare_summary_prompt".to_string(),
+            chat_id: summaryChatId.clone(),
+            use_english: Some(useEnglish),
+            previous_summary: previousSummary.clone(),
+            prepared_history: buildSummaryPreparedHistory(
+                systemPrompt.clone(), summaryHistory.clone(), summaryPrompt.clone(),
+            ),
+            chat_history: summaryHistory,
+            system_prompt: Some(systemPrompt),
+            summary_prompt: Some(summaryPrompt),
+            summary_result: None,
+            model_parameters: serializedModelParameters.clone(),
+            metadata: baseSummaryMetadata,
+        };
         let beforePrepareContext =
-            SummaryHookRegistry::dispatchSummaryGenerateHooks(SummaryHookContext {
-                stage: "before_prepare_summary_prompt".to_string(),
-                use_english: Some(useEnglish),
-                previous_summary: previousSummary.clone(),
-                chat_history: summaryHistory,
-                prepared_history: Vec::new(),
-                system_prompt: Some(systemPrompt),
-                summary_prompt: Some(summaryPrompt),
-                summary_result: None,
-                model_parameters: serializedModelParameters.clone(),
-                metadata: baseSummaryMetadata.clone(),
-            });
+            SummaryHookRegistry::dispatchSummaryGenerateHooks(beforePrepareBaseContext.clone())
+            .await
+            .map_err(AiServiceError::RequestFailed)?;
+        let mut preparedHistory = reconcileSummaryPreparedHistory(
+            &beforePrepareBaseContext, &beforePrepareContext,
+        );
         summaryHistory = beforePrepareContext.chat_history;
         systemPrompt = beforePrepareContext.system_prompt.expect(
             "SummaryHookContext.system_prompt must be present after before_prepare_summary_prompt",
@@ -413,37 +524,31 @@ impl ConversationService {
         summaryPrompt = beforePrepareContext.summary_prompt.expect(
             "SummaryHookContext.summary_prompt must be present after before_prepare_summary_prompt",
         );
-        let mut preparedHistory = if beforePrepareContext.prepared_history.is_empty() {
-            buildSummaryPreparedHistory(
-                systemPrompt.clone(),
-                summaryHistory.clone(),
-                summaryPrompt.clone(),
-            )
-        } else {
-            beforePrepareContext.prepared_history
+        let beforeSendBaseContext = SummaryHookContext {
+            stage: "before_send_to_model".to_string(),
+            chat_id: summaryChatId.clone(),
+            use_english: Some(useEnglish),
+            previous_summary: previousSummary.clone(),
+            chat_history: summaryHistory,
+            prepared_history: preparedHistory.clone(),
+            system_prompt: Some(systemPrompt),
+            summary_prompt: Some(summaryPrompt),
+            summary_result: None,
+            model_parameters: serializedModelParameters.clone(),
+            metadata: {
+                let mut metadata = beforePrepareContext.metadata;
+                metadata.insert(
+                    "preparedMessageCount".to_string(),
+                    json!(preparedHistory.len()),
+                );
+                metadata
+            },
         };
-
-        let beforeSendBasePreparedHistory = preparedHistory.clone();
         let beforeSendContext =
-            SummaryHookRegistry::dispatchSummaryGenerateHooks(SummaryHookContext {
-                stage: "before_send_to_model".to_string(),
-                use_english: Some(useEnglish),
-                previous_summary: previousSummary.clone(),
-                chat_history: summaryHistory,
-                prepared_history: preparedHistory.clone(),
-                system_prompt: Some(systemPrompt),
-                summary_prompt: Some(summaryPrompt),
-                summary_result: None,
-                model_parameters: serializedModelParameters.clone(),
-                metadata: {
-                    let mut metadata = baseSummaryMetadata.clone();
-                    metadata.insert(
-                        "preparedMessageCount".to_string(),
-                        json!(preparedHistory.len()),
-                    );
-                    metadata
-                },
-            });
+            SummaryHookRegistry::dispatchSummaryGenerateHooks(beforeSendBaseContext.clone())
+            .await
+            .map_err(AiServiceError::RequestFailed)?;
+        preparedHistory = reconcileSummaryPreparedHistory(&beforeSendBaseContext, &beforeSendContext);
         summaryHistory = beforeSendContext.chat_history;
         systemPrompt = beforeSendContext
             .system_prompt
@@ -451,26 +556,15 @@ impl ConversationService {
         summaryPrompt = beforeSendContext
             .summary_prompt
             .expect("SummaryHookContext.summary_prompt must be present after before_send_to_model");
-        preparedHistory = if beforeSendContext.prepared_history != beforeSendBasePreparedHistory {
-            beforeSendContext.prepared_history
-        } else {
-            buildSummaryPreparedHistory(
-                systemPrompt.clone(),
-                summaryHistory.clone(),
-                summaryPrompt.clone(),
-            )
-        };
-
-        let summaryStream = {
+        preparedHistory = stripSummaryMetaTurns(preparedHistory);
+        if let Some(callback) = &progress { callback("summary_preparing"); }
+        let mut summaryStream = {
             let mut service = summaryService.lock().await;
             service
                 .send_message(SendMessageRequest {
                     chat_history: preparedHistory.clone(),
                     model_parameters: modelParameters,
-                    enable_thinking: false,
-                    thinking_quality_level: 1,
-                    thinking_configurations: "[]".to_string(),
-                    thinking_option_id: String::new(),
+                    thinking: RequestThinking::default(),
                     stream: true,
                     available_tools: Vec::new(),
                     preserve_think_in_history: false,
@@ -480,20 +574,23 @@ impl ConversationService {
                 })
                 .await?
         };
-        let summaryChunks = collect_stream_chunks(summaryStream).await;
-        let mut summaryContent = removeThinkingContent(&summaryChunks.join("").trim().to_string());
-        let (summaryInputTokens, summaryCachedInputTokens, summaryOutputTokens) = {
+        let mut content = String::new();
+        summaryStream.collect(&mut |chunk| content.push_str(&chunk)).await;
+        crate::chat::llmprovider::AIService::ensure_response_completed(summaryStream.as_ref())?;
+        let mut summaryContent = ChatMarkupRegex::remove_meta_tags(&removeThinkingContent(content.trim()));
+        let usage = {
             let service = summaryService.lock().await;
-            (
-                service.input_token_count(),
-                service.cached_input_token_count(),
-                service.output_token_count(),
-            )
+            TokenCounts {
+                input: service.input_token_count(),
+                cached_input: service.cached_input_token_count(),
+                output: service.output_token_count(),
+            }
         };
 
         let afterGenerateContext =
             SummaryHookRegistry::dispatchSummaryGenerateHooks(SummaryHookContext {
                 stage: "after_generate_summary".to_string(),
+                chat_id: summaryChatId,
                 use_english: Some(useEnglish),
                 previous_summary: previousSummary,
                 chat_history: summaryHistory,
@@ -503,33 +600,34 @@ impl ConversationService {
                 summary_result: Some(summaryContent.clone()),
                 model_parameters: serializedModelParameters,
                 metadata: {
-                    let mut metadata = baseSummaryMetadata;
+                    let mut metadata = beforeSendContext.metadata;
                     metadata.insert(
                         "preparedMessageCount".to_string(),
                         json!(preparedHistory.len()),
                     );
-                    metadata.insert("inputTokens".to_string(), json!(summaryInputTokens));
+                    metadata.insert("inputTokens".to_string(), json!(usage.input));
                     metadata.insert(
                         "cachedInputTokens".to_string(),
-                        json!(summaryCachedInputTokens),
+                        json!(usage.cached_input),
                     );
-                    metadata.insert("outputTokens".to_string(), json!(summaryOutputTokens));
+                    metadata.insert("outputTokens".to_string(), json!(usage.output));
                     metadata
                 },
-            });
+            })
+            .await
+            .map_err(AiServiceError::RequestFailed)?;
         summaryContent = afterGenerateContext.summary_result.expect(
             "SummaryHookContext.summary_result must be present after after_generate_summary",
         );
-        if summaryContent.trim().is_empty() {
-            return Ok("Conversation Summary: Unable to generate valid summary.".to_string());
-        }
+        summaryContent = ChatMarkupRegex::remove_meta_tags(&summaryContent);
+        validateSummaryContent(&summaryContent)?;
         self.runtime_context
             .support()
             .updateTokensForProviderModel(
                 &providerModel,
-                summaryInputTokens,
-                summaryOutputTokens,
-                summaryCachedInputTokens,
+                usage.input,
+                usage.output,
+                usage.cached_input,
             )
             .map_err(AiServiceError::RequestFailed)?;
         UsageStatisticsStore::new()
@@ -538,12 +636,12 @@ impl ConversationService {
                 FunctionType::SUMMARY,
                 UsageRequestSource::SUMMARY_GENERATION,
                 None,
-                summaryInputTokens,
-                summaryOutputTokens,
-                summaryCachedInputTokens,
+                usage.input,
+                usage.output,
+                usage.cached_input,
             )
             .map_err(AiServiceError::RequestFailed)?;
-        Ok(summaryContent)
+        Ok((summaryContent, usage))
     }
 
     /// Generates a concise title from the first user message and attachment names.
@@ -583,10 +681,7 @@ impl ConversationService {
                 .send_message(SendMessageRequest {
                     chat_history: prepared_history,
                     model_parameters,
-                    enable_thinking: false,
-                    thinking_quality_level: 1,
-                    thinking_configurations: "[]".to_string(),
-                    thinking_option_id: String::new(),
+                    thinking: RequestThinking::default(),
                     stream: false,
                     available_tools: Vec::new(),
                     preserve_think_in_history: false,
@@ -722,7 +817,7 @@ fn extract_xml_tag_body_case_insensitive<'a>(content: &'a str, tag_name: &str) -
 fn build_prepare_history_metadata(
     request: &PrepareConversationHistoryRequest,
 ) -> BTreeMap<String, String> {
-    let mut metadata = request.active_prompt_metadata.clone();
+    let mut metadata = request.prompt_metadata.clone();
     insert_option(
         &mut metadata,
         "workspacePath",
@@ -737,15 +832,6 @@ fn build_prepare_history_metadata(
         &mut metadata,
         "customSystemPromptTemplate",
         request.custom_system_prompt_template.as_ref(),
-    );
-    metadata.insert(
-        "enableGroupOrchestrationHint".to_string(),
-        request.enable_group_orchestration_hint.to_string(),
-    );
-    insert_option(
-        &mut metadata,
-        "groupParticipantNamesText",
-        request.group_participant_names_text.as_ref(),
     );
     insert_option(
         &mut metadata,
@@ -793,6 +879,26 @@ fn insert_option(target: &mut BTreeMap<String, String>, key: &str, value: Option
     }
 }
 
+/// Preserves explicit prepared-history edits and rebuilds only changed source components.
+#[allow(non_snake_case)]
+fn reconcileSummaryPreparedHistory(
+    original: &SummaryHookContext,
+    updated: &SummaryHookContext,
+) -> Vec<PromptTurn> {
+    let sourceChanged = updated.chat_history != original.chat_history
+        || updated.system_prompt != original.system_prompt
+        || updated.summary_prompt != original.summary_prompt;
+    if updated.prepared_history != original.prepared_history || !sourceChanged {
+        return updated.prepared_history.clone();
+    }
+    buildSummaryPreparedHistory(
+        updated.system_prompt.clone().expect("Summary hooks must retain the system prompt"),
+        updated.chat_history.clone(),
+        updated.summary_prompt.clone().expect("Summary hooks must retain the summary prompt"),
+    )
+}
+
+/// Assembles summary source components into provider-facing turns.
 #[allow(non_snake_case)]
 fn buildSummaryPreparedHistory(
     systemPrompt: String,
@@ -804,6 +910,16 @@ fn buildSummaryPreparedHistory(
     prepared.extend(chatHistory);
     prepared.push(PromptTurn::new(PromptTurnKind::USER, summaryPrompt));
     prepared
+}
+
+#[allow(non_snake_case)]
+fn validateSummaryContent(summary: &str) -> Result<(), AiServiceError> {
+    if summary.trim().is_empty() {
+        return Err(AiServiceError::RequestFailed(
+            "Compaction checkpoint was empty".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -841,8 +957,14 @@ fn serializeSummaryHookModelParameters(
 }
 
 #[allow(non_snake_case)]
-fn stripGeminiThoughtSignatureMetaTurns(messages: Vec<PromptTurn>) -> Vec<PromptTurn> {
+fn stripSummaryMetaTurns(messages: Vec<PromptTurn>) -> Vec<PromptTurn> {
     messages
+        .into_iter()
+        .map(|mut turn| {
+            turn.content = ChatMarkupRegex::remove_meta_tags(&turn.content);
+            turn
+        })
+        .collect()
 }
 
 #[allow(non_snake_case)]
@@ -902,17 +1024,14 @@ fn sanitizeConversationTitle(raw_title: &str) -> String {
         .to_string()
 }
 
+/// Combines the generic system prompt with the explicitly supplied user profile.
 fn build_final_system_prompt(
-    avatar_mood_rules_text: &str,
     system_prompt: &str,
-    waifu_rules_text: &str,
     preferences_text: &str,
     disable_user_preference_description: bool,
 ) -> String {
     let mut final_prompt = String::new();
-    final_prompt.push_str(avatar_mood_rules_text);
     final_prompt.push_str(system_prompt);
-    final_prompt.push_str(waifu_rules_text);
     if !disable_user_preference_description && !preferences_text.is_empty() {
         final_prompt.push_str("\n\nUSER.md:\n");
         final_prompt.push_str(preferences_text);
@@ -930,5 +1049,192 @@ fn build_media_intent_prompt(media_type: &str, path: &str, user_intent: Option<&
     match user_intent {
         Some(intent) => format!("{}:{}\n{}", media_type, path, intent),
         None => format!("{}:{}", media_type, path),
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use crate::chat::hooks::SummaryHookRegistry::{applySummaryHookMutation, SummaryHookMutation};
+
+    /// Keeps both trigger names and the derived ratio stable across plugin metadata edits.
+    #[test]
+    fn automatic_summary_trigger_preserves_the_hook_contract() {
+        for (point, name) in [
+            (SummaryTriggerPoint::BeforeSend, "before_send"),
+            (SummaryTriggerPoint::AfterReply, "after_reply"),
+        ] {
+            let trigger = SummaryTriggerContext {
+                current_tokens: 6094, max_tokens: 2000,
+                token_usage_threshold: 0.25, trigger_point: point,
+            }.metadata();
+            assert_eq!(trigger, json!({
+                "currentTokens": 6094, "maxTokens": 2000,
+                "tokenUsageThreshold": 0.25, "usageRatio": 3.047, "triggerPoint": name,
+            }));
+            let mut context = summary_context();
+            context.metadata.insert("trigger".into(), trigger.clone());
+            let updated = applySummaryHookMutation(context, SummaryHookMutation {
+                metadata: HashMap::from([("plugin".into(), json!(true))]), ..Default::default()
+            });
+            assert_eq!(updated.metadata["trigger"], trigger);
+        }
+    }
+
+    /// Creates the same proposed prompt supplied to the summary preparation hooks.
+    fn summary_context() -> SummaryHookContext {
+        let history = vec![PromptTurn::new(PromptTurnKind::USER, "conversation")];
+        SummaryHookContext {
+            stage: "before_prepare_summary_prompt".into(), chat_id: None,
+            use_english: Some(false), previous_summary: None,
+            prepared_history: buildSummaryPreparedHistory("system".into(), history.clone(), "summarize".into()),
+            chat_history: history, system_prompt: Some("system".into()),
+            summary_prompt: Some("summarize".into()), summary_result: None,
+            model_parameters: Vec::new(), metadata: HashMap::new(),
+        }
+    }
+
+    /// Keeps a plugin's prepared history through a subsequent stage that only adds metadata.
+    #[test]
+    fn summary_custom_history_survives_the_next_stage() {
+        let original = summary_context();
+        let custom = vec![PromptTurn::new(PromptTurnKind::USER, "plugin prompt")];
+        let mut prepared = applySummaryHookMutation(original.clone(), SummaryHookMutation {
+            prepared_history: Some(custom.clone()), ..Default::default()
+        });
+        prepared.prepared_history = reconcileSummaryPreparedHistory(&original, &prepared);
+        prepared.stage = "before_send_to_model".into();
+        let updated = applySummaryHookMutation(prepared.clone(), SummaryHookMutation {
+            metadata: HashMap::from([("plugin".into(), json!(true))]), ..Default::default()
+        });
+        assert_eq!(reconcileSummaryPreparedHistory(&prepared, &updated), custom);
+    }
+
+    /// Honors an explicitly cleared history even when a plugin also replaces source text.
+    #[test]
+    fn summary_empty_prepared_history_is_an_explicit_replacement() {
+        let original = summary_context();
+        let updated = applySummaryHookMutation(original.clone(), SummaryHookMutation {
+            prepared_history: Some(Vec::new()), summary_prompt: Some("changed".into()),
+            ..Default::default()
+        });
+        assert!(reconcileSummaryPreparedHistory(&original, &updated).is_empty());
+    }
+
+    /// Reflects text and conversation edits when the plugin leaves the prepared array unchanged.
+    #[test]
+    fn summary_source_edits_update_the_actual_request() {
+        let original = summary_context();
+        let updated = applySummaryHookMutation(original.clone(), SummaryHookMutation {
+            chat_history: Some(Vec::new()), system_prompt: Some("custom system".into()),
+            summary_prompt: Some(String::new()), ..Default::default()
+        });
+        let request = reconcileSummaryPreparedHistory(&original, &updated);
+        assert_eq!(request.len(), 2);
+        assert_eq!(request[0].content, "custom system");
+        assert_eq!(request[1].content, "");
+    }
+
+    #[test]
+    fn missing_template_does_not_reject_nonempty_summary() {
+        for summary in [
+            "A short conversation summary.",
+            "## 进展\n已完成检查，等待用户选择。",
+            "Custom summary from a plugin",
+        ] {
+            assert!(validateSummaryContent(summary).is_ok());
+        }
+        assert!(validateSummaryContent(" \n\t").is_err());
+    }
+
+    #[test]
+    fn summary_prompt_inherits_previous_summary_in_both_languages() {
+        for use_english in [false, true] {
+            let previous = "Important context from the previous conversation.";
+            let prompt = FunctionalPrompts::buildSummarySystemPrompt(Some(previous), use_english);
+            assert!(prompt.starts_with(FunctionalPrompts::summaryPrompt(use_english)));
+            assert_eq!(prompt.matches(previous).count(), 1);
+            assert_eq!(
+                FunctionalPrompts::buildSummarySystemPrompt(Some(" \n"), use_english),
+                FunctionalPrompts::summaryPrompt(use_english)
+            );
+        }
+    }
+
+    #[test]
+    fn removes_protocol_meta_without_changing_turn_identity() {
+        let mut turn = PromptTurn::new(
+            PromptTurnKind::ASSISTANT,
+            r#"before<meta provider="openai:reasoning">SECRET</meta>after"#,
+        );
+        turn.metadata.insert("author".to_string(), json!("participant"));
+        let cleaned = stripSummaryMetaTurns(vec![turn.clone()]);
+        assert_eq!(cleaned[0].content, "before after");
+        assert_eq!(cleaned[0].kind, turn.kind);
+        assert_eq!(cleaned[0].metadata, turn.metadata);
+    }
+}
+
+
+#[cfg(test)]
+mod relative_attachment_tests {
+    use super::*;
+
+    fn prepared(content: &str, base: &str) -> String {
+        let stored = PromptTurn::new(PromptTurnKind::USER, content);
+        let mut history = vec![stored.clone()];
+        ConversationService::use_relative_attachment_paths(&mut history, base);
+        assert_eq!(stored.content, content);
+        history.remove(0).content
+    }
+
+    #[test]
+    fn workspace_and_output_attachments_expose_the_same_relative_path() {
+        for base in ["/operitapp/workspaces/project", "/operitapp/outputs/family"] {
+            let source = format!(r#"<attachment id="{base}/.operit/attachments/id/report.pdf" path="{base}/.operit/attachments/id/report.pdf" node_id="source">body</attachment>"#);
+            let visible = prepared(&source, base);
+            assert!(visible.contains(r#"id=".operit/attachments/id/report.pdf""#));
+            assert!(visible.contains(r#"path=".operit/attachments/id/report.pdf""#));
+            assert!(visible.contains(r#"node_id="source""#));
+            assert!(visible.ends_with(">body</attachment>"));
+            assert!(!visible.contains("/operitapp/"));
+        }
+    }
+
+    #[test]
+    fn history_is_rebased_from_stable_locators_after_a_workspace_change() {
+        let content = r#"<attachment id="/operitapp/outputs/family/.operit/attachments/id/file.pdf" path="/operitapp/outputs/family/.operit/attachments/id/file.pdf"/>"#;
+        assert!(prepared(content, "/operitapp/outputs/family").contains(r#"path=".operit/attachments/id/file.pdf""#));
+        let visible = prepared(content, "/operitapp/workspaces/project");
+        let path = unescape_xml_attribute(&attr_value(&visible, "path").unwrap());
+        assert_eq!(VfsPath::resolveFileToolPath(Some("/operitapp/workspaces/project"), &path).unwrap(),
+            "/operitapp/outputs/family/.operit/attachments/id/file.pdf");
+    }
+
+    #[test]
+    fn attributes_keep_escaping_and_attachment_bodies_are_not_rewritten() {
+        let base = "/app/workspaces/a&b";
+        let content = r#"prefix <attachment path = '/operitapp/workspaces/a&amp;b/中文 &quot;file&#39;.pdf' id="/operitapp/workspaces/a&amp;b/中文 &quot;file&#39;.pdf" content="/operitapp/workspaces/unchanged">/operitapp/body</attachment> suffix"#;
+        let visible = prepared(content, base);
+        assert_eq!(unescape_xml_attribute(&attr_value(&visible, "path").unwrap()), "中文 \"file'.pdf");
+        assert!(visible.contains(r#"content="/operitapp/workspaces/unchanged""#));
+        assert!(visible.ends_with(">/operitapp/body</attachment> suffix"));
+    }
+
+    #[test]
+    fn multimodal_and_inline_identifiers_are_preserved_while_reference_paths_are_relative() {
+        let content = r#"<image_link id="pool-id"/><attachment id="pasted_text_1" content="inline"/><attachment id="/operitapp/outputs/family/.operit/attachments/id/big.zip.operit-ref.json" path="/operitapp/outputs/family/.operit/attachments/id/big.zip.operit-ref.json"/>"#;
+        let visible = prepared(content, "/operitapp/outputs/family");
+        assert!(visible.starts_with(r#"<image_link id="pool-id"/><attachment id="pasted_text_1" content="inline"/>"#));
+        assert!(visible.contains(r#"path=".operit/attachments/id/big.zip.operit-ref.json""#));
+    }
+
+    #[test]
+    fn workspace_notices_use_dot_without_modifying_other_message_roles() {
+        let content = "<workspace_attachment>/operitapp/workspaces/project</workspace_attachment>";
+        assert_eq!(prepared(content, "/app/workspaces/project"), "<workspace_attachment>.</workspace_attachment>");
+        let mut history = vec![PromptTurn::new(PromptTurnKind::ASSISTANT, content)];
+        ConversationService::use_relative_attachment_paths(&mut history, "/app/workspaces/project");
+        assert_eq!(history[0].content, content);
     }
 }

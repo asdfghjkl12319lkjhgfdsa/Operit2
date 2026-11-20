@@ -1,17 +1,28 @@
 // Generated from operit-plugin-sdk Rust declarations.
 
-import type { AgentStatusResultData, AppListData, AppOperationData, AppUsageTimeResultData, BinaryFileContentData, BluetoothBleNotificationData, BluetoothBleServicesData, BluetoothBondedDevicesData, BluetoothReadData, BluetoothScanResultData, BluetoothSessionData, BluetoothStateData, BluetoothTransferData, CharacterCardListResultData, ChatCallResultData, ChatCreationResultData, ChatDeleteResultData, ChatFindResultData, ChatListResultData, ChatMessagesResultData, ChatServiceStartResultData, ChatSwitchResultData, ChatTitleUpdateResultData, DeviceInfoResultData, DirectoryListingData, EnvironmentVariableReadResultData, EnvironmentVariableWriteResultData, FileApplyResultData, FileContentData, FileExistsData, FileInfoData, FileOperationData, FilePartContentData, FindFilesResultData, GrepResultData, HiddenTerminalCommandResultData, HttpResponseData, LocationData, MemoryLinkQueryResultData, MemoryLinkResultData, MemoryQueryResultData, MessageSendResultData, MusicPlaybackResultData, NotificationData, SleepResultData, SystemSettingData, TerminalCommandResultData, TerminalInfoResultData, TerminalSessionCloseResultData, TerminalSessionCreationResultData, TerminalSessionScreenResultData, ToolResultData, VisitWebResultData } from "./results";
+import type { AgentStatusResultData, AppListData, AppOperationData, AppUsageTimeResultData, BinaryFileContentData, BluetoothBleNotificationData, BluetoothBleServicesData, BluetoothBondedDevicesData, BluetoothReadData, BluetoothScanResultData, BluetoothSessionData, BluetoothStateData, BluetoothTransferData, CatalogReadToolSourcesResultData, ChatCallResultData, ChatCancelResultData, ChatCancelScheduledMessageResultData, ChatCreationResultData, ChatDeleteExtensionResultData, ChatDeleteResultData, ChatFindResultData, ChatListResultData, ChatMessagesResultData, ChatObservationResultData, ChatPreparedDeliveryResultData, ChatReadExtensionResultData, ChatScheduleMessageResultData, ChatScheduledMessagesResultData, ChatSendMessageResultData, ChatServiceStartResultData, ChatSwitchResultData, ChatTitleUpdateResultData, ChatWriteExtensionResultData, DeviceInfoResultData, DirectoryListingData, EdgePortResultData, EnvironmentVariableReadResultData, EnvironmentVariableWriteResultData, FileApplyResultData, FileContentData, FileExistsData, FileInfoData, FileOperationData, FilePartContentData, FindFilesResultData, GrepResultData, HiddenTerminalCommandResultData, HttpResponseData, JsonResultData, LocationData, MediaRegistrationResultData, MessageSendResultData, ModelsListSummariesResultData, MusicPlaybackResultData, NotificationData, SleepResultData, StorageRequestResultData, SttTranscribeResultData, SystemSettingData, TerminalCommandResultData, TerminalInfoResultData, TerminalObservationResultData, TerminalSessionCloseResultData, TerminalSessionCreationResultData, TerminalSessionScreenResultData, ThemeApplyConfigResultData, ThemeListConfigsResultData, ToolResultData, TtsGetCurrentConfigIdResultData, TtsListConfigsResultData, TtsSetCurrentConfigIdResultData, TtsSpeakResultData, TtsSynthesizeResultData, UIActionResultData, UIPageResultData, VisitWebResultData, WebSocketResultData } from "./results";
 
 /**
  * Maps every built-in tool name to its concrete public result type.
  */
 export interface ToolResultMap {
+  list_windows: JsonResultData;
+  focus_window: UIActionResultData;
+  get_page_info: UIPageResultData;
+  tap: UIActionResultData;
+  long_press: UIActionResultData;
+  click_element: UIActionResultData;
+  set_input_text: UIActionResultData;
+  press_key: UIActionResultData;
+  swipe: UIActionResultData;
+  edge_execute: EdgePortResultData;
+  io_execute: EdgePortResultData;
   list_files: DirectoryListingData;
   read_file: FileContentData;
   read_file_part: FilePartContentData;
   read_file_full: FileContentData;
   read_file_binary: BinaryFileContentData;
-  write_file: FileOperationData;
+  write_file: FileApplyResultData;
   write_file_binary: FileOperationData;
   delete_file: FileOperationData;
   file_exists: FileExistsData;
@@ -30,6 +41,8 @@ export interface ToolResultMap {
   apply_file: FileApplyResultData;
   create_file: FileApplyResultData;
   edit_file: FileApplyResultData;
+  storage_request: StorageRequestResultData;
+  web_socket: WebSocketResultData;
   http_request: HttpResponseData;
   visit_web: VisitWebResultData;
   browser_click: string;
@@ -60,6 +73,7 @@ export interface ToolResultMap {
   get_system_setting: SystemSettingData;
   modify_system_setting: SystemSettingData;
   toast: string;
+  set_clipboard_text: string;
   send_notification: string;
   install_app: AppOperationData;
   uninstall_app: AppOperationData;
@@ -93,13 +107,26 @@ export interface ToolResultMap {
   read_environment_variable: EnvironmentVariableReadResultData;
   write_environment_variable: EnvironmentVariableWriteResultData;
   execute_cli_command: unknown;
+  models_list_summaries: ModelsListSummariesResultData;
+  tts_synthesize: TtsSynthesizeResultData;
+  tts_speak: TtsSpeakResultData;
+  stt_transcribe: SttTranscribeResultData;
+  tts_list_configs: TtsListConfigsResultData;
+  tts_get_current_config_id: TtsGetCurrentConfigIdResultData;
+  tts_set_current_config_id: TtsSetCurrentConfigIdResultData;
+  media_register: MediaRegistrationResultData;
+  media_register_from_path: MediaRegistrationResultData;
+  theme_list_configs: ThemeListConfigsResultData;
+  theme_apply_config: ThemeApplyConfigResultData;
   use_package: string;
+  catalog_read_tool_sources: CatalogReadToolSourcesResultData;
   list_core_nodes: string;
   switch_core: string;
   package_proxy: ToolResultData;
   get_terminal_info: TerminalInfoResultData;
   execute_in_terminal_session: TerminalCommandResultData;
   execute_in_terminal_session_streaming: TerminalCommandResultData;
+  terminal_observe: TerminalObservationResultData;
   execute_hidden_terminal_command: HiddenTerminalCommandResultData;
   create_terminal_session: TerminalSessionCreationResultData;
   close_terminal_session: TerminalSessionCloseResultData;
@@ -120,23 +147,25 @@ export interface ToolResultMap {
   agent_status: AgentStatusResultData;
   switch_chat: ChatSwitchResultData;
   update_chat_title: ChatTitleUpdateResultData;
+  update_chat_group: string;
+  update_chat_pinned: string;
+  update_chat_locked: string;
+  promote_chat_to_root: string;
+  reorder_chats: string;
   delete_chat: ChatDeleteResultData;
   send_message_to_ai: MessageSendResultData;
   send_message_to_ai_streaming: MessageSendResultData;
+  chat_send_message: ChatSendMessageResultData;
+  chat_observe: ChatObservationResultData;
+  chat_deliver_prepared: ChatPreparedDeliveryResultData;
+  chat_list_scheduled_messages: ChatScheduledMessagesResultData;
+  chat_schedule_message: ChatScheduleMessageResultData;
+  chat_cancel_scheduled_message: ChatCancelScheduledMessageResultData;
+  chat_cancel: ChatCancelResultData;
+  chat_read_extension: ChatReadExtensionResultData;
+  chat_write_extension: ChatWriteExtensionResultData;
+  chat_delete_extension: ChatDeleteExtensionResultData;
   call_chat_model: ChatCallResultData;
-  list_character_cards: CharacterCardListResultData;
   get_chat_messages: ChatMessagesResultData;
   get_chat_messages_range: ChatMessagesResultData;
-  query_memory: MemoryQueryResultData;
-  get_memory_owner_key: string;
-  get_memory_by_title: MemoryQueryResultData;
-  create_memory: string;
-  update_memory: string;
-  delete_memory: string;
-  move_memory: string;
-  link_memories: MemoryLinkResultData;
-  query_memory_links: MemoryLinkQueryResultData;
-  update_memory_link: MemoryLinkQueryResultData;
-  delete_memory_link: string;
-  update_user_preferences: string;
 }

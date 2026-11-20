@@ -12,15 +12,6 @@ fn epochMillisToLocalDateTimeString(value: i64) -> Result<String, String> {
 }
 
 #[allow(non_snake_case)]
-fn epochMillisToLocalDateString(value: i64) -> Result<String, String> {
-    let datetime = chrono::Local
-        .timestamp_millis_opt(value)
-        .single()
-        .ok_or_else(|| format!("Operit1 用户偏好日期无效：{value}"))?;
-    Ok(datetime.naive_local().format("%Y-%m-%d").to_string())
-}
-
-#[allow(non_snake_case)]
 fn currentTimeMillis() -> i64 {
     operit_host_api::TimeUtils::currentTimeMillis()
 }
@@ -39,10 +30,25 @@ fn requiredPreferenceString<'a>(
         .ok_or_else(|| format!("Operit1 DataStore 键不是字符串：{key}"))
 }
 
+/// Decodes Kotlin's textual parameter values using their declared types without interpreting text as JSON.
 #[allow(non_snake_case)]
-fn parseCustomParameterValue(value: &str) -> Result<Value, String> {
-    serde_json::from_str(value)
-        .map_err(|error| format!("Operit1 自定义参数值不是合法 JSON：{error}"))
+fn parseCustomParameterValue(
+    value: &str,
+    valueType: &operit_model::ModelParameter::ParameterValueType,
+) -> Result<Value, String> {
+    use operit_model::ModelParameter::ParameterValueType;
+
+    match valueType {
+        ParameterValueType::INT => serde_json::from_str::<i32>(value).map(Value::from),
+        ParameterValueType::FLOAT => {
+            serde_json::from_str::<f32>(value).and_then(serde_json::to_value)
+        }
+        ParameterValueType::BOOLEAN => serde_json::from_str::<bool>(value).map(Value::from),
+        ParameterValueType::STRING | ParameterValueType::OBJECT => {
+            Ok(Value::String(value.to_string()))
+        }
+    }
+    .map_err(|error| format!("Operit1 自定义参数值与声明类型 {valueType:?} 不匹配：{error}"))
 }
 
 #[allow(non_snake_case)]
@@ -143,16 +149,6 @@ fn defaultSummaryTokenThreshold() -> f32 {
 #[allow(non_snake_case)]
 fn defaultEnableSummary() -> bool {
     ModelConfigDefaults::DEFAULT_ENABLE_SUMMARY
-}
-
-#[allow(non_snake_case)]
-fn defaultEnableSummaryByMessageCount() -> bool {
-    ModelConfigDefaults::DEFAULT_ENABLE_SUMMARY_BY_MESSAGE_COUNT
-}
-
-#[allow(non_snake_case)]
-fn defaultSummaryMessageCountThreshold() -> i32 {
-    ModelConfigDefaults::DEFAULT_SUMMARY_MESSAGE_COUNT_THRESHOLD
 }
 
 #[allow(non_snake_case)]

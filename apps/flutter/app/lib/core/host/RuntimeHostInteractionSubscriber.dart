@@ -5,18 +5,23 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
 
 import '../bridge/PlatformCoreProxy.dart';
 import '../bridge/ProxyCoreRuntimeBridge.dart';
 import '../browser/BrowserAutomationBridge.dart';
 import '../browser/BrowserAutomationModels.dart';
+import '../link/CoreLinkProtocol.dart';
 import '../logging/ClientLogger.dart';
 import '../proxy/generated/CoreProxyClients.g.dart';
 import '../proxy/generated/CoreProxyModels.g.dart';
 import '../web_visit/WebVisitBridge.dart';
 import '../web_visit/WebVisitModels.dart';
 import 'AppToastController.dart';
+import 'RuntimeHostInteractionDelivery.dart';
+import 'RuntimeFloatingWindowController.dart';
 import 'ComposeDslFilePickerService.dart';
+import 'ComposeDslFileSaveService.dart';
 import 'ComposeWebViewControllerBridge.dart';
 import 'browser/RuntimeBrowserSessionRegistry.dart';
 
@@ -56,6 +61,12 @@ class RuntimeHostInteractionSubscriber {
   static const GeneratedCoreProxyClients _clients = GeneratedCoreProxyClients(
     ProxyCoreRuntimeBridge(coreProxy: platformCoreProxy),
   );
+  static final _delivery = RuntimeHostInteractionDelivery(
+    dispatch: _dispatch,
+    respond: _respondOwnerHostInteraction,
+    errorResponse: _errorResponse,
+    onDispatchError: _reportDispatchError,
+  );
   static const List<RuntimeHostInteractionKind> _ownerKinds =
       <RuntimeHostInteractionKind>[
         RuntimeHostInteractionKind.browserAutomation,
@@ -63,6 +74,7 @@ class RuntimeHostInteractionSubscriber {
         RuntimeHostInteractionKind.webVisit,
         RuntimeHostInteractionKind.composeWebViewController,
         RuntimeHostInteractionKind.composeFilePicker,
+        RuntimeHostInteractionKind.composeFileSave,
         RuntimeHostInteractionKind.systemCaptureScreenshot,
         RuntimeHostInteractionKind.systemLanguageCode,
         RuntimeHostInteractionKind.systemRecognizeText,
@@ -78,6 +90,8 @@ class RuntimeHostInteractionSubscriber {
       ];
 
   static StreamSubscription<RuntimeHostInteractionRequest>? _subscription;
+  static Timer? _reconnectTimer;
+  static bool _uninstalled = false;
   static int _ttsPlaybackOwnerSequence = 0;
   static final Map<String, _BrowserInteractHostTiming>
   _browserInteractHostTimings = <String, _BrowserInteractHostTiming>{};
@@ -89,43 +103,95 @@ class RuntimeHostInteractionSubscriber {
 
   /// Installs the owner host interaction stream listener.
   static void install() {
+    _uninstalled = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     if (_subscription != null) {
       return;
     }
-    late final StreamSubscription<RuntimeHostInteractionRequest> subscription;
-    subscription = _clients.servicesRuntimeHostInteractionService
-        .ownerHostInteractionEvents(kinds: _ownerKinds)
-        .listen(
-          (event) => unawaited(_handleEvent(event)),
-          onError: (Object error, StackTrace stackTrace) {
-            _releaseSubscription(subscription);
-            FlutterError.reportError(
-              FlutterErrorDetails(
-                exception: error,
-                stack: stackTrace,
-                library: 'runtime host interaction subscriber',
-                context: ErrorDescription(
-                  'listening owner host interaction stream',
+    try {
+      final pending = _delivery.pending;
+      final resumingRequestIds = pending
+          .map((request) => request.requestId)
+          .toSet();
+      late final StreamSubscription<RuntimeHostInteractionRequest> subscription;
+      subscription = _clients.servicesRuntimeHostInteractionService
+          .ownerHostInteractionEvents(kinds: _ownerKinds)
+          .listen(
+            (event) {
+              // A replay may already be queued when the resumed response is accepted.
+              if (resumingRequestIds.contains(event.requestId)) return;
+              unawaited(_handleEvent(event, subscription));
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              if (!identical(_subscription, subscription)) return;
+              _releaseSubscription(subscription);
+              FlutterError.reportError(
+                FlutterErrorDetails(
+                  exception: error,
+                  stack: stackTrace,
+                  library: 'runtime host interaction subscriber',
+                  context: ErrorDescription(
+                    'listening owner host interaction stream',
+                  ),
                 ),
-              ),
-            );
-          },
-          onDone: () {
-            _releaseSubscription(subscription);
-            ClientLogger.d(
-              'owner host interaction stream closed',
-              tag: 'RuntimeHostInteraction',
-            );
-          },
-          cancelOnError: true,
-        );
-    _subscription = subscription;
+              );
+              _scheduleReconnect();
+            },
+            onDone: () {
+              if (!identical(_subscription, subscription)) return;
+              _releaseSubscription(subscription);
+              ClientLogger.v(
+                'owner host interaction stream closed',
+                tag: 'RuntimeHostInteraction',
+                verboseLevel: VerboseLevel.level4,
+              );
+              _scheduleReconnect();
+            },
+            cancelOnError: true,
+          );
+      _subscription = subscription;
+      for (final request in pending) {
+        unawaited(_handleEvent(request, subscription));
+      }
+    } catch (error, stackTrace) {
+      // A synchronous failure while re-subscribing must not break the
+      // reconnect chain, or pending interactions would wait for their full
+      // timeout with no consumer.
+      FlutterError.reportError(
+        FlutterErrorDetails(
+          exception: error,
+          stack: stackTrace,
+          library: 'runtime host interaction subscriber',
+          context: ErrorDescription('installing owner host interaction stream'),
+        ),
+      );
+      _scheduleReconnect();
+    }
+  }
+
+  /// Schedules a reconnect if the host subscriber was not deliberately uninstalled.
+  static void _scheduleReconnect() {
+    if (_uninstalled) {
+      return;
+    }
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(milliseconds: 500), () {
+      _reconnectTimer = null;
+      if (!_uninstalled && _subscription == null) {
+        install();
+      }
+    });
   }
 
   /// Stops the owner host interaction stream listener.
   static Future<void> uninstall() async {
+    _uninstalled = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     final subscription = _subscription;
     _subscription = null;
+    _delivery.clear();
     await subscription?.cancel();
   }
 
@@ -138,63 +204,80 @@ class RuntimeHostInteractionSubscriber {
     }
   }
 
-  /// Handles one owner-host interaction request.
+  /// Reconnects the owner stream after a completion loses its transport connection.
+  static void _reconnectAfterDeliveryFailure() {
+    if (_uninstalled) return;
+    final subscription = _subscription;
+    _subscription = null;
+    unawaited(subscription?.cancel());
+    _scheduleReconnect();
+  }
+
+  /// Reports native execution failures while their structured response returns to Core.
+  static void _reportDispatchError(Object error, StackTrace stackTrace) {
+    FlutterError.reportError(
+      FlutterErrorDetails(
+        exception: error,
+        stack: stackTrace,
+        library: 'runtime host interaction subscriber',
+        context: ErrorDescription('executing owner host interaction'),
+      ),
+    );
+  }
+
+  /// Delivers the original operation result through the current owner connection.
   static Future<void> _handleEvent(
     RuntimeHostInteractionRequest request,
+    StreamSubscription<RuntimeHostInteractionRequest> subscription,
   ) async {
+    if (!identical(_subscription, subscription)) return;
     final eventStopwatch = Stopwatch()..start();
     try {
-      final response = await _dispatch(request);
-      final respondStopwatch = Stopwatch()..start();
-      await _respondOwnerHostInteraction(request.requestId, response);
-      respondStopwatch.stop();
+      final respondElapsed = await _delivery.deliver(request);
+      if (respondElapsed == null) return;
       _recordBrowserInteractHostResponseTiming(
         request.requestId,
-        respondElapsedUs: respondStopwatch.elapsedMicroseconds,
+        respondElapsedUs: respondElapsed.inMicroseconds,
         roundTripElapsedUs: eventStopwatch.elapsedMicroseconds,
         failed: false,
       );
     } catch (error, stackTrace) {
-      final response = _errorResponse(error);
-      try {
-        await _respondOwnerHostInteraction(request.requestId, response);
-      } catch (respondError, respondStackTrace) {
-        FlutterError.reportError(
-          FlutterErrorDetails(
-            exception: respondError,
-            stack: respondStackTrace,
-            library: 'runtime host interaction subscriber',
-            context: ErrorDescription(
-              'responding owner host interaction error',
-            ),
-          ),
-        );
-      }
       _recordBrowserInteractHostResponseTiming(
         request.requestId,
         respondElapsedUs: 0,
         roundTripElapsedUs: eventStopwatch.elapsedMicroseconds,
         failed: true,
       );
-      FlutterError.reportError(
-        FlutterErrorDetails(
-          exception: error,
-          stack: stackTrace,
-          library: 'runtime host interaction subscriber',
-          context: ErrorDescription('handling owner host interaction event'),
-        ),
-      );
+      if (!RuntimeHostInteractionDelivery.isCoreRejection(error) &&
+          identical(_subscription, subscription)) {
+        _reconnectAfterDeliveryFailure();
+      }
+      if (error is CoreLinkError &&
+          error.message ==
+              'host interaction request not found: ${request.requestId}') {
+        ClientLogger.w(
+          'Host interaction expired or was cancelled by Core: ${request.requestId}',
+          tag: 'RuntimeHostInteraction',
+        );
+      } else {
+        FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: error,
+            stack: stackTrace,
+            library: 'runtime host interaction subscriber',
+            context: ErrorDescription('responding owner host interaction'),
+          ),
+        );
+      }
     }
   }
 
-  /// Sends one owner host interaction response through the runtime service.
+  /// Sends a response only after the native operation has completed.
   static Future<void> _respondOwnerHostInteraction(
     String requestId,
     RuntimeHostInteractionResponse response,
-  ) {
-    return _clients.servicesRuntimeHostInteractionService
-        .respondOwnerHostInteraction(requestId: requestId, response: response);
-  }
+  ) => _clients.servicesRuntimeHostInteractionService
+      .respondOwnerHostInteraction(requestId: requestId, response: response);
 
   /// Builds a typed error response for one failed owner interaction.
   static RuntimeHostInteractionResponse _errorResponse(Object error) {
@@ -222,6 +305,9 @@ class RuntimeHostInteractionSubscriber {
         ),
       RuntimeHostInteractionKind.composeFilePicker => _handleComposeFilePicker(
         _requirePayload(request.composeFilePicker, request.kind),
+      ),
+      RuntimeHostInteractionKind.composeFileSave => _handleComposeFileSave(
+        _requirePayload(request.composeFileSave, request.kind),
       ),
       RuntimeHostInteractionKind.systemCaptureScreenshot =>
         _handleSystemCaptureScreenshot(),
@@ -257,9 +343,6 @@ class RuntimeHostInteractionSubscriber {
       ),
       RuntimeHostInteractionKind.localInference => _handleLocalInference(
         _requirePayload(request.localInference, request.kind),
-      ),
-      RuntimeHostInteractionKind.webAccessPairing => throw StateError(
-        'web access pairing is handled by the app dialog host',
       ),
       RuntimeHostInteractionKind.appNotification => throw StateError(
         'application notification is handled by the app notification service',
@@ -373,7 +456,7 @@ class RuntimeHostInteractionSubscriber {
 
   /// Logs one compact browser interaction host timing summary.
   static void _logBrowserInteractHostSummary(_BrowserInteractHostStats stats) {
-    ClientLogger.d(
+    ClientLogger.v(
       'host summary elapsedMs=${stats.windowStopwatch.elapsedMilliseconds} '
       'accepted=${stats.count} errors=${stats.errorCount} '
       'avgAcceptUs=${_averageMicroseconds(stats.totalAcceptElapsedUs, stats.count)} '
@@ -386,6 +469,7 @@ class RuntimeHostInteractionSubscriber {
       'maxRoundTripUs=${stats.maxRoundTripElapsedUs} '
       'slowestSession=${stats.slowestSessionId}',
       tag: _browserInputLogTag,
+      verboseLevel: VerboseLevel.level3,
     );
   }
 
@@ -442,6 +526,20 @@ class RuntimeHostInteractionSubscriber {
     );
   }
 
+  /// Saves one Compose DSL export through the platform owner.
+  static Future<RuntimeHostInteractionResponse> _handleComposeFileSave(
+    RuntimeHostInteractionComposeFileSavePayload payload,
+  ) async {
+    final resultJson = await ComposeDslFileSaveService.save(
+      payload.requestJson,
+    );
+    return _response(
+      composeFileSave: RuntimeHostInteractionComposeFileSaveResponse(
+        resultJson: resultJson,
+      ),
+    );
+  }
+
   static Future<RuntimeHostInteractionResponse>
   _handleSystemCaptureScreenshot() async {
     final rawResponse = await _channel.invokeMethod<Object?>(
@@ -485,8 +583,24 @@ class RuntimeHostInteractionSubscriber {
   static Future<RuntimeHostInteractionResponse> _handleSystemOperation(
     RuntimeHostInteractionSystemOperationPayload payload,
   ) async {
+    if (payload.operation == 'floating_window') {
+      final result = await RuntimeFloatingWindowController.command(
+        (jsonDecode(payload.paramsJson) as Map).cast<String, Object?>(),
+      );
+      return _response(
+        systemOperation: RuntimeHostInteractionSystemOperationResponse(
+          resultJson: jsonEncode(result),
+        ),
+      );
+    }
     if (payload.operation == 'toast') {
       return _handleToastOperation(payload);
+    }
+    if (payload.operation == 'set_clipboard_text') {
+      return _handleClipboardWriteOperation(payload);
+    }
+    if (payload.operation == 'get_device_location_foreground') {
+      return _handleForegroundLocationOperation(payload);
     }
     final rawResponse = await _channel.invokeMethod<Object?>(
       'ownerSystemOperation',
@@ -496,6 +610,81 @@ class RuntimeHostInteractionSubscriber {
       _requireMethodResponseMap(rawResponse, 'ownerSystemOperation'),
     );
     return _response(systemOperation: response);
+  }
+
+  /// Reads one foreground location through the Flutter geolocation plugin.
+  static Future<RuntimeHostInteractionResponse>
+  _handleForegroundLocationOperation(
+    RuntimeHostInteractionSystemOperationPayload payload,
+  ) async {
+    final decoded = jsonDecode(payload.paramsJson);
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException(
+        'get_device_location_foreground paramsJson must be an object',
+      );
+    }
+    final timeout = decoded['timeout'];
+    final highAccuracy = decoded['highAccuracy'];
+    final includeAddress = decoded['includeAddress'];
+    if (timeout is! int || timeout <= 0) {
+      throw const FormatException(
+        'get_device_location_foreground timeout must be a positive integer',
+      );
+    }
+    if (highAccuracy is! bool || includeAddress is! bool) {
+      throw const FormatException(
+        'get_device_location_foreground parameters have invalid types',
+      );
+    }
+
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      throw StateError('Windows location service is disabled');
+    }
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+    if (permission == LocationPermission.denied) {
+      throw StateError('Windows location permission was denied');
+    }
+    if (permission == LocationPermission.deniedForever) {
+      throw StateError('Windows location permission is permanently denied');
+    }
+
+    final position = await Geolocator.getCurrentPosition(
+      locationSettings: LocationSettings(
+        accuracy: highAccuracy
+            ? LocationAccuracy.best
+            : LocationAccuracy.medium,
+        timeLimit: Duration(seconds: timeout),
+      ),
+    );
+    final result = <String, Object?>{
+      'latitude': position.latitude,
+      'longitude': position.longitude,
+      'accuracy': position.accuracy,
+      'provider': 'flutter-geolocator',
+      'timestamp': position.timestamp.millisecondsSinceEpoch,
+      'rawData': jsonEncode(<String, Object?>{
+        'altitude': position.altitude,
+        'altitudeAccuracy': position.altitudeAccuracy,
+        'heading': position.heading,
+        'headingAccuracy': position.headingAccuracy,
+        'speed': position.speed,
+        'speedAccuracy': position.speedAccuracy,
+        'isMocked': position.isMocked,
+      }),
+      'address': '',
+      'city': '',
+      'province': '',
+      'country': '',
+    };
+    return _response(
+      systemOperation: RuntimeHostInteractionSystemOperationResponse(
+        resultJson: jsonEncode(result),
+      ),
+    );
   }
 
   /// Presents one system-operation toast inside the Flutter application.
@@ -514,6 +703,33 @@ class RuntimeHostInteractionSubscriber {
     return _response(
       systemOperation: RuntimeHostInteractionSystemOperationResponse(
         resultJson: jsonEncode(<String, Object?>{'success': true}),
+      ),
+    );
+  }
+
+  /// Writes system-operation clipboard text inside the Flutter application.
+  static Future<RuntimeHostInteractionResponse> _handleClipboardWriteOperation(
+    RuntimeHostInteractionSystemOperationPayload payload,
+  ) async {
+    final decoded = jsonDecode(payload.paramsJson);
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException(
+        'set_clipboard_text paramsJson must be an object',
+      );
+    }
+    final text = decoded['text'];
+    if (text is! String || text.isEmpty) {
+      throw const FormatException(
+        'set_clipboard_text text must be a non-empty string',
+      );
+    }
+    await Clipboard.setData(ClipboardData(text: text));
+    return _response(
+      systemOperation: RuntimeHostInteractionSystemOperationResponse(
+        resultJson: jsonEncode(<String, Object?>{
+          'success': true,
+          'text': text,
+        }),
       ),
     );
   }
@@ -698,6 +914,7 @@ class RuntimeHostInteractionSubscriber {
     RuntimeHostInteractionComposeWebViewControllerResponse?
     composeWebViewController,
     RuntimeHostInteractionComposeFilePickerResponse? composeFilePicker,
+    RuntimeHostInteractionComposeFileSaveResponse? composeFileSave,
     RuntimeHostInteractionSystemCaptureScreenshotResponse?
     systemCaptureScreenshot,
     RuntimeHostInteractionSystemLanguageCodeResponse? systemLanguageCode,
@@ -719,6 +936,7 @@ class RuntimeHostInteractionSubscriber {
       webVisit: webVisit,
       composeWebViewController: composeWebViewController,
       composeFilePicker: composeFilePicker,
+      composeFileSave: composeFileSave,
       systemCaptureScreenshot: systemCaptureScreenshot,
       systemLanguageCode: systemLanguageCode,
       systemRecognizeText: systemRecognizeText,

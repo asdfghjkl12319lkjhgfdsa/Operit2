@@ -41,6 +41,8 @@ function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_17)
   target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100")
   target_compile_options(${TARGET} PRIVATE /EHsc)
+  # Serialize compiler PDB writes through MSPDBSRV during parallel MSVC builds.
+  target_compile_options(${TARGET} PRIVATE /FS)
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
   # Third-party Windows plugins still use the MSVC experimental coroutine header.
   target_compile_definitions(${TARGET} PRIVATE "_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS")
@@ -99,17 +101,37 @@ include(flutter/generated_plugins.cmake)
 # Support files are copied into place next to the executable, so that it can
 # run in place. This is done instead of making a separate bundle (as on Linux)
 # so that building and running from within Visual Studio will work.
-set(BUILD_BUNDLE_DIR "$<TARGET_FILE_DIR:${BINARY_NAME}>")
+set(BUILD_BUNDLE_DIR "${CMAKE_CURRENT_BINARY_DIR}/runner")
 # Make the "install" step default, as it's required to run.
 set(CMAKE_VS_INCLUDE_INSTALL_TO_DEFAULT_BUILD 1)
-if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT OR
+   CMAKE_INSTALL_PREFIX STREQUAL "$<TARGET_FILE_DIR:${BINARY_NAME}>")
   set(CMAKE_INSTALL_PREFIX "${BUILD_BUNDLE_DIR}" CACHE PATH "..." FORCE)
 endif()
+# The install prefix cannot evaluate generator expressions. Resolve the default
+# runner directory at install time; explicit packaging prefixes stay exact.
+install(CODE "
+  if(\"\${CMAKE_INSTALL_PREFIX}\" STREQUAL \"${BUILD_BUNDLE_DIR}\")
+    set(CMAKE_INSTALL_PREFIX \"${BUILD_BUNDLE_DIR}/\${CMAKE_INSTALL_CONFIG_NAME}\")
+  endif()
+  " COMPONENT Runtime)
 
-set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")
-set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}")
+# Keep destinations relative so release packaging can install into a fresh tree.
+set(INSTALL_BUNDLE_DATA_DIR "data")
+set(INSTALL_BUNDLE_LIB_DIR ".")
 
-install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+# Install Bash after the bundle prefix is configured so its target expression is
+# evaluated in the destination, alongside the other application runtime files.
+install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runner/$<CONFIG>/bash"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
+
+# Ship the compiler's redistributable DLLs so fresh Windows users can launch the app.
+set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+include(InstallRequiredSystemLibraries)
+install(FILES ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
+
+install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "."
   COMPONENT Runtime)
 
 install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
@@ -121,6 +143,7 @@ install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
 set(OPERIT_FLUTTER_BRIDGE_CRATE "${CMAKE_CURRENT_SOURCE_DIR}/../../native/operit-flutter-bridge")
 install(FILES
   "${OPERIT_FLUTTER_BRIDGE_CRATE}/target/$<IF:$<CONFIG:Debug>,debug,release>/operit_flutter_bridge.dll"
+  "${OPERIT_FLUTTER_BRIDGE_CRATE}/target/$<IF:$<CONFIG:Debug>,debug,release>/operit_local_llm.dll"
   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
@@ -144,11 +167,16 @@ set(FLUTTER_ASSET_DIR_NAME "flutter_assets")
 install(CODE "
   if(NOT \"\${CMAKE_INSTALL_CONFIG_NAME}\" STREQUAL \"Debug\" AND
      NOT \"\${CMAKE_INSTALL_CONFIG_NAME}\" STREQUAL \"Profile\")
-    file(REMOVE_RECURSE \"${INSTALL_BUNDLE_DATA_DIR}/${FLUTTER_ASSET_DIR_NAME}\")
+    file(REMOVE_RECURSE \"\${CMAKE_INSTALL_PREFIX}/${INSTALL_BUNDLE_DATA_DIR}/${FLUTTER_ASSET_DIR_NAME}\")
   endif()
   " COMPONENT Runtime)
 install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
-  DESTINATION "${INSTALL_BUNDLE_DATA_DIR}" COMPONENT Runtime)
+  DESTINATION "${INSTALL_BUNDLE_DATA_DIR}" CONFIGURATIONS Debug COMPONENT Runtime)
+# Flutter shares its asset output across build modes and leaves the debug kernel
+# behind. AOT bundles must not include those JIT-only files.
+install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
+  DESTINATION "${INSTALL_BUNDLE_DATA_DIR}" CONFIGURATIONS Profile Release COMPONENT Runtime
+  REGEX "/flutter_assets/(kernel_blob[.]bin|vm_snapshot_data|isolate_snapshot_data)$" EXCLUDE)
 
 # Install the AOT library on non-Debug builds only.
 install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"

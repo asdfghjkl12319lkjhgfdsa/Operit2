@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -8,42 +10,161 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:operit2/core/bridge/FfiCoreProxy.dart';
 import 'package:operit2/core/bridge/FfiCoreTransport.dart';
+import 'package:operit2/core/bridge/CoreByteTransport.dart';
 import 'package:operit2/core/link/CoreLinkCodec.dart';
 import 'package:operit2/core/link/CoreLinkProtocol.dart';
+import 'package:operit2/core/logging/ClientLogger.dart';
 
-typedef _Post = Bool Function(Int64, Pointer<_DartObject>);
+typedef _FixtureSendNative =
+    Bool Function(
+      Pointer<Void>,
+      Int64,
+      Pointer<Uint8>,
+      UintPtr,
+      Pointer<Pointer<Void>>,
+      UintPtr,
+    );
 
-final class _TypedData extends Struct {
-  @Int32()
-  external int type;
-  @IntPtr()
-  external int length;
+final class _BatchFrame extends Struct {
   external Pointer<Uint8> bytes;
-}
-
-final class _ExternalData extends Struct {
-  @Int32()
-  external int type;
-  @IntPtr()
+  @UintPtr()
   external int length;
-  external Pointer<Void> bytes;
-  external Pointer<Void> peer;
-  external Pointer<Void> callback;
+  external Pointer<Pointer<Void>> handles;
+  @UintPtr()
+  external int count;
 }
 
-final class _ObjectValue extends Union {
-  external _TypedData data;
-  external _ExternalData externalData;
-  @Int64()
-  external int integer;
-  @Double()
-  external double doubleValue;
+late bool Function(Pointer<Void>, int, Pointer<_BatchFrame>, int)
+_fixtureSendBatch;
+
+late Pointer<Uint8> Function(int) _fixtureAllocate;
+late bool Function(
+  Pointer<Void>,
+  int,
+  Pointer<Uint8>,
+  int,
+  Pointer<Pointer<Void>>,
+  int,
+)
+_fixtureSend;
+late DynamicLibrary _fixtureLibrary;
+late Pointer<NativeFunction<Void Function(Pointer<Void>)>>
+_fixtureBufferRelease;
+late Pointer<Void> Function(int) _fixtureBufferAllocate;
+late Pointer<Uint8> Function(Pointer<Void>) _fixtureBufferData;
+late void Function(Pointer<Void>) _fixtureBufferSeal;
+late Pointer<Void> Function(Pointer<Void>) _fixtureBufferRetain;
+late Pointer<Uint8> Function(Pointer<Void>) _fixtureBufferView;
+late int Function(Pointer<Void>) _fixtureBufferLength;
+late int Function(Pointer<Void>) _fixtureTrackAllocation;
+late bool Function(int) _fixtureAllocationIsLive;
+final List<String> _nativeFailures = [];
+
+/// Captures the host log call without using a Core request or the client logger.
+void _reportFailure(Pointer<Uint8> bytes, int length) {
+  _nativeFailures.add(utf8.decode(bytes.asTypedList(length)));
 }
 
-final class _DartObject extends Struct {
-  @Int32()
-  external int type;
-  external _ObjectValue value;
+/// Loads the production Rust sender in a dependency-free native test library.
+Future<void> _loadPortFixture() async {
+  final output = await Directory('build/native_tests').create(recursive: true);
+  final manifest = Directory.current.uri
+      .resolve(
+        '../../../hosts/common/operit-host-native-common/tests/port-fixture/Cargo.toml',
+      )
+      .toFilePath();
+  final result = await Process.run(
+    'cargo',
+    [
+      'build',
+      '--offline',
+      '--manifest-path',
+      manifest,
+      '--target-dir',
+      '${output.absolute.path}/cargo',
+      '--message-format=json',
+    ],
+    environment: {...Platform.environment, 'RUSTFLAGS': '-Awarnings'},
+  );
+  if (result.exitCode != 0) {
+    throw StateError('Native fixture failed: ${result.stderr}');
+  }
+  final artifacts = const LineSplitter()
+      .convert(result.stdout as String)
+      .map((line) => jsonDecode(line) as Map<String, dynamic>)
+      .where(
+        (message) =>
+            message['reason'] == 'compiler-artifact' &&
+            message['target']['name'] == 'operit_dart_port_fixture',
+      );
+  final library = (artifacts.single['filenames'] as List).first as String;
+  final native = DynamicLibrary.open(library);
+  _fixtureLibrary = native;
+  _fixtureBufferRelease = native
+      .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+        'fixture_buffer_release',
+      );
+  _fixtureBufferAllocate = native
+      .lookupFunction<
+        Pointer<Void> Function(UintPtr),
+        Pointer<Void> Function(int)
+      >('fixture_buffer_allocate');
+  _fixtureBufferData = native
+      .lookupFunction<
+        Pointer<Uint8> Function(Pointer<Void>),
+        Pointer<Uint8> Function(Pointer<Void>)
+      >('fixture_buffer_data');
+  _fixtureBufferSeal = native
+      .lookupFunction<
+        Void Function(Pointer<Void>),
+        void Function(Pointer<Void>)
+      >('fixture_buffer_seal');
+  _fixtureBufferRetain = native
+      .lookupFunction<
+        Pointer<Void> Function(Pointer<Void>),
+        Pointer<Void> Function(Pointer<Void>)
+      >('fixture_buffer_retain');
+  _fixtureBufferView = native
+      .lookupFunction<
+        Pointer<Uint8> Function(Pointer<Void>),
+        Pointer<Uint8> Function(Pointer<Void>)
+      >('fixture_buffer_view');
+  _fixtureBufferLength = native
+      .lookupFunction<
+        UintPtr Function(Pointer<Void>),
+        int Function(Pointer<Void>)
+      >('fixture_buffer_length');
+  _fixtureAllocate = native
+      .lookupFunction<
+        Pointer<Uint8> Function(UintPtr),
+        Pointer<Uint8> Function(int)
+      >('fixture_allocate');
+  _fixtureSend = native
+      .lookupFunction<
+        _FixtureSendNative,
+        bool Function(
+          Pointer<Void>,
+          int,
+          Pointer<Uint8>,
+          int,
+          Pointer<Pointer<Void>>,
+          int,
+        )
+      >('fixture_send');
+  _fixtureSendBatch = native
+      .lookupFunction<
+        Bool Function(Pointer<Void>, Int64, Pointer<_BatchFrame>, UintPtr),
+        bool Function(Pointer<Void>, int, Pointer<_BatchFrame>, int)
+      >('fixture_send_batch');
+  _fixtureTrackAllocation = native
+      .lookupFunction<
+        UintPtr Function(Pointer<Void>),
+        int Function(Pointer<Void>)
+      >('fixture_track_allocation');
+  _fixtureAllocationIsLive = native
+      .lookupFunction<Bool Function(UintPtr), bool Function(int)>(
+        'fixture_allocation_is_live',
+      );
 }
 
 class _HostConnection {
@@ -51,17 +172,18 @@ class _HostConnection {
   _HostConnection() : token = calloc<Uint8>().cast<Void>();
 
   final Pointer<Void> token;
-  late bool Function(int, Pointer<_DartObject>) post;
+  late Pointer<Void> post;
   late int port;
   final List<List<Object?>> items = [];
   final List<String> closedPushes = [];
   final List<String> closedWatches = [];
   final Map<String, int> watches = {};
   final Map<String, int> delayed = {};
+  Pointer<Uint8>? lastPayload;
 
   /// Publishes function pointers using the same versioned descriptor as the Rust host.
   String descriptor() => jsonEncode({
-    'version': 1,
+    'version': 4,
     'session': token.address.toString(),
     'attach':
         Pointer.fromFunction<
@@ -77,6 +199,8 @@ class _HostConnection {
                 Int64,
                 Pointer<Uint8>,
                 UintPtr,
+                Pointer<Pointer<Void>>,
+                UintPtr,
               )
             >(_submit)
             .address
@@ -84,35 +208,107 @@ class _HostConnection {
     'allocate': Pointer.fromFunction<Pointer<Uint8> Function(UintPtr)>(
       _allocate,
     ).address.toString(),
+    'bufferAllocate': _fixtureLibrary
+        .lookup<NativeFunction<Pointer<Void> Function(UintPtr)>>(
+          'fixture_buffer_allocate',
+        )
+        .address
+        .toString(),
+    'bufferData': _fixtureLibrary
+        .lookup<NativeFunction<Pointer<Uint8> Function(Pointer<Void>)>>(
+          'fixture_buffer_data',
+        )
+        .address
+        .toString(),
+    'bufferSeal': _fixtureLibrary
+        .lookup<NativeFunction<Void Function(Pointer<Void>)>>(
+          'fixture_buffer_seal',
+        )
+        .address
+        .toString(),
+    'bufferRetain': _fixtureLibrary
+        .lookup<NativeFunction<Pointer<Void> Function(Pointer<Void>)>>(
+          'fixture_buffer_retain',
+        )
+        .address
+        .toString(),
+    'bufferRelease': _fixtureBufferRelease.address.toString(),
     'free': Pointer.fromFunction<Void Function(Pointer<Uint8>, UintPtr)>(
       _free,
     ).address.toString(),
     'release': calloc.nativeFree.address.toString(),
+    'reportFailure':
+        Pointer.fromFunction<Void Function(Pointer<Uint8>, UintPtr)>(
+          _reportFailure,
+        ).address.toString(),
   });
 
-  /// Copies a framed typed-data message through the actual Dart VM native API.
-  void send(int kind, int id, Uint8List payload) {
-    final bytes = calloc<Uint8>(9 + payload.length);
+  /// Transfers an immutable external buffer through the actual Dart VM native API.
+  void send(
+    int kind,
+    int id,
+    Uint8List payload, [
+    List<CoreLinkBufferSpan> buffers = const [],
+  ]) {
+    final bytes = _fixtureAllocate(9 + payload.length);
     final frame = bytes.asTypedList(9 + payload.length);
     frame[0] = kind;
     ByteData.sublistView(frame).setInt64(1, id, Endian.little);
     frame.setRange(9, frame.length, payload);
-    final object = calloc<_DartObject>();
-    object.ref.type = 7;
-    object.ref.value.data
-      ..type = 2
-      ..length = frame.length
-      ..bytes = bytes;
+    lastPayload = bytes;
+    final handles = calloc<Pointer<Void>>(buffers.length + 1);
     try {
-      expect(post(port, object), isTrue);
+      for (var i = 0; i < buffers.length; i++) {
+        handles[i] = Pointer<Void>.fromAddress(buffers[i].buffer.token as int);
+      }
+      expect(
+        _fixtureSend(post, port, bytes, frame.length, handles, buffers.length),
+        isTrue,
+      );
     } finally {
-      calloc.free(object);
-      calloc.free(bytes);
+      calloc.free(handles);
+    }
+  }
+
+  /// Posts a batch whose binary table starts independently at zero for every frame.
+  void batch(List<(int, int, CoreLinkMessage)> values) {
+    final entries = calloc<_BatchFrame>(values.length);
+    final tables = <Pointer<Pointer<Void>>>[];
+    try {
+      for (var i = 0; i < values.length; i++) {
+        final (kind, id, message) = values[i];
+        final shared = message.share(_shareFixture);
+        final bytes = _fixtureAllocate(9 + shared.bytes.length);
+        final frame = bytes.asTypedList(9 + shared.bytes.length);
+        frame[0] = kind;
+        ByteData.sublistView(frame).setInt64(1, id, Endian.little);
+        frame.setRange(9, frame.length, shared.bytes);
+        final handles = calloc<Pointer<Void>>(shared.buffers.length + 1);
+        tables.add(handles);
+        for (var j = 0; j < shared.buffers.length; j++) {
+          handles[j] = Pointer<Void>.fromAddress(
+            shared.buffers[j].buffer.token as int,
+          );
+        }
+        entries[i].bytes = bytes;
+        entries[i].length = frame.length;
+        entries[i].handles = handles;
+        entries[i].count = shared.buffers.length;
+      }
+      expect(_fixtureSendBatch(post, port, entries, values.length), isTrue);
+    } finally {
+      for (final handles in tables) {
+        calloc.free(handles);
+      }
+      calloc.free(entries);
     }
   }
 
   /// Completes one request with a compact success result.
-  void reply(int id, Object? value) => send(0, id, encodeCoreLink([0, value]));
+  void reply(int id, Object? value) {
+    final message = encodeCoreLinkMessage([0, value]).share(_shareFixture);
+    send(0, id, message.bytes, message.buffers);
+  }
 
   /// Emits one event before the watch-open response to exercise buffering.
   void event(int id, String subscription, String value) => send(
@@ -132,9 +328,7 @@ int _freedBuffers = 0;
 /// Captures the VM's thread-safe post entry point and connection-specific port.
 bool _attach(Pointer<Void> token, Pointer<Void> post, int port) {
   final connection = _connections[token.address]!;
-  connection.post = post
-      .cast<NativeFunction<_Post>>()
-      .asFunction<bool Function(int, Pointer<_DartObject>)>();
+  connection.post = post;
   connection.port = port;
   return true;
 }
@@ -158,9 +352,26 @@ void _submit(
   int id,
   Pointer<Uint8> pointer,
   int length,
+  Pointer<Pointer<Void>> handles,
+  int count,
 ) {
   final connection = _connections[token.address]!;
   final bytes = Uint8List.fromList(pointer.asTypedList(length));
+  final buffers = <CoreLinkSharedBuffer>[];
+  for (var i = 0; i < count; i++) {
+    final token = _fixtureBufferRetain(handles[i]);
+    final view = _fixtureBufferView(token)
+        .asTypedList(
+          _fixtureBufferLength(token),
+          finalizer: _fixtureBufferRelease,
+          token: token,
+        )
+        .asUnmodifiableView();
+    buffers.add(
+      CoreLinkSharedBuffer(view, token.address, _fixtureBufferRelease.address),
+    );
+  }
+  attachCoreLinkBuffers(bytes, buffers);
   _free(pointer, length);
   scheduleMicrotask(() {
     switch (operation) {
@@ -189,7 +400,13 @@ void _submit(
         connection.closedPushes.add(utf8.decode(bytes));
         connection.reply(id, null);
       case 4:
-        connection.reply(id, [null, 'core/test7', 'items', 'Snapshot', 'snapshot']);
+        connection.reply(id, [
+          null,
+          'core/test7',
+          'items',
+          'Snapshot',
+          'snapshot',
+        ]);
       case 5:
         final watch = decodeCoreLink<List<Object?>>(bytes);
         final subscription = watch[0] as String;
@@ -215,7 +432,12 @@ void _submit(
           connection.send(3, id, Uint8List(0));
         }
       case 6:
-        connection.closedWatches.add(utf8.decode(bytes));
+        final closing = decodeCoreLink<List<Object?>>(bytes);
+        final subscription = closing[0] as String;
+        final generation = closing[1] as int;
+        if (connection.watches[subscription] == generation) {
+          connection.closedWatches.add(subscription);
+        }
         connection.reply(id, null);
     }
   });
@@ -246,6 +468,12 @@ void main() {
   late _HostConnection host;
   late List<String> platformMethods;
 
+  setUpAll(_loadPortFixture);
+  setUp(() async {
+    await ClientLogger.initialize();
+    await ClientLogger.clear();
+  });
+
   setUp(() {
     platformMethods = [];
     transport = FfiCoreTransport();
@@ -269,6 +497,83 @@ void main() {
         .setMockMethodCallHandler(const MethodChannel('operit/runtime'), null);
   });
 
+  test('VM collection releases delivered shared ownership receipts', () async {
+    final messages = ReceivePort();
+    final adopted = ReceivePort();
+    final exit = ReceivePort();
+    final isolate = await Isolate.spawn(_receiveOneEnvelope, [
+      messages.sendPort,
+      _fixtureLibrary
+          .lookup<NativeFunction<Pointer<Void> Function(Pointer<Void>)>>(
+            'fixture_buffer_retain',
+          )
+          .address,
+      _fixtureBufferRelease.address,
+      _fixtureLibrary
+          .lookup<NativeFunction<UintPtr Function(Pointer<Void>)>>(
+            'fixture_track_allocation',
+          )
+          .address,
+      adopted.sendPort,
+    ], onExit: exit.sendPort);
+    final port = await messages.first as SendPort;
+    messages.close();
+    final token = _fixtureBufferAllocate(1024 * 1024);
+    _fixtureBufferSeal(token);
+    final handles = calloc<Pointer<Void>>()..value = token;
+    final frame = _fixtureAllocate(9);
+    final tokenProbe = _fixtureTrackAllocation(token);
+    final payloadProbe = _fixtureTrackAllocation(
+      _fixtureBufferView(token).cast(),
+    );
+    final metadataProbe = _fixtureTrackAllocation(frame.cast());
+    expect(
+      [tokenProbe, payloadProbe, metadataProbe].every(_fixtureAllocationIsLive),
+      isTrue,
+    );
+    try {
+      expect(
+        _fixtureSend(
+          NativeApi.postCObject.cast(),
+          port.nativePort,
+          frame,
+          9,
+          handles,
+          1,
+        ),
+        isTrue,
+      );
+      _fixtureBufferRelease.asFunction<void Function(Pointer<Void>)>()(token);
+      expect(_fixtureAllocationIsLive(tokenProbe), isFalse);
+      final adoptedProbe = await adopted.first as int;
+      final probes = [metadataProbe, payloadProbe, adoptedProbe];
+      await exit.first;
+      for (
+        var attempt = 0;
+        attempt < 16 && probes.any(_fixtureAllocationIsLive);
+        attempt++
+      ) {
+        final pressure = List.generate(
+          32,
+          (index) => Uint8List(1024 * 1024)..[0] = index,
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        expect(pressure.last[0], 31);
+      }
+      expect(
+        probes.where(_fixtureAllocationIsLive),
+        isEmpty,
+        reason:
+            'Metadata, shared payload and adopted handle must all be released',
+      );
+    } finally {
+      calloc.free(handles);
+      adopted.close();
+      exit.close();
+      isolate.kill();
+    }
+  });
+
   test('calls and snapshots use FFI after one host bootstrap', () async {
     expect(
       await proxy.call(_call('one', 'echo', Uint8List.fromList([0, 255]))),
@@ -282,18 +587,24 @@ void main() {
   test('retries connection after storage becomes configured', () async {
     var attempts = 0;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(const MethodChannel('operit/runtime'), (call) async {
+        .setMockMethodCallHandler(const MethodChannel('operit/runtime'), (
+          call,
+        ) async {
           attempts++;
           if (attempts == 1) {
-            throw PlatformException(code: 'OPERIT_RUNTIME_ERROR',
-                message: 'Runtime and workspace roots are not configured');
+            throw PlatformException(
+              code: 'OPERIT_RUNTIME_ERROR',
+              message: 'Runtime and workspace roots are not configured',
+            );
           }
           host = _HostConnection();
           _connections[host.token.address] = host;
           return host.descriptor();
         });
-    await expectLater(proxy.call(_call('before', 'echo', 'before')),
-        throwsA(isA<PlatformException>()));
+    await expectLater(
+      proxy.call(_call('before', 'echo', 'before')),
+      throwsA(isA<PlatformException>()),
+    );
     expect(await proxy.call(_call('after', 'echo', 'ready')), 'ready');
     expect(attempts, 2);
   });
@@ -306,6 +617,73 @@ void main() {
     host.reply(host.delayed['one']!, 'first');
     expect(await Future.wait([first, second]), ['first', 'second']);
   });
+
+  test(
+    'response views share native storage and outlive the connection',
+    () async {
+      final source = await transport.shareBytes(Uint8List.fromList([7, 9]));
+      final response = await transport.request(
+        CoreTransportOperation.call,
+        encodeNativeCoreCallRequest(_call('shared', 'echo', source)),
+      );
+      final value = decodeNativeCoreResult(response) as Uint8List;
+      expect(value, [7, 9]);
+      expect(() => response[0] = 255, throwsUnsupportedError);
+      expect(() => value[0] = 255, throwsUnsupportedError);
+      final sourceToken = coreLinkSharedSpan(source)!.buffer.token as int;
+      final receivedToken = coreLinkSharedSpan(value)!.buffer.token as int;
+      expect(
+        _fixtureBufferView(Pointer<Void>.fromAddress(sourceToken)).address,
+        _fixtureBufferView(Pointer<Void>.fromAddress(receivedToken)).address,
+      );
+      await proxy.call(_call('next', 'echo', 'another allocation'));
+      await transport.close();
+      await pumpEventQueue();
+      expect(value, [7, 9]);
+      expect(decodeNativeCoreResult(response), [7, 9]);
+    },
+  );
+
+  test(
+    'concurrent nested shared slices preserve addresses and view identity',
+    () async {
+      final source = await transport.shareBytes(
+        Uint8List.fromList([3, 5, 7, 9]),
+      );
+      final slice = sliceCoreLinkBytes(source, 1, 3);
+      final values = await Future.wait(
+        List.generate(16, (index) async {
+          final result = await transport.request(
+            CoreTransportOperation.call,
+            encodeNativeCoreCallRequest(
+              _call('$index', 'echo', {
+                'data': [source, slice],
+              }),
+            ),
+          );
+          return decodeNativeCoreResult(result) as Map;
+        }),
+      );
+      final original = coreLinkSharedSpan(source)!;
+      for (final value in values) {
+        final data = value['data'] as List;
+        final full = coreLinkSharedSpan(data[0] as Uint8List)!;
+        final part = coreLinkSharedSpan(data[1] as Uint8List)!;
+        expect(identical(full.buffer, original.buffer), isTrue);
+        expect((data[1] as Uint8List).toList(), [5, 7]);
+        expect(
+          _fixtureBufferView(
+                Pointer<Void>.fromAddress(part.buffer.token as int),
+              ).address +
+              part.offset,
+          _fixtureBufferView(
+                Pointer<Void>.fromAddress(original.buffer.token as int),
+              ).address +
+              1,
+        );
+      }
+    },
+  );
 
   test(
     'push preserves order and releases a failed stream exactly once',
@@ -325,6 +703,125 @@ void main() {
       expect(host.items.map((item) => item[1]), [0, 1, 2]);
       expect(host.closedPushes, ['push-1']);
       expect(() => push.add('late'), throwsStateError);
+    },
+  );
+
+  test('rejected posts release their native allocation immediately', () async {
+    await proxy.call(_call('connected', 'echo', null));
+    await transport.close();
+    final bytes = _fixtureAllocate(64);
+    final token = _fixtureBufferAllocate(128);
+    _fixtureBufferSeal(token);
+    final handles = calloc<Pointer<Void>>()..value = token;
+    final metadataProbe = _fixtureTrackAllocation(bytes.cast());
+    final payloadProbe = _fixtureTrackAllocation(
+      _fixtureBufferView(token).cast(),
+    );
+    final tokenProbe = _fixtureTrackAllocation(token);
+    try {
+      expect(
+        _fixtureSend(host.post, host.port, bytes, 64, handles, 1),
+        isFalse,
+      );
+      expect(_fixtureAllocationIsLive(metadataProbe), isFalse);
+      expect(_fixtureAllocationIsLive(payloadProbe), isTrue);
+      expect(_fixtureAllocationIsLive(tokenProbe), isTrue);
+    } finally {
+      _fixtureBufferRelease.asFunction<void Function(Pointer<Void>)>()(token);
+      calloc.free(handles);
+    }
+    expect(_fixtureAllocationIsLive(tokenProbe), isFalse);
+    expect(_fixtureAllocationIsLive(payloadProbe), isFalse);
+  });
+
+  test(
+    'metadata-only batches preserve byte slots and ordered watch values',
+    () async {
+      final failureCount = _nativeFailures.length;
+      await proxy.call(_call('metadataSetup', 'echo', null));
+      final values = <Object?>[];
+      final done = Completer<void>();
+      proxy
+          .watchStream(_watch('metadataBatch'))
+          .listen(
+            (event) => values.add(event.value),
+            onError: done.completeError,
+            onDone: done.complete,
+          );
+      while (host.watches.isEmpty) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      final watch = host.watches.entries.single;
+      final expected = <Object?>['early'];
+      for (var batch = 0; batch < 256; batch++) {
+        host.batch(
+          List.generate(12, (index) {
+            final value = 'frame-${batch * 12 + index}'.padRight(280, '.');
+            expected.add(value);
+            return (
+              1,
+              watch.value,
+              encodeCoreLinkMessage([
+                watch.key,
+                [null, 'core/test7', 'items', 'Changed', value],
+              ]),
+            );
+          }),
+        );
+        await Future<void>.delayed(Duration.zero);
+      }
+      host.send(3, watch.value, Uint8List(0));
+      await done.future;
+      expect(values, expected);
+      expect(platformMethods, ['connectCoreFfi']);
+      expect(_nativeFailures, hasLength(failureCount));
+    },
+  );
+
+  test(
+    'one batch preserves independent binary tables and watch identities',
+    () async {
+      final firstValues = <Object?>[];
+      final secondValues = <Object?>[];
+      final firstDone = Completer<void>();
+      final secondDone = Completer<void>();
+      proxy
+          .watchStream(_watch('firstBatch'))
+          .listen(
+            (event) => firstValues.add(event.value),
+            onDone: firstDone.complete,
+          );
+      proxy
+          .watchStream(_watch('secondBatch'))
+          .listen(
+            (event) => secondValues.add(event.value),
+            onDone: secondDone.complete,
+          );
+      while (host.watches.length != 2) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      final watches = host.watches.entries.toList();
+      CoreLinkMessage value(String id, List<int> bytes) =>
+          encodeCoreLinkMessage([
+            id,
+            [null, 'core/test7', 'items', 'Changed', Uint8List.fromList(bytes)],
+          ]);
+      host.batch([
+        (1, watches[0].value, value(watches[0].key, [1, 2, 3])),
+        (1, watches[1].value, value(watches[1].key, [9, 8, 7, 6])),
+        (3, watches[0].value, CoreLinkMessage.bytes(Uint8List(0))),
+        (3, watches[1].value, CoreLinkMessage.bytes(Uint8List(0))),
+      ]);
+      await Future.wait([firstDone.future, secondDone.future]);
+      expect(firstValues, [
+        'early',
+        [1, 2, 3],
+      ]);
+      expect(secondValues, [
+        'early',
+        [9, 8, 7, 6],
+      ]);
+      expect(host.closedWatches, hasLength(2));
     },
   );
 
@@ -362,7 +859,7 @@ void main() {
   });
 
   test(
-    'cancellation during opening waits for acknowledgement and releases native state',
+    'cancellation releases native state before the open acknowledgement',
     () async {
       final received = Completer<void>();
       final subscription = proxy
@@ -371,9 +868,9 @@ void main() {
       await received.future;
       final cancelling = subscription.cancel();
       final watch = host.watches.entries.single;
-      host.reply(watch.value, watch.key);
       await cancelling;
       expect(host.closedWatches, [watch.key]);
+      host.reply(watch.value, watch.key);
     },
   );
 
@@ -389,6 +886,8 @@ void main() {
         proxy.call(_call('two', 'echo', null)),
         throwsStateError,
       );
+      final log = await ClientLogger.readText();
+      expect(log, isNot(contains('Core FFI connection failed')));
     },
   );
 
@@ -429,17 +928,117 @@ void main() {
   );
 
   test(
-    'invalid transport frames fail pending work and detach the connection',
+    'failed connections preserve the error and reconnect once for new calls',
     () async {
       final pending = proxy.call(_call('one', 'delayed', null));
       final assertion = expectLater(pending, throwsFormatException);
       await pumpEventQueue();
+      _nativeFailures.clear();
       host.send(255, 0, Uint8List(0));
       await assertion;
-      await expectLater(
-        proxy.call(_call('two', 'echo', null)),
-        throwsStateError,
+      // The failure is recorded synchronously before any new FFI session opens.
+      expect(platformMethods, ['connectCoreFfi']);
+      final log = _nativeFailures.single;
+      expect(log, contains('Core FFI connection failed pendingRequests=1'));
+      expect(log, contains('Unknown Core FFI frame type: 255'));
+      expect(log, contains('stackTrace='));
+      expect(log, contains('kind=255 id=0'));
+      expect(log, contains('pendingIds=[1]'));
+      expect(log, contains('at=${DateTime.now().year}-'));
+      final failedHost = host;
+      expect(platformMethods, ['connectCoreFfi']);
+      expect(
+        await Future.wait([
+          proxy.call(_call('two', 'echo', 'retried')),
+          proxy.call(_call('three', 'echo', 'concurrent')),
+        ]),
+        ['retried', 'concurrent'],
       );
+      expect(platformMethods, ['connectCoreFfi', 'connectCoreFfi']);
+      expect(host, isNot(same(failedHost)));
+      expect(host.delayed, isEmpty);
+      expect(_nativeFailures, [log]);
     },
+  );
+
+  test('terminal failure closes old watches and permits a new watch', () async {
+    final errors = <Object>[];
+    final done = Completer<void>();
+    proxy
+        .watchStream(_watch('items'))
+        .listen((_) {}, onError: errors.add, onDone: done.complete);
+    await pumpEventQueue();
+    host.send(
+      4,
+      0,
+      encodeCoreLink([
+        1,
+        'MODULE_DISCONNECTED',
+        'module disconnected',
+        null,
+        null,
+        null,
+      ]),
+    );
+    await done.future;
+    expect(errors.single, isA<CoreLinkError>());
+    expect(platformMethods, ['connectCoreFfi']);
+    final events = await proxy.watchStream(_watch('finite')).toList();
+    expect(events.map((event) => event.value), ['early']);
+    expect(platformMethods, ['connectCoreFfi', 'connectCoreFfi']);
+  });
+}
+
+/// Lets VM isolate teardown exercise finalizers on a received ownership envelope.
+void _receiveOneEnvelope(List<Object> arguments) {
+  final parent = arguments[0] as SendPort;
+  final retain =
+      Pointer<
+            NativeFunction<Pointer<Void> Function(Pointer<Void>)>
+          >.fromAddress(arguments[1] as int)
+          .asFunction<Pointer<Void> Function(Pointer<Void>)>();
+  final release =
+      Pointer<NativeFunction<Void Function(Pointer<Void>)>>.fromAddress(
+        arguments[2] as int,
+      );
+  final trackAllocation =
+      Pointer<NativeFunction<UintPtr Function(Pointer<Void>)>>.fromAddress(
+        arguments[3] as int,
+      ).asFunction<int Function(Pointer<Void>)>();
+  final adopted = arguments[4] as SendPort;
+  final port = ReceivePort();
+  parent.send(port.sendPort);
+  port.listen((dynamic message) {
+    final envelope = (message as List).single as List;
+    if (envelope.length != 5 || (envelope[2] as Uint8List).length != 1) {
+      throw StateError('Invalid fixture ownership receipt');
+    }
+    final token = retain(Pointer<Void>.fromAddress(envelope[1] as int));
+    final view = Pointer<Uint8>.fromAddress(
+      envelope[3] as int,
+    ).asTypedList(envelope[4] as int, finalizer: release, token: token);
+    if (view.first != 0 || view.last != 0) {
+      throw StateError('Invalid adopted binary contents');
+    }
+    adopted.send(trackAllocation(token));
+    Isolate.exit();
+  });
+}
+
+/// Publishes one fixture binary value through the same native immutable lifecycle.
+CoreLinkBufferSpan _shareFixture(Uint8List bytes) {
+  final shared = coreLinkSharedSpan(bytes);
+  if (shared != null) return shared;
+  final token = _fixtureBufferAllocate(bytes.length);
+  final pointer = _fixtureBufferData(token);
+  pointer.asTypedList(bytes.length).setAll(0, bytes);
+  _fixtureBufferSeal(token);
+  final view = pointer
+      .asTypedList(bytes.length, finalizer: _fixtureBufferRelease, token: token)
+      .asUnmodifiableView();
+  return CoreLinkBufferSpan(
+    CoreLinkSharedBuffer(view, token.address, _fixtureBufferRelease.address),
+    0,
+    bytes.length,
   );
 }

@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../theme/OperitFormStyles.dart';
 import '../utils/MCPCommandRunner.dart';
+import '../components/ExtensionScopeControls.dart';
 
 class MCPImportResult {
   const MCPImportResult({required this.message});
@@ -103,6 +104,12 @@ class _MCPImportDialogState extends State<MCPImportDialog> {
                       },
               ),
               const SizedBox(height: 16),
+              Text(
+                _mode == _MCPImportMode.zip || _mode == _MCPImportMode.github
+                    ? '本地部署 MCP 仅保存在本设备，不参与空间同步。'
+                    : '远程 MCP 可选择设备空间；包含本地命令的配置仅限本设备。',
+              ),
+              const SizedBox(height: 12),
               AnimatedSwitcher(
                 duration: const Duration(milliseconds: 160),
                 child: _mode == _MCPImportMode.config
@@ -223,6 +230,37 @@ class _MCPImportDialogState extends State<MCPImportDialog> {
     });
   }
 
+  /// Uses structured MCP definitions to enforce the local deployment boundary.
+  Future<String?> _chooseConfigScope(String jsonConfig) async {
+    final document = jsonDecode(jsonConfig);
+    if (document is! Map<String, dynamic> ||
+        document['mcpServers'] is! Map<String, dynamic>) {
+      throw const FormatException('MCP 配置必须包含 mcpServers 对象');
+    }
+    final servers = document['mcpServers'] as Map<String, dynamic>;
+    if (servers.isEmpty) throw const FormatException('MCP 配置为空');
+    for (final definition in servers.values) {
+      if (definition is! Map<String, dynamic>) {
+        throw const FormatException('MCP 服务必须是对象');
+      }
+      final command = definition['command'];
+      final url = definition['url'];
+      final local = command is String && command.trim().isNotEmpty;
+      final remote = url is String && url.trim().isNotEmpty;
+      if (local == remote) {
+        throw const FormatException('MCP 服务必须且只能指定 command 或 url');
+      }
+    }
+    final hasLocal = servers.values.any(
+      (definition) =>
+          definition['command'] is String &&
+          (definition['command'] as String).trim().isNotEmpty,
+    );
+    if (hasLocal) return 'device';
+    if (!mounted) return null;
+    return chooseExtensionScope(context);
+  }
+
   Future<void> _mergeConfig() async {
     final jsonConfig = _mergeConfigController.text.trim();
     if (jsonConfig.isEmpty) {
@@ -234,20 +272,44 @@ class _MCPImportDialogState extends State<MCPImportDialog> {
       );
       return;
     }
+    String? scope;
+    try {
+      scope = await _chooseConfigScope(jsonConfig);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+      return;
+    }
+    if (scope == null) return;
     await _run(() async {
       final lifecycles = _serverLifecyclesFromConfig(jsonConfig);
       final count = await widget.clients.permissionsMcpRuntimeMcpLocalServer
-          .mergeConfigFromJson(jsonConfig: jsonConfig);
+          .mergeConfigFromJsonWithScope(jsonConfig: jsonConfig, scope: scope!);
       await _applyImportedServerLifecycles(lifecycles);
       return '已导入 $count 个 MCP 服务';
     });
   }
 
   Future<void> _mergeFormConfig(String jsonConfig) async {
+    String? scope;
+    try {
+      scope = await _chooseConfigScope(jsonConfig);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+      return;
+    }
+    if (scope == null) return;
     await _run(() async {
       final lifecycles = _serverLifecyclesFromConfig(jsonConfig);
       final count = await widget.clients.permissionsMcpRuntimeMcpLocalServer
-          .mergeConfigFromJson(jsonConfig: jsonConfig);
+          .mergeConfigFromJsonWithScope(jsonConfig: jsonConfig, scope: scope!);
       await _applyImportedServerLifecycles(lifecycles);
       return '已导入 $count 个 MCP 服务';
     });
@@ -440,6 +502,7 @@ class _MCPFormConfigPaneState extends State<MCPFormConfigPane> {
   final _commandController = TextEditingController();
   final _argsController = TextEditingController();
   final _urlController = TextEditingController();
+  final _bearerTokenController = TextEditingController();
   final _headersController = TextEditingController();
   final _envController = TextEditingController();
 
@@ -452,6 +515,7 @@ class _MCPFormConfigPaneState extends State<MCPFormConfigPane> {
     _commandController.dispose();
     _argsController.dispose();
     _urlController.dispose();
+    _bearerTokenController.dispose();
     _headersController.dispose();
     _envController.dispose();
     super.dispose();
@@ -472,6 +536,7 @@ class _MCPFormConfigPaneState extends State<MCPFormConfigPane> {
             commandController: _commandController,
             argsController: _argsController,
             urlController: _urlController,
+            bearerTokenController: _bearerTokenController,
             headersController: _headersController,
             envController: _envController,
             onRemoteChanged: (value) {
@@ -495,12 +560,14 @@ class _MCPFormConfigPaneState extends State<MCPFormConfigPane> {
       return;
     }
     final serverId = _serverIdController.text.trim();
+    final bearerToken = _bearerTokenController.text.trim();
     final config = <String, Object?>{
       'mcpServers': <String, Object?>{
         serverId: _remote
             ? <String, Object?>{
                 'url': _urlController.text.trim(),
                 'type': _type,
+                if (bearerToken.isNotEmpty) 'bearerToken': bearerToken,
                 'headers': _parseMapLines(_headersController.text),
                 'disabled': false,
                 'autoApprove': <String>[],
@@ -590,6 +657,7 @@ class _FormConfigPane extends StatelessWidget {
     required this.commandController,
     required this.argsController,
     required this.urlController,
+    required this.bearerTokenController,
     required this.headersController,
     required this.envController,
     required this.onRemoteChanged,
@@ -603,6 +671,7 @@ class _FormConfigPane extends StatelessWidget {
   final TextEditingController commandController;
   final TextEditingController argsController;
   final TextEditingController urlController;
+  final TextEditingController bearerTokenController;
   final TextEditingController headersController;
   final TextEditingController envController;
   final ValueChanged<bool> onRemoteChanged;
@@ -672,6 +741,13 @@ class _FormConfigPane extends StatelessWidget {
                     }
                   }
                 : null,
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: bearerTokenController,
+            enabled: enabled,
+            obscureText: true,
+            decoration: const InputDecoration(labelText: 'Bearer Token'),
           ),
           const SizedBox(height: 12),
           TextFormField(

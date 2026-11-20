@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// Runs MCP server management commands.
-pub fn run_mcp_command(
+pub async fn run_mcp_command(
     application: &OperitApplication,
     args: &[String],
     output: &mut CoreCommandOutput,
@@ -35,7 +35,7 @@ pub fn run_mcp_command(
         Some("remove") => remove_mcp_server(context, args, output),
         Some("enable") => set_mcp_enabled(context, args, true, output),
         Some("disable") => set_mcp_enabled(context, args, false, output),
-        Some("start") => start_mcp_server(application, args, output),
+        Some("start") => start_mcp_server(application, args, output).await,
         Some("kill") => kill_mcp_server(application, args, output),
         Some("tools") => print_mcp_tools(context, args, output),
         Some("config") => print_mcp_config(context, args, output),
@@ -45,7 +45,7 @@ pub fn run_mcp_command(
         Some("install-zip") => install_mcp_from_zip(application, args, output),
         Some("meta") => print_mcp_metadata(context, args, output),
         Some("meta-set") => save_mcp_metadata(context, args, output),
-        Some("describe") => generate_mcp_description(application, args, output),
+        Some("describe") => generate_mcp_description(application, args, output).await,
         Some(_) | None => {
             print_mcp_usage(output);
             Ok(())
@@ -164,7 +164,7 @@ fn import_mcp_config(
     output: &mut CoreCommandOutput,
 ) -> Result<(), String> {
     let configArg = required_arg(args, 1, "operit2 mcp import <json-or-@file>")?;
-    let configJson = read_content_arg(configArg)?;
+    let configJson = read_content_arg(&context, configArg)?;
     let count = mcp_local_server(&context).mergeConfigFromJson(&configJson)?;
     output.push_stdout_line(format!("MCP servers imported: {count}"));
     output.setJsonStdout(serde_json::json!({"imported": count}));
@@ -214,7 +214,7 @@ fn set_mcp_enabled(
 }
 
 /// Starts one MCP server and prints startup progress.
-fn start_mcp_server(
+async fn start_mcp_server(
     application: &OperitApplication,
     args: &[String],
     output: &mut CoreCommandOutput,
@@ -226,18 +226,30 @@ fn start_mcp_server(
         .getMcpStartupTimeoutSeconds()
         .map_err(|error| error.to_string())?;
     let timeoutMs = timeoutSeconds.max(1) as u64 * 1000;
-    let starter = MCPStarter::new(context.clone(), application.toolHandler.runtimeSupport());
+    let starter = MCPStarter::new(context.clone());
     let mut statuses = Vec::new();
-    let started = starter.startPluginWithTimeout(id, timeoutMs, |status| {
-        statuses.push(status);
-    });
+    let started = starter
+        .startPluginWithTimeout(id, timeoutMs, |status| {
+            statuses.push(status);
+        })
+        .await;
     let mut statusItems = Vec::new();
     for status in &statuses {
         print_start_status(status, output);
         statusItems.push(start_status_json(status));
     }
     if !started {
-        return Err(format!("MCP start failed: {id}"));
+        let errors = statuses
+            .iter()
+            .filter_map(|status| match status {
+                StartStatus::Error(message)
+                | StartStatus::TerminalServiceUnavailable(message)
+                | StartStatus::PnpmMissing(message) => Some(message.as_str()),
+                StartStatus::InProgress(_) | StartStatus::Success(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!("MCP start failed: {id}\n{errors}"));
     }
     mcp_local_server(&context).updateServerStatus(
         id.to_string(),
@@ -341,7 +353,7 @@ fn save_mcp_config(
 ) -> Result<(), String> {
     let id = required_arg(args, 1, "operit2 mcp config-set <id> <json-or-@file>")?;
     let configArg = required_arg(args, 2, "operit2 mcp config-set <id> <json-or-@file>")?;
-    let configJson = read_content_arg(configArg)?;
+    let configJson = read_content_arg(&context, configArg)?;
     let saved = mcp_local_server(&context).savePluginConfig(id, &configJson)?;
     if !saved {
         return Err(format!("MCP config did not contain server: {id}"));
@@ -397,8 +409,8 @@ fn install_mcp_from_github(
     let usage = "operit2 mcp install-github <id> <repo-url> <name> <description-or-@file> <author> <version> [config-or-@file]";
     let id = required_arg(args, 1, usage)?.to_string();
     let repoUrl = required_arg(args, 2, usage)?.to_string();
-    let metadata = metadata_from_install_args(args, usage)?;
-    let mcpConfig = optional_content_arg(args.get(7))?;
+    let metadata = metadata_from_install_args(&context, args, usage)?;
+    let mcpConfig = optional_content_arg(&context, args.get(7))?;
     match MCPRepository::getInstance(&context, application.toolHandler.runtimeSupport())
         .installMCPServerWithObject(
             id.clone(),
@@ -435,8 +447,8 @@ fn install_mcp_from_zip(
     let usage = "operit2 mcp install-zip <id> <zip-path> <name> <description-or-@file> <author> <version> [config-or-@file]";
     let id = required_arg(args, 1, usage)?.to_string();
     let zipPath = required_arg(args, 2, usage)?.to_string();
-    let metadata = metadata_from_install_args(args, usage)?;
-    let mcpConfig = optional_content_arg(args.get(7))?;
+    let metadata = metadata_from_install_args(&context, args, usage)?;
+    let mcpConfig = optional_content_arg(&context, args.get(7))?;
     match MCPRepository::getInstance(&context, application.toolHandler.runtimeSupport())
         .installMCPServerFromZip(
             id.clone(),
@@ -492,7 +504,7 @@ fn save_mcp_metadata(
     let id = required_arg(args, 1, usage)?;
     require_mcp_server(&context, id)?;
     let name = required_arg(args, 2, usage)?.to_string();
-    let description = read_content_arg(required_arg(args, 3, usage)?)?;
+    let description = read_content_arg(&context, required_arg(args, 3, usage)?)?;
     let author = required_arg(args, 4, usage)?.to_string();
     let version = required_arg(args, 5, usage)?.to_string();
     let metadata = PluginMetadata {
@@ -509,7 +521,7 @@ fn save_mcp_metadata(
 }
 
 /// Generates and saves an MCP description.
-fn generate_mcp_description(
+async fn generate_mcp_description(
     application: &OperitApplication,
     args: &[String],
     output: &mut CoreCommandOutput,
@@ -519,14 +531,11 @@ fn generate_mcp_description(
     let metadata = mcp_local_server(&context)
         .getPluginMetadata(id)
         .ok_or_else(|| format!("MCP metadata not found: {id}"))?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let toolSupport = application.toolHandler.runtimeSupport();
+    let description = MCPRepository::getInstance(&context, toolSupport)
+        .generatePluginDescription(id, &metadata.name)
+        .await
         .map_err(|error| error.to_string())?;
-    let description = runtime.block_on(
-        MCPRepository::getInstance(&context, application.toolHandler.runtimeSupport())
-            .generatePluginDescription(id, &metadata.name),
-    )?;
     mcp_local_server(&context).addOrUpdatePluginMetadata(
         id,
         PluginMetadata {
@@ -603,18 +612,22 @@ fn parse_key_value(value: &str) -> Result<(String, String), String> {
     Ok((key, value[separator + 1..].to_string()))
 }
 
-fn metadata_from_install_args(args: &[String], usage: &str) -> Result<PluginMetadata, String> {
+fn metadata_from_install_args(
+    context: &HostManager,
+    args: &[String],
+    usage: &str,
+) -> Result<PluginMetadata, String> {
     Ok(PluginMetadata {
         name: required_arg(args, 3, usage)?.to_string(),
-        description: read_content_arg(required_arg(args, 4, usage)?)?,
+        description: read_content_arg(&context, required_arg(args, 4, usage)?)?,
         author: required_arg(args, 5, usage)?.to_string(),
         version: required_arg(args, 6, usage)?.to_string(),
     })
 }
 
-fn optional_content_arg(value: Option<&String>) -> Result<String, String> {
+fn optional_content_arg(context: &HostManager, value: Option<&String>) -> Result<String, String> {
     value
-        .map(|item| read_content_arg(item))
+        .map(|item| read_content_arg(&context, item))
         .transpose()
         .map(|item| item.unwrap_or_default())
 }

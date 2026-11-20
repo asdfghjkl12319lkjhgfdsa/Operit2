@@ -1,6 +1,6 @@
 // Generated from operit-plugin-sdk Rust declarations.
 
-import type { AppListData, AppOperationData, AppUsageTimeResultData, BluetoothBleNotificationData, BluetoothBleServicesData, BluetoothBondedDevicesData, BluetoothReadData, BluetoothScanResultData, BluetoothSessionData, BluetoothStateData, BluetoothTransferData, DeviceInfoResultData, HiddenTerminalCommandResultData, LocationData, MusicPlaybackResultData, NotificationData, SleepResultData, SystemSettingData, TerminalCommandResultData, TerminalInfoResultData, TerminalSessionCloseResultData, TerminalSessionCreationResultData, TerminalSessionScreenResultData, TerminalStreamEventData } from "./results";
+import type { AppListData, AppOperationData, AppUsageTimeResultData, BluetoothBleNotificationData, BluetoothBleServicesData, BluetoothBondedDevicesData, BluetoothReadData, BluetoothScanResultData, BluetoothSessionData, BluetoothStateData, BluetoothTransferData, DeviceInfoResultData, HiddenTerminalCommandResultData, LocationData, MusicPlaybackResultData, NotificationData, SleepResultData, SystemSettingData, TerminalCommandResultData, TerminalImplementation, TerminalInfoResultData, TerminalSessionCloseResultData, TerminalSessionCreationResultData, TerminalSessionScreenResultData, TerminalStreamEventData, TerminalType } from "./results";
 
 /**
  * Provides device settings, application control, notifications, usage, and location services.
@@ -271,11 +271,11 @@ export namespace System {
     /**
      * Sets the maximum command execution time in milliseconds.
      */
-    timeout_ms?: TerminalHostExecStreamingOptionsTimeoutMs;
+    timeoutMs?: TerminalHostExecStreamingOptionsTimeoutMs;
     /**
      * Receives output events while the command is still running.
      */
-    on_intermediate_result?: (arg0: TerminalStreamEventData) => void;
+    onIntermediateResult?: (arg0: TerminalStreamEventData) => void;
   }
 
   /**
@@ -454,6 +454,11 @@ export namespace System {
    */
   function sendNotification(message: string, title?: string): Promise<string>;
   /**
+   * Write text to the system clipboard.
+   * @param text - The text to store
+   */
+  function setClipboardText(text: string): Promise<string>;
+  /**
    * Modify a system setting
    * @param setting - Setting name
    * @param value - New value
@@ -590,22 +595,33 @@ export namespace System {
      */
     function close(sessionId: string): Promise<TerminalSessionCloseResultData>;
     /**
+     * Atomically close an idle session only when it belongs to the supplied name.
+     * Hosts without atomic support reject this operation without closing the session.
+     */
+    function closeIfIdle(sessionId: string, sessionName: string): Promise<TerminalSessionCloseResultData>;
+    /**
      * Creates or returns an interactive terminal session with the supplied name.
      * @param sessionName Stable name used to identify the terminal session.
-     * @returns Promise resolving to the session creation result.
+     * @param type Exact interpreter type; omission requests the host's configured default terminal.
+     * @returns Promise resolving to the actual session creation result.
      */
-    function create(sessionName: string): Promise<TerminalSessionCreationResultData>;
+    function create(sessionName: string, type?: TerminalType): Promise<TerminalSessionCreationResultData>;
     /**
      * Execute a command in a terminal session.
      * @param sessionId The ID of the session.
      * @param command The command to execute.
-     * @param timeoutMs Optional timeout in milliseconds. Strongly recommended to always pass explicitly.
-     * @returns Promise resolving to the command execution result. On timeout, the current command is cancelled, the terminal session is kept, and the returned result has `timedOut === true`.
+     * @param timeoutMs Optional foreground wait in milliseconds, default 20000.
+     * @returns The execution receipt. Wait expiry keeps the command running and returns `timedOut === true`; use the returned sessionId with wait, screen, input or close.
      */
     function exec(sessionId: string, command: string, timeoutMs?: System.TerminalHostExecTimeoutMs): Promise<TerminalCommandResultData>;
     /**
+     * Runs one command as a single-consumer async iterable of live output and completion.
+     * Wait expiry or returning from the iterator detaches observation while the command continues.
+     */
+    function execStream(request: TerminalExecRequest): AsyncIterable<TerminalExecEvent>;
+    /**
      * Execute a command in a terminal session and receive incremental output chunks.
-     * Final resolution still returns the complete terminal command result.
+     * Resolution returns a completed receipt or a running receipt when the foreground wait expires.
      * @param sessionId The ID of the session.
      * @param command The command to execute.
      * @param options Streaming execution options.
@@ -636,11 +652,21 @@ export namespace System {
      */
     function input(sessionId: string, options?: System.TerminalHostInputOptions): Promise<string>;
     /**
+     * Runs a command under session ownership. Expired foreground waits retain the running command.
+     * A yielded session is reserved; the next run with this name acquires a new session generation.
+     */
+    function run(request: TerminalRunRequest): Promise<TerminalCommandResultData>;
+    /**
      * Get the current visible terminal screen content for a session (single screen only, no history).
      * @param sessionId The ID of the session.
      * @returns Promise resolving to the current screen snapshot result.
      */
     function screen(sessionId: string): Promise<TerminalSessionScreenResultData>;
+    /**
+     * Waits for the original managed command without writing anything to its terminal.
+     * Expired waits return timedOut=true while the command continues in its original session.
+     */
+    function wait(sessionId: string, waitMs: number): Promise<TerminalCommandResultData>;
   }
 
   /**
@@ -681,3 +707,33 @@ export namespace System {
   }
 
 }
+
+/**
+ * Starts one streamed command in an existing terminal session.
+ */
+export interface TerminalExecRequest {
+  sessionId: string;
+  command: string;
+  /**
+   * Limits foreground waiting in milliseconds; omission uses 20000 and expiry keeps the command running.
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * Runs a command in the newest available named session with an independent foreground wait.
+ */
+export interface TerminalRunRequest {
+  sessionName: string;
+  terminalType: TerminalType;
+  command: string;
+  /**
+   * Limits foreground waiting only; zero returns as soon as execution starts.
+   */
+  waitMs: number;
+}
+
+/**
+ * Carries live PTY output followed by the complete execution receipt.
+ */
+export type TerminalExecEvent = { type: "start"; sessionId: string; command: string; platform: string; terminal: TerminalImplementation; terminalType: TerminalType; } | { type: "chunk"; sessionId: string; command: string; platform: string; terminal: TerminalImplementation; terminalType: TerminalType; chunk: string; chunkIndex: number; receivedChars: number; } | { type: "completed"; result: TerminalCommandResultData; };

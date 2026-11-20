@@ -1,345 +1,31 @@
+#![cfg(test)]
 use super::*;
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
 
 use crate::db::AppDatabase::DATABASE_VERSION;
 use crate::sqliteParams;
 use crate::RuntimeStorageHost::{setDefaultRuntimeSqliteHost, setDefaultRuntimeStorageHost};
-use operit_host_api::{
-    HostError, HostResult, RuntimeSqliteConnection, RuntimeSqliteHost, RuntimeSqliteTransaction,
-    RuntimeStorageEntry, RuntimeStorageHost, SqliteRow as HostSqliteRow, SqliteValue,
-};
+
 use operit_util::RuntimeStorageLayout::WORKSPACE_DIR_PATH;
-use operit_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
-use rusqlite::types::Value as RusqliteValue;
 
-static HOSTS: OnceLock<()> = OnceLock::new();
-static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-static DATABASE_MUTEX: Mutex<()> = Mutex::new(());
+use operit_host_native_storage::NativeRuntimeStorageHost;
 
-#[derive(Clone, Debug)]
-struct TestRuntimeHost {
-    root: PathBuf,
-}
+pub(crate) static DATABASE_MUTEX: Mutex<()> = Mutex::new(());
 
-impl TestRuntimeHost {
-    fn new(root: PathBuf) -> Self {
-        Self { root }
-    }
-
-    fn resolve(&self, path: &str) -> HostResult<PathBuf> {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            return Err(HostError::new(format!(
-                "Runtime storage path must be relative: {}",
-                path.display()
-            )));
-        }
-        let mut resolved = self.root.clone();
-        for component in path.components() {
-            match component {
-                Component::Normal(segment) => resolved.push(segment),
-                Component::CurDir => {}
-                _ => {
-                    return Err(HostError::new(format!(
-                        "Invalid runtime storage path: {}",
-                        path.display()
-                    )))
-                }
-            }
-        }
-        Ok(resolved)
-    }
-}
-
-impl RuntimeStorageHost for TestRuntimeHost {
-    fn runtimeRootDir(&self) -> Option<PathBuf> {
-        Some(self.root.clone())
-    }
-
-    fn workspaceRootDir(&self) -> Option<PathBuf> {
-        Some(self.root.join(WORKSPACE_DIR_PATH))
-    }
-
-    fn readBytes(&self, path: &str) -> HostResult<Vec<u8>> {
-        Ok(fs::read(self.resolve(path)?)?)
-    }
-
-    /// Reads one bounded byte range from the filesystem-backed test host.
-    fn readBytesRange(&self, path: &str, offset: u64, length: usize) -> HostResult<Vec<u8>> {
-        let content = self.readBytes(path)?;
-        let start = usize::try_from(offset)
-            .map_err(|_| HostError::new("runtime storage offset does not fit usize"))?;
-        if start >= content.len() {
-            return Ok(Vec::new());
-        }
-        let end = start
-            .checked_add(length)
-            .ok_or_else(|| HostError::new("runtime storage byte range overflows usize"))?
-            .min(content.len());
-        Ok(content[start..end].to_vec())
-    }
-
-    fn writeBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
-        let path = self.resolve(path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, content)?;
-        Ok(())
-    }
-
-    /// Appends bytes to the SQL chat sync test runtime root.
-    fn appendBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
-        let path = self.resolve(path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        std::io::Write::write_all(&mut file, content)?;
-        Ok(())
-    }
-
-    fn delete(&self, path: &str, recursive: bool) -> HostResult<()> {
-        let path = self.resolve(path)?;
-        if !path.exists() {
-            return Ok(());
-        }
-        if path.is_dir() {
-            if recursive {
-                fs::remove_dir_all(path)?;
-            } else {
-                fs::remove_dir(path)?;
-            }
-        } else {
-            fs::remove_file(path)?;
-        }
-        Ok(())
-    }
-
-    fn exists(&self, path: &str) -> HostResult<bool> {
-        Ok(self.resolve(path)?.exists())
-    }
-
-    fn list(&self, prefix: &str) -> HostResult<Vec<RuntimeStorageEntry>> {
-        let directory = self.resolve(prefix)?;
-        let mut entries = Vec::new();
-        if !directory.exists() {
-            return Ok(entries);
-        }
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
-            let path = entry
-                .path()
-                .strip_prefix(&self.root)
-                .map_err(|error| HostError::new(error.to_string()))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            entries.push(RuntimeStorageEntry {
-                path,
-                isDirectory: metadata.is_dir(),
-                size: metadata.len() as i64,
-            });
-        }
-        Ok(entries)
-    }
-}
-
-impl RuntimeSqliteHost for TestRuntimeHost {
-    fn openSqliteDatabase(&self, path: &str) -> HostResult<Box<dyn RuntimeSqliteConnection>> {
-        let path = self.resolve(path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let connection =
-            rusqlite::Connection::open(path).map_err(|error| HostError::new(error.to_string()))?;
-        connection
-            .execute_batch(
-                r#"
-                    PRAGMA journal_mode = MEMORY;
-                    PRAGMA synchronous = OFF;
-                    PRAGMA temp_store = MEMORY;
-                    "#,
-            )
-            .map_err(|error| HostError::new(error.to_string()))?;
-        Ok(Box::new(TestRuntimeSqliteConnection { connection }))
-    }
-}
-
-struct TestRuntimeSqliteConnection {
-    connection: rusqlite::Connection,
-}
-
-impl RuntimeSqliteConnection for TestRuntimeSqliteConnection {
-    fn executeBatch(&mut self, sql: &str) -> HostResult<()> {
-        self.connection
-            .execute_batch(sql)
-            .map_err(|error| HostError::new(error.to_string()))
-    }
-
-    fn execute(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<usize> {
-        let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
-        self.connection
-            .execute(sql, rusqlite::params_from_iter(params))
-            .map_err(|error| HostError::new(error.to_string()))
-    }
-
-    fn query(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<Vec<HostSqliteRow>> {
-        queryRows(&self.connection, sql, params)
-    }
-
-    fn lastInsertRowId(&self) -> HostResult<i64> {
-        Ok(self.connection.last_insert_rowid())
-    }
-
-    fn beginTransaction(&mut self) -> HostResult<Box<dyn RuntimeSqliteTransaction + '_>> {
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(|error| HostError::new(error.to_string()))?;
-        Ok(Box::new(TestRuntimeSqliteTransaction { transaction }))
-    }
-}
-
-struct TestRuntimeSqliteTransaction<'a> {
-    transaction: rusqlite::Transaction<'a>,
-}
-
-impl RuntimeSqliteTransaction for TestRuntimeSqliteTransaction<'_> {
-    fn execute(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<usize> {
-        let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
-        self.transaction
-            .execute(sql, rusqlite::params_from_iter(params))
-            .map_err(|error| HostError::new(error.to_string()))
-    }
-
-    fn query(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<Vec<HostSqliteRow>> {
-        queryRows(&self.transaction, sql, params)
-    }
-
-    fn lastInsertRowId(&self) -> HostResult<i64> {
-        Ok(self.transaction.last_insert_rowid())
-    }
-
-    fn commit(self: Box<Self>) -> HostResult<()> {
-        self.transaction
-            .commit()
-            .map_err(|error| HostError::new(error.to_string()))
-    }
-}
-
-trait TestRusqliteConnection {
-    fn prepareStatement<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>>;
-}
-
-impl TestRusqliteConnection for rusqlite::Connection {
-    fn prepareStatement<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
-        self.prepare(sql)
-    }
-}
-
-impl TestRusqliteConnection for rusqlite::Transaction<'_> {
-    fn prepareStatement<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
-        self.prepare(sql)
-    }
-}
-
-fn queryRows(
-    connection: &impl TestRusqliteConnection,
-    sql: &str,
-    params: Vec<SqliteValue>,
-) -> HostResult<Vec<HostSqliteRow>> {
-    let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
-    let mut statement = connection
-        .prepareStatement(sql)
-        .map_err(|error| HostError::new(error.to_string()))?;
-    let columns = statement
-        .column_names()
-        .into_iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let mut rows = statement
-        .query(rusqlite::params_from_iter(params))
-        .map_err(|error| HostError::new(error.to_string()))?;
-    let mut out = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|error| HostError::new(error.to_string()))?
-    {
-        let mut values = Vec::new();
-        for index in 0..columns.len() {
-            let value = row
-                .get::<_, RusqliteValue>(index)
-                .map_err(|error| HostError::new(error.to_string()))?;
-            values.push(fromRusqliteValue(value));
-        }
-        out.push(HostSqliteRow {
-            columns: columns.clone(),
-            values,
-        });
-    }
-    Ok(out)
-}
-
-fn toRusqliteValue(value: SqliteValue) -> RusqliteValue {
-    match value {
-        SqliteValue::Null => RusqliteValue::Null,
-        SqliteValue::Integer(value) => RusqliteValue::Integer(value),
-        SqliteValue::Real(value) => RusqliteValue::Real(value),
-        SqliteValue::Text(value) => RusqliteValue::Text(value),
-        SqliteValue::Blob(value) => RusqliteValue::Blob(value),
-    }
-}
-
-fn fromRusqliteValue(value: RusqliteValue) -> SqliteValue {
-    match value {
-        RusqliteValue::Null => SqliteValue::Null,
-        RusqliteValue::Integer(value) => SqliteValue::Integer(value),
-        RusqliteValue::Real(value) => SqliteValue::Real(value),
-        RusqliteValue::Text(value) => SqliteValue::Text(value),
-        RusqliteValue::Blob(value) => SqliteValue::Blob(value),
-    }
-}
-
-fn installTestHosts() {
-    HOSTS.get_or_init(|| {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test clock must be after UNIX_EPOCH")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "operit2-sql-sync-tests-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).expect("test runtime host root must be created");
-        let host = Arc::new(TestRuntimeHost::new(root));
-        setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(
-            host.root.clone(),
-            host.root.join(WORKSPACE_DIR_PATH),
-        ));
-        setDefaultRuntimeStorageHost(host.clone());
-        setDefaultRuntimeSqliteHost(host);
-    });
-}
-
+/// Gives each replica its own Host roots while all production paths remain virtual.
 fn testPaths(name: &str) -> RuntimeStorePaths {
-    installTestHosts();
-    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    let runtimeDir = RuntimeStorePaths::default()
-        .runtime_dir()
-        .join(format!("sync-tests/{name}-{id}"));
-    RuntimeStorePaths::new(runtimeDir.clone(), runtimeDir.join(WORKSPACE_DIR_PATH))
+    let root = std::env::temp_dir().join(format!("operit2-sql-sync-{name}-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let host = Arc::new(NativeRuntimeStorageHost::new(root.join("runtime"), root.join(WORKSPACE_DIR_PATH)));
+    setDefaultRuntimeStorageHost(host.clone());
+    setDefaultRuntimeSqliteHost(host);
+    RuntimeStorePaths::default()
 }
 
-fn openTestStore(name: &str) -> (RuntimeStorePaths, Arc<AppDatabase>, SqlChatSyncStore) {
+/// Opens an isolated database through the shared runtime host test fixture.
+pub(crate) fn openTestStore(name: &str) -> (RuntimeStorePaths, Arc<AppDatabase>, SqlChatSyncStore) {
     AppDatabase::closeDatabase();
     let paths = testPaths(name);
     let database = AppDatabase::getDatabase(paths.clone()).unwrap();
@@ -359,6 +45,7 @@ fn message(chatId: &str, timestamp: i64, content: &str) -> MessageEntity {
         timestamp,
         orderIndex: 0,
         roleName: String::new(),
+        pluginExtensions: BTreeMap::new(),
         selectedVariantIndex: 0,
         provider: "test-provider".to_string(),
         modelName: "test-model".to_string(),
@@ -464,14 +151,155 @@ fn upsertOperation(sequence: i64, content: &str) -> SyncOperation {
         semantics: SyncOperationSemantics::EntityState,
         payload: serde_json::to_value(payload).unwrap(),
         createdAt: sequence,
-        schemaVersion: 6,
+        schemaVersion: CHAT_SYNC_OPERATION_SCHEMA_VERSION,
     }
+}
+
+/// A chat operation larger than the Link ceiling remains atomic and idempotent through blob transport.
+#[test]
+fn large_chat_operation_round_trips_without_advancing_receipts_on_missing_blobs() {
+    use crate::RuntimeFileSyncStore::RuntimeFileSyncStore;
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_, database, store) = openTestStore("large-chat-transport");
+    let host = crate::RuntimeStorageHost::defaultRuntimeStorageHost();
+    let source = RuntimeFileSyncStore::new(host.clone(), "runtime/sync/large-source");
+    let target = RuntimeFileSyncStore::new(host, "runtime/sync/large-target");
+    let content = "x".repeat(5 * 1024 * 1024);
+    let original = upsertOperation(1, &content);
+    let wire = source.prepareTransactionForTransport(original.clone()).unwrap();
+    assert!(serde_json::to_vec(&wire).unwrap().len() < 1024);
+    let before = store.receipt().unwrap();
+    assert!(target.hydrateTransaction(wire.clone()).is_err());
+    assert_eq!(store.receipt().unwrap(), before);
+    assert!(database.chatDao().getChatById("chat-remote").unwrap().is_none());
+    let reference = RuntimeFileSyncStore::requiredBlob(&wire).unwrap().unwrap();
+    target.writeBlob(&reference, &source.readBlob(&reference).unwrap()).unwrap();
+    let restored = target.hydrateTransaction(wire).unwrap();
+    assert_eq!(restored, original);
+    store.applyOperation(&restored).unwrap();
+    store.applyOperation(&restored).unwrap();
+    assert_eq!(database.messagePartDao().getPartsForMessage("chat-remote", 2_000, 0).unwrap()[0].content, content);
+    assert!(store.receipt().unwrap().containsSequence(&original.originDeviceId, original.sequence));
+    assert_eq!(sqlOperationCount(&database), 1);
+}
+
+/// Rejoining replicas converge on deletion despite old snapshots, in-flight replies and repeated delivery.
+#[test]
+fn chat_deletion_survives_rejoin_and_late_writes_on_three_replicas() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_aPaths, aDatabase, a) = openTestStore("delete-rejoin-a");
+    insertChatMessage(&aDatabase, "deleted-chat", 100, "original");
+    a.recordChatSnapshot("deleted-chat").unwrap();
+    let initial = a.operationsSince(&SyncClock::empty(), &[], 100).unwrap();
+    let (_bPaths, bDatabase, b) = openTestStore("delete-rejoin-b");
+    for operation in &initial { b.applyOperation(operation).unwrap(); }
+
+    // B keeps executing while A is disconnected and deletes its own copy.
+    assert!(a.deleteChat("deleted-chat").unwrap());
+    let count = sqlOperationCount(&aDatabase);
+    assert!(a.deleteChat("deleted-chat").unwrap());
+    assert_eq!(sqlOperationCount(&aDatabase), count, "retry must reuse the durable deletion fact");
+    let deletion = a.operationsSince(&SyncClock::empty(), &[], 100).unwrap().into_iter().find(|op| op.operation == "delete").unwrap();
+    insertChatMessage(&bDatabase, "deleted-chat", 200, "late remote reply");
+    b.recordMessageSnapshot("deleted-chat", 200).unwrap();
+    let late = b.operationsSince(&SyncClock::empty(), &[], 100).unwrap().into_iter().find(|op| op.originDeviceId == b.originDeviceId).unwrap();
+
+    let (cPaths, cDatabase, c) = openTestStore("delete-rejoin-c");
+    let mut branch = chat("independent-branch");
+    branch.parentChatId = Some("deleted-chat".into());
+    cDatabase.chatDao().insertChat(branch).unwrap();
+    for store in [&a, &b, &c] {
+        store.applyOperation(&deletion).unwrap();
+        store.applyOperation(&late).unwrap();
+        for operation in &initial { store.applyBootstrapOperation(operation).unwrap(); }
+        store.applyOperation(&late).unwrap();
+        store.applyOperation(&deletion).unwrap();
+        assert!(store.chatIsDeleted("deleted-chat").unwrap());
+        assert!(store.receipt().unwrap().containsSequence(&late.originDeviceId, late.sequence));
+    }
+    for database in [&aDatabase, &bDatabase, &cDatabase] {
+        assert!(database.chatDao().getChatById("deleted-chat").unwrap().is_none());
+        assert!(database.messageDao().getMessagesForChatAsc("deleted-chat", 80).unwrap().is_empty());
+        assert_eq!(database.store().queryScalar::<i64>("SELECT COUNT(*) FROM message_parts WHERE chatId='deleted-chat'", Vec::new()).unwrap(), 0);
+    }
+    assert!(cDatabase.chatDao().getChatById("independent-branch").unwrap().is_some());
+    let mut mixed = upsertOperation(500, "unrelated message");
+    let mut mixedPayload: ChatSyncPayload = serde_json::from_value(mixed.payload).unwrap();
+    mixedPayload.chatRows.push(chat("deleted-chat"));
+    mixedPayload.messageRows.push(message("deleted-chat", 300, "must stay deleted"));
+    mixedPayload.partRows.push(messagePart("deleted-chat", 300, "must stay deleted"));
+    mixed.payload = serde_json::to_value(mixedPayload).unwrap();
+    c.applyOperation(&mixed).unwrap();
+    assert!(cDatabase.chatDao().getChatById("deleted-chat").unwrap().is_none());
+    assert_eq!(cDatabase.messageDao().getMessagesForChatAsc("chat-remote", 80).unwrap().len(), 1);
+    assert!(c.receipt().unwrap().containsSequence(&mixed.originDeviceId, mixed.sequence));
+    let draft = chat("deleted-chat").toChatHistory(Vec::new());
+    assert!(c.commitChatDraft(&draft, None).is_err());
+    assert!(c.commitImportedChatRecords(chat("deleted-chat"), Vec::new(), Vec::new(), Vec::new()).is_err());
+    assert_eq!(c.operationsSince(&SyncClock::empty(), &[], 100).unwrap().into_iter().find(|op| op.opId == late.opId).unwrap(), late,
+        "ignored materializations must still relay their original operation");
+    AppDatabase::closeDatabase();
+    let reopened = AppDatabase::getDatabase(cPaths.clone()).unwrap();
+    let reopenedSync = SqlChatSyncStore::new(cPaths, &reopened).unwrap();
+    assert!(reopenedSync.chatIsDeleted("deleted-chat").unwrap());
+    reopenedSync.applyOperation(&late).unwrap();
+    assert!(reopened.chatDao().getChatById("deleted-chat").unwrap().is_none());
+}
+
+/// A failed journal insert rolls back the chat, its children and its deletion marker together.
+#[test]
+fn chat_deletion_is_atomic_and_respects_the_local_lock() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_, database, store) = openTestStore("delete-atomic");
+    insertChatMessage(&database, "atomic-chat", 100, "must survive rollback");
+    database.store().executeBatch("CREATE TRIGGER reject_chat_delete BEFORE INSERT ON sync_sql_operations WHEN NEW.operation='delete' BEGIN SELECT RAISE(ABORT,'injected journal failure'); END;").unwrap();
+    assert!(store.deleteChat("atomic-chat").is_err());
+    assert!(database.chatDao().getChatById("atomic-chat").unwrap().is_some());
+    assert_eq!(database.messageDao().getMessagesForChatAsc("atomic-chat", 80).unwrap().len(), 1);
+    assert!(!store.chatIsDeleted("atomic-chat").unwrap());
+    database.store().executeBatch("DROP TRIGGER reject_chat_delete; UPDATE chats SET locked=1 WHERE id='atomic-chat';").unwrap();
+    assert!(!store.deleteChat("atomic-chat").unwrap());
+    assert!(!store.chatIsDeleted("atomic-chat").unwrap());
+    database.store().executeBatch("UPDATE chats SET locked=0 WHERE id='atomic-chat';").unwrap();
+    assert!(store.deleteChat("atomic-chat").unwrap());
+    assert!(store.chatIsDeleted("atomic-chat").unwrap());
+}
+
+/// Same-ID content corrections cannot erase the terminal lifecycle of an already deleted chat.
+#[test]
+fn chat_deletion_cannot_be_retracted_by_an_operation_revision() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_, database, store) = openTestStore("delete-revision");
+    database.chatDao().insertChat(chat("deleted-chat")).unwrap();
+    assert!(store.deleteChat("deleted-chat").unwrap());
+    let mut revision = store.operationsSince(&SyncClock::empty(), &[], 100).unwrap().pop().unwrap();
+    revision.payload = serde_json::to_value(ChatSyncPayload { chatRows: vec![chat("deleted-chat")], ..Default::default() }).unwrap();
+    revision.createdAt += 100;
+    assert!(store.applyOperation(&revision).is_err());
+    assert!(store.chatIsDeleted("deleted-chat").unwrap());
+    assert!(database.chatDao().getChatById("deleted-chat").unwrap().is_none());
+}
+
+/// Invalid replacements roll back the prior operation and business state in the same transaction.
+#[test]
+fn same_id_chat_revision_failed_replacement_preserves_previous_state() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_paths, database, store) = openTestStore("same-id-invalid-revision");
+    let old = upsertOperation(1, "old");
+    store.applyOperation(&old).unwrap();
+    let mut invalid = upsertOperation(1, "invalid");
+    invalid.createdAt += 1;
+    invalid.payload["partRows"] = serde_json::json!([]);
+    assert!(store.applyOperation(&invalid).is_err());
+    assert_eq!(database.messagePartDao().getPartsForMessage("chat-remote", 2_000, 0).unwrap()[0].content, "old");
+    assert_eq!(store.operationsSince(&SyncClock::empty(), &[CHAT_SYNC_DOMAIN.into()], 10).unwrap(), vec![old]);
+    AppDatabase::closeDatabase();
 }
 
 /// Verifies that applying a remote chat operation updates observers of the chats table.
 #[test]
 fn remote_chat_operation_invalidates_chat_history_flow() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_sourcePaths, sourceDatabase, sourceSyncStore) = openTestStore("history-flow-source");
     sourceDatabase
         .chatDao()
@@ -519,7 +347,7 @@ fn remote_chat_operation_invalidates_chat_history_flow() {
 /// Verifies assistant completion, chat metadata, and sync rows commit as one generation.
 #[test]
 fn assistant_segment_commit_is_atomic_and_synchronizable() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_sourcePaths, sourceDatabase, sourceSyncStore) = openTestStore("assistant-commit-source");
     let chatId = "chat-assistant-commit";
     let timestamp = 7_000;
@@ -540,11 +368,26 @@ fn assistant_segment_commit_is_atomic_and_synchronizable() {
     completedMessage.completedExecutionGeneration = 1;
     completedMessage.inputTokens = 11;
     completedMessage.outputTokens = 13;
+    // Caller snapshots cannot supply authoritative totals; the transaction owns accounting.
+    let mut staleChat = completedChat.clone();
+    staleChat.inputTokens = 999;
+    staleChat.outputTokens = 888;
+    staleChat.currentWindowSize = 123;
     let committedClock = sourceSyncStore
         .commitAssistantMessageSegment(
-            completedChat.clone(),
+            staleChat.clone(),
             completedMessage.clone(),
             vec![messagePart(chatId, timestamp, "complete")],
+            Some(4_096),
+        )
+        .unwrap();
+    // Replaying a segment also preserves the latest persisted context window.
+    sourceSyncStore
+        .commitAssistantMessageSegment(
+            staleChat,
+            completedMessage.clone(),
+            vec![messagePart(chatId, timestamp, "complete")],
+            None,
         )
         .unwrap();
     assert!(committedClock.sequenceFor(&sourceSyncStore.originDeviceId) > 0);
@@ -608,12 +451,14 @@ fn assistant_segment_commit_is_atomic_and_synchronizable() {
             .currentWindowSize,
         4_096
     );
+    let synchronizedChat = targetDatabase.chatDao().getChatById(chatId).unwrap().unwrap();
+    assert_eq!((synchronizedChat.inputTokens, synchronizedChat.outputTokens), (11, 13));
     AppDatabase::closeDatabase();
 }
 
 #[test]
 fn chat_dao_update_chats_preserves_child_messages() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_paths, database, _syncStore) = openTestStore("chat-dao-update");
     let chatId = "chat-update";
     insertChatMessage(&database, chatId, 9_000, "kept");
@@ -624,7 +469,7 @@ fn chat_dao_update_chats_preserves_child_messages() {
         .unwrap()
         .expect("chat must exist");
     chat.displayOrder = 42;
-    chat.group = Some("updated-group".to_string());
+    chat.workspaceId = Some("updated-workspace".to_string());
     chat.updatedAt = 9_100;
     database.chatDao().updateChats(vec![chat]).unwrap();
 
@@ -634,8 +479,8 @@ fn chat_dao_update_chats_preserves_child_messages() {
         .unwrap()
         .expect("chat must remain");
     assert_eq!(updated.displayOrder, 42);
-    assert_eq!(updated.group.as_deref(), Some("updated-group"));
-    let messages = database.messageDao().getMessagesForChat(chatId).unwrap();
+    assert_eq!(updated.workspaceId.as_deref(), Some("updated-workspace"));
+    let messages = database.messageDao().getMessagesForChatAsc(chatId, 80).unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(
         database
@@ -651,7 +496,7 @@ fn chat_dao_update_chats_preserves_child_messages() {
 /// Verifies the logical message identity replaces repeated writes instead of duplicating rows.
 #[test]
 fn repeated_message_entity_insert_replaces_the_existing_row() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_paths, database, _syncStore) = openTestStore("message-entity-identity");
     let chatId = "chat-message-entity-identity";
     let timestamp = 9_200;
@@ -665,7 +510,7 @@ fn repeated_message_entity_insert_replaces_the_existing_row() {
     second.outputTokens = 2;
     database.messageDao().insertMessage(second).unwrap();
 
-    let messages = database.messageDao().getMessagesForChat(chatId).unwrap();
+    let messages = database.messageDao().getMessagesForChatAsc(chatId, 80).unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].outputTokens, 2);
     AppDatabase::closeDatabase();
@@ -673,7 +518,7 @@ fn repeated_message_entity_insert_replaces_the_existing_row() {
 
 #[test]
 fn message_dao_locator_previews_match_kotlin_projection() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_paths, database, _syncStore) = openTestStore("message-dao-locator");
     let chatId = "chat-locator";
     insertChatMessage(&database, chatId, 10_000, "alpha content");
@@ -681,7 +526,7 @@ fn message_dao_locator_previews_match_kotlin_projection() {
 
     let previews = database
         .messageDao()
-        .getLocatorPreviewsForChat(chatId, 80)
+        .getMessageLocatorIndex(chatId, "", 80)
         .unwrap();
     assert_eq!(previews.len(), 2);
     assert_eq!(previews[0].messageIndex, Some(0));
@@ -689,7 +534,7 @@ fn message_dao_locator_previews_match_kotlin_projection() {
 
     let searchPreviews = database
         .messageDao()
-        .searchLocatorPreviewsForChat(chatId, "searchable", 80)
+        .getMessageLocatorIndex(chatId, "searchable", 80)
         .unwrap();
     assert_eq!(searchPreviews.len(), 1);
     assert_eq!(searchPreviews[0].messageIndex, Some(1));
@@ -700,7 +545,7 @@ fn message_dao_locator_previews_match_kotlin_projection() {
 /// Verifies version-22 migration creates canonical structured message parts.
 #[test]
 fn migrates_version_22_messages_to_final_structured_parts() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     AppDatabase::closeDatabase();
     let paths = testPaths("structured-message-migration");
     {
@@ -816,6 +661,9 @@ fn migrates_version_22_messages_to_final_structured_parts() {
                 "#,
             )
             .unwrap();
+        store
+            .executeBatch(include_str!("fixtures/historical-migration-support.sql"))
+            .unwrap();
         store.setUserVersion(22).unwrap();
     }
 
@@ -853,7 +701,7 @@ fn migrates_version_22_messages_to_final_structured_parts() {
 /// Verifies version-24 migration restores parts required by locator previews and hydration.
 #[test]
 fn migrates_version_23_message_revisions_to_canonical_visible_parts() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     AppDatabase::closeDatabase();
     let paths = testPaths("canonical-visible-parts-migration");
     let chatId = "chat-23";
@@ -962,6 +810,12 @@ fn migrates_version_23_message_revisions_to_canonical_visible_parts() {
                 "#,
             )
             .unwrap();
+        store
+            .executeBatch(include_str!("fixtures/historical-migration-support.sql"))
+            .unwrap();
+        store
+            .executeBatch(include_str!("fixtures/version23-sync-variant-rows.sql"))
+            .unwrap();
         store.setUserVersion(23).unwrap();
     }
 
@@ -980,7 +834,7 @@ fn migrates_version_23_message_revisions_to_canonical_visible_parts() {
     );
     let previews = database
         .messageDao()
-        .getLocatorPreviewsForChat(chatId, 48)
+        .getMessageLocatorIndex(chatId, "", 48)
         .unwrap();
     assert_eq!(previews[0].previewContent, "");
     assert_eq!(previews[0].contentLength, 0);
@@ -990,25 +844,23 @@ fn migrates_version_23_message_revisions_to_canonical_visible_parts() {
 /// Verifies version-25 migration deterministically renames execution generation columns.
 #[test]
 fn migrates_version_25_execution_generation_columns() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     AppDatabase::closeDatabase();
     let paths = testPaths("execution-generation-migration");
     {
         let store = SqliteStore::open(paths.sqlite_database_path()).unwrap();
         store
+            .executeBatch(include_str!("../../db/fixtures/version27-chat-records.sql"))
+            .unwrap();
+        store
             .executeBatch(
                 r#"
-                CREATE TABLE messages (
-                    messageId INTEGER PRIMARY KEY NOT NULL,
-                    completedRouteGeneration INTEGER NOT NULL
-                );
-                CREATE TABLE sync_sql_message_rows (
-                    opId TEXT PRIMARY KEY NOT NULL,
-                    completedRouteGeneration INTEGER NOT NULL
-                );
-                INSERT INTO messages (messageId, completedRouteGeneration) VALUES (1, 7);
-                INSERT INTO sync_sql_message_rows (opId, completedRouteGeneration)
-                VALUES ('operation-25', 9);
+                ALTER TABLE messages RENAME COLUMN completedExecutionGeneration TO completedRouteGeneration;
+                ALTER TABLE sync_sql_message_rows RENAME COLUMN completedExecutionGeneration TO completedRouteGeneration;
+                UPDATE messages SET completedRouteGeneration = 7 WHERE messageId = 1;
+                UPDATE sync_sql_message_rows SET completedRouteGeneration = 9 WHERE opId = 'v27:1';
+                DROP TABLE token_usage_records;
+                DROP TABLE token_stats_models;
                 "#,
             )
             .unwrap();
@@ -1032,7 +884,7 @@ fn migrates_version_25_execution_generation_columns() {
         database
             .store()
             .queryScalar::<i64>(
-                "SELECT completedExecutionGeneration FROM sync_sql_message_rows WHERE opId = 'operation-25'",
+                "SELECT completedExecutionGeneration FROM sync_sql_message_rows WHERE opId = 'v27:1'",
                 sqliteParams![],
             )
             .unwrap(),
@@ -1043,7 +895,7 @@ fn migrates_version_25_execution_generation_columns() {
 
 #[test]
 fn record_message_snapshots_are_merged_into_final_stream_state() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_paths, database, syncStore) = openTestStore("stream-merge");
     let chatId = "chat-stream";
     let timestamp = 10_000;
@@ -1060,7 +912,10 @@ fn record_message_snapshots_are_merged_into_final_stream_state() {
         .unwrap();
     assert_eq!(operations.len(), 1);
     assert_eq!(operations[0].sequence, 100);
-    assert_eq!(operations[0].schemaVersion, 5);
+    assert_eq!(
+        operations[0].schemaVersion,
+        CHAT_SYNC_OPERATION_SCHEMA_VERSION
+    );
     let payload = exportedPayload(&operations[0]);
     assert_eq!(payload.messageRows.len(), 1);
     assert_eq!(payload.partRows[0].content, "token-100");
@@ -1069,7 +924,7 @@ fn record_message_snapshots_are_merged_into_final_stream_state() {
 
 #[test]
 fn compacted_stream_snapshot_applies_to_new_receiver() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_sourcePaths, sourceDatabase, sourceSyncStore) = openTestStore("source-stream");
     let chatId = "chat-apply";
     let timestamp = 11_000;
@@ -1116,7 +971,7 @@ fn compacted_stream_snapshot_applies_to_new_receiver() {
 
 #[test]
 fn older_merged_upsert_does_not_revert_newer_state() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_paths, database, syncStore) = openTestStore("older-upsert");
     let newer = upsertOperation(2, "new");
     let older = upsertOperation(1, "old");
@@ -1143,7 +998,7 @@ fn older_merged_upsert_does_not_revert_newer_state() {
 
 #[test]
 fn delete_transaction_survives_compaction_and_applies() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_sourcePaths, sourceDatabase, sourceSyncStore) = openTestStore("source-delete");
     let chatId = "chat-delete";
     let timestamp = 12_000;
@@ -1190,7 +1045,7 @@ fn delete_transaction_survives_compaction_and_applies() {
 
 #[test]
 fn stress_stream_snapshots_export_single_final_operation() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_paths, database, syncStore) = openTestStore("stress-stream");
     let chatId = "chat-stress";
     let timestamp = 13_000;
@@ -1218,7 +1073,7 @@ fn stress_stream_snapshots_export_single_final_operation() {
 
 #[test]
 fn stress_many_messages_roundtrip_with_stream_compaction() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_sourcePaths, sourceDatabase, sourceSyncStore) = openTestStore("stress-roundtrip-source");
     let chatId = "chat-stress-roundtrip";
     let messageCount = 60;
@@ -1301,7 +1156,7 @@ fn stress_many_messages_roundtrip_with_stream_compaction() {
 #[test]
 #[ignore]
 fn stress_ultra_many_messages_roundtrip_with_stream_compaction() {
-    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
     let (_sourcePaths, sourceDatabase, sourceSyncStore) = openTestStore("stress-ultra-source");
     let chatId = "chat-stress-ultra";
     let messageCount = 600;
@@ -1388,5 +1243,383 @@ fn stress_ultra_many_messages_roundtrip_with_stream_compaction() {
             .sequenceFor(&operations[0].originDeviceId),
         (messageCount * updateRounds) as i64
     );
+    AppDatabase::closeDatabase();
+}
+
+/// Applies an earlier independent SQL entity after a later sequence and exports the exact missing gap.
+#[test]
+fn sparse_sql_receipts_do_not_hide_earlier_independent_entities() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_paths, database, syncStore) = openTestStore("sparse-sql-receipts");
+    let earlier = upsertOperation(1, "earlier");
+    let mut later = upsertOperation(2, "later");
+    let mut payload: ChatSyncPayload = serde_json::from_value(later.payload.clone()).unwrap();
+    payload.messageRows[0].timestamp = 2001;
+    payload.partRows[0].messageTimestamp = 2001;
+    later.entityId = "chat-remote:2001".into();
+    later.payload = serde_json::to_value(payload).unwrap();
+    syncStore.applyOperation(&later).unwrap();
+    syncStore.applyOperation(&earlier).unwrap();
+    assert!(
+        database
+            .messageDao()
+            .getMessageByTimestamp("chat-remote", 2000)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        database
+            .messageDao()
+            .getMessageByTimestamp("chat-remote", 2001)
+            .unwrap()
+            .is_some()
+    );
+    let mut receipt = SyncReceipt::default();
+    receipt.observe("remote-sql", 2);
+    let exported = syncStore
+        .operationsSince(&receipt, &[CHAT_SYNC_DOMAIN.into()], 1)
+        .unwrap();
+    assert_eq!(exported.len(), 1);
+    assert_eq!(exported[0].opId, earlier.opId);
+    assert_eq!(
+        syncStore.receipt().unwrap().ranges["remote-sql"],
+        vec![[1, 2]]
+    );
+    AppDatabase::closeDatabase();
+}
+
+/// Existing databases gain the export index, and page selection avoids scanning later independent entities.
+#[test]
+fn large_sql_export_uses_bounded_entity_lookups_after_reopen() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (paths, database, store) = openTestStore("export-index");
+    database.store().executeBatch("DROP INDEX sync_sql_operations_entity_state").unwrap();
+    drop(store);
+    let _reopened = SqlChatSyncStore::new(paths, &database).unwrap();
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for row in database.store().queryRows("SELECT sql FROM sqlite_master WHERE tbl_name='sync_sql_operations' AND sql IS NOT NULL ORDER BY type DESC",vec![]).unwrap() {
+        connection.execute_batch(&row.get::<_,String>(0).unwrap()).unwrap();
+    }
+    connection.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<30000)
+        INSERT INTO sync_sql_operations SELECT 'phone:'||i,'phone',i,'chat','message','chat:'||i,'upsert','entity_state',i,8 FROM n;
+        INSERT INTO sync_sql_operations VALUES('phone:30001','phone',30001,'chat','message','chat:1','upsert','entity_state',30001,8);").unwrap();
+    let mut statement = connection.prepare(EXPORT_OPERATIONS_SQL).unwrap();
+    let sequences = statement.query_map(rusqlite::params!["chat","phone",1,256], |row| row.get::<_,i64>(2))
+        .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+    assert_eq!(sequences,(2..=257).collect::<Vec<_>>());
+    assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 20000, "export scanned unrelated later entities");
+    AppDatabase::closeDatabase();
+}
+
+/// Keeps accepted sequence membership after SQL deliberately compacts an older entity snapshot.
+#[test]
+fn native_sql_compaction_does_not_erase_durable_receipts() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_paths, database, syncStore) = openTestStore("compacted-sql-receipts");
+    let earlier = upsertOperation(1, "earlier");
+    let later = upsertOperation(2, "later");
+    let operations = vec![earlier, later];
+    syncStore
+        .syncOperationStore
+        .receiveOperations(&operations)
+        .unwrap();
+    for operation in &operations {
+        syncStore.applyOperation(operation).unwrap();
+        syncStore
+            .syncOperationStore
+            .completeOperations(std::slice::from_ref(operation))
+            .unwrap();
+    }
+    assert_eq!(sqlOperationCount(&database), 1);
+    assert_eq!(
+        syncStore.receipt().unwrap().ranges["remote-sql"],
+        vec![[1, 2]]
+    );
+    assert_eq!(
+        syncStore.syncOperationStore.receipt().unwrap().ranges["remote-sql"],
+        vec![[1, 2]]
+    );
+    assert!(
+        syncStore
+            .syncOperationStore
+            .pendingOperations()
+            .unwrap()
+            .is_empty()
+    );
+    AppDatabase::closeDatabase();
+}
+
+/// A business update gets a new identity; an archived original remains immutable.
+#[test]
+fn later_chat_write_has_a_new_identity_and_collision_keeps_business_state() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_paths, database, store) = openTestStore("immutable-chat-history");
+    let original = upsertOperation(1, "old");
+    let latest = upsertOperation(2, "latest");
+    store.applyOperation(&original).unwrap();
+    store.applyOperation(&latest).unwrap();
+    let mut collision = original.clone();
+    collision.createdAt += 100;
+    collision.payload["partRows"][0]["content"] = serde_json::json!("overwritten original");
+    assert!(store.applyOperation(&collision).is_err());
+    store.applyOperation(&original).unwrap();
+    assert_eq!(database.messagePartDao().getPartsForMessage("chat-remote", 2_000, 0).unwrap()[0].content, "latest");
+    assert_eq!(sqlOperationCount(&database), 1);
+    assert_eq!(store.operationsSince(&SyncClock::empty(), &[CHAT_SYNC_DOMAIN.into()], 10).unwrap(), vec![latest]);
+    AppDatabase::closeDatabase();
+}
+
+/// SQL correction must preserve scoped business priority while accepting an older independent message.
+#[test]
+fn chat_correction_keeps_scoped_versions_after_restart() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_source_paths, source_database, source) = openTestStore("correction-source");
+    let mut newest = upsertOperation(1, "newest");
+    newest.createdAt = 50;
+    source.applyOperation(&newest).unwrap();
+    let authoritative = source.syncSnapshot().unwrap();
+    assert_eq!(source.syncCoverage().unwrap(), authoritative.covered);
+    drop(source);drop(source_database);AppDatabase::closeDatabase();
+
+    let (target_paths, database, target) = openTestStore("correction-target");
+    let captured = target.syncSnapshot().unwrap();
+    assert!(target.repairSyncedSnapshot(&captured.token().unwrap(), &authoritative).unwrap());
+    assert_eq!(target.syncSnapshot().unwrap().data, authoritative.data);
+    drop(target);drop(database);AppDatabase::closeDatabase();
+    let database = AppDatabase::getDatabase(target_paths.clone()).unwrap();
+    let target = SqlChatSyncStore::new(target_paths, &database).unwrap();
+    assert_eq!(target.syncCoverage().unwrap(), target.syncSnapshot().unwrap().covered);
+    let mut older_x = upsertOperation(1, "stale");
+    older_x.originDeviceId = "delayed-device".into();
+    older_x.opId = "delayed-device:1".into();
+    older_x.createdAt = 40;
+    target.applyOperation(&older_x).unwrap();
+    let mut older_y = upsertOperation(2, "independent");
+    older_y.originDeviceId = "delayed-device".into();
+    older_y.opId = "delayed-device:2".into();
+    older_y.createdAt = 40;
+    older_y.entityId = "chat-remote:3000".into();
+    older_y.payload = serde_json::to_value(ChatSyncPayload {
+        chatRows: vec![chat("chat-remote")],
+        messageRows: vec![message("chat-remote",3_000,"independent")],
+        partRows: vec![messagePart("chat-remote",3_000,"independent")],
+        ..Default::default()
+    }).unwrap();
+    target.applyOperation(&older_y).unwrap();
+    target.applyOperation(&older_y).unwrap();
+    assert_eq!(database.messagePartDao().getPartsForMessage("chat-remote",2_000,0).unwrap()[0].content,"newest");
+    assert_eq!(database.messagePartDao().getPartsForMessage("chat-remote",3_000,0).unwrap()[0].content,"independent");
+    AppDatabase::closeDatabase();
+}
+
+#[test]
+fn same_author_chat_changes_follow_sequence_when_its_clock_moves_backwards() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    for reverse in [false,true] {
+        let (_paths,database,store) = openTestStore("chat-clock-rollback");
+        let mut first = upsertOperation(1,"first"); first.createdAt = 50;
+        let mut second = upsertOperation(2,"second"); second.createdAt = 10;
+        let operations = if reverse { vec![second,first] } else { vec![first,second] };
+        for operation in operations { store.applyOperation(&operation).unwrap(); }
+        assert_eq!(database.messagePartDao().getPartsForMessage("chat-remote",2_000,0).unwrap()[0].content,"second");
+        AppDatabase::closeDatabase();
+    }
+}
+
+/// Stream upserts consume different local auto-increment IDs, but must never require a full snapshot.
+#[test]
+fn incremental_messages_with_different_local_ids_have_equal_content_digests() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (_, source_database, source) = openTestStore("digest-source");
+    let chat_id = "digest-chat";
+    insertChatMessage(&source_database, chat_id, 1000, "first");
+    let mut delivery = Vec::new();
+    for index in 0..4 {
+        updateMessagePart(&source_database, chat_id, 1000, format!("chunk-{index}"));
+        source.recordMessageSnapshot(chat_id, 1000).unwrap();
+        delivery.extend(source.operationsSince(&SyncClock::empty(), &[], 100).unwrap());
+    }
+    insertChatMessage(&source_database, chat_id, 2000, "second");
+    source.recordMessageSnapshot(chat_id, 2000).unwrap();
+    delivery.extend(source.operationsSince(&SyncClock::empty(), &[], 100).unwrap());
+    let source_snapshot = source.syncSnapshot().unwrap();
+    let (_, target_database, target) = openTestStore("digest-target");
+    for operation in &delivery { target.applyOperation(operation).unwrap(); }
+    let target_snapshot = target.syncSnapshot().unwrap();
+    let source_id = source_database.messageDao().getMessageByTimestamp(chat_id, 2000)
+        .unwrap().unwrap().messageId;
+    let target_id = target_database.messageDao().getMessageByTimestamp(chat_id, 2000)
+        .unwrap().unwrap().messageId;
+    assert_ne!(source_id, target_id, "fixture must expose independently allocated row IDs");
+    assert_eq!(source_snapshot.data.revision, target_snapshot.data.revision);
+    assert_ne!(source_snapshot.content_digest().unwrap(), target_snapshot.content_digest().unwrap());
+
+    let source_digest = SqlChatSyncStore::snapshotContentSummary(&source_snapshot).unwrap();
+    let target_digest = SqlChatSyncStore::snapshotContentSummary(&target_snapshot).unwrap();
+    let source_manifest = source_snapshot.manifest_with_content(source_digest).unwrap();
+    let target_manifest = target_snapshot.manifest_with_content(target_digest).unwrap();
+    assert_eq!(source_manifest.digest, target_manifest.digest);
+    assert_eq!(source_manifest.contentBytes, target_manifest.contentBytes, "local row IDs must not affect authority size");
+    assert_eq!(
+        crate::Transaction::compare_manifests(&source_manifest, &target_manifest).unwrap(),
+        crate::Transaction::Source::Equal,
+    );
+    assert_eq!(source_manifest.token, source_snapshot.token().unwrap(), "CAS must still cover physical row IDs");
+    let mut changed = target_snapshot.clone();
+    changed.data=serde_json::from_slice(&serde_json::to_vec(&changed.data).unwrap()).unwrap();
+    let parts = changed.data.values.get_mut("message_parts").unwrap();
+    let content = parts["columns"].as_array().unwrap().iter().position(|name| name == "content").unwrap();
+    parts["rows"][0][content] = serde_json::json!({"Text":"different business content"});
+    assert_ne!(SqlChatSyncStore::snapshotContentSummary(&source_snapshot).unwrap(),
+        SqlChatSyncStore::snapshotContentSummary(&changed).unwrap());
+    AppDatabase::closeDatabase();
+}
+
+#[test]
+fn correction_replaces_chat_payloads_with_an_exportable_initializer_and_replays_offline_writes() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|e|e.into_inner());
+    let (_,a_db,a) = openTestStore("compact-init-a");
+    let first = upsertOperation(1,"A"); let latest = upsertOperation(2,"AB");
+    a.applyOperation(&first).unwrap(); a.applyOperation(&latest).unwrap();
+    assert_eq!(sqlOperationCount(&a_db),1);
+    let (_,b_db,b) = openTestStore("compact-init-b");
+    b.applyOperation(&latest).unwrap();
+    let (_,offline_db,offline) = openTestStore("compact-init-offline");
+    offline.applyOperation(&latest).unwrap();
+    let mut pending = upsertOperation(1,"offline");
+    pending.originDeviceId = "offline-author".into(); pending.opId = "offline-author:1".into(); pending.createdAt = 30;
+    pending.entityId = "chat-remote:3000".into();
+    pending.payload = serde_json::to_value(ChatSyncPayload { chatRows:vec![chat("chat-remote")],
+        messageRows:vec![message("chat-remote",3000,"offline")],partRows:vec![messagePart("chat-remote",3000,"offline")],..Default::default() }).unwrap();
+    offline.applyOperation(&pending).unwrap();
+    let a_snapshot = a.syncSnapshot().unwrap(); let b_snapshot = b.syncSnapshot().unwrap();
+    let mut authority = a_snapshot.clone(); authority.covered.extend(b_snapshot.covered.iter().cloned());
+    for (store,db,capture) in [(&a,&a_db,&a_snapshot),(&b,&b_db,&b_snapshot)] {
+        assert!(store.repairSyncedSnapshot(&capture.token().unwrap(),&authority).unwrap());
+        assert_eq!(sqlOperationCount(db),0);
+        assert!(store.receipt().unwrap().containsSequence("remote-sql",1));
+    }
+    let initializers = a.operationsSince(&SyncClock::empty(),&[],100).unwrap();
+    assert_eq!(initializers.len(),1);
+    assert_eq!(initializers,b.operationsSince(&SyncClock::empty(),&[],100).unwrap());
+    offline.applyOperation(&initializers[0]).unwrap();
+    assert_eq!(offline_db.messagePartDao().getPartsForMessage("chat-remote",2000,0).unwrap()[0].content,"AB");
+    assert_eq!(offline_db.messagePartDao().getPartsForMessage("chat-remote",3000,0).unwrap()[0].content,"offline");
+    assert_eq!(sqlOperationCount(&offline_db),1);
+    let (_,empty_db,empty) = openTestStore("compact-init-empty");
+    empty.applyOperation(&initializers[0]).unwrap();
+    assert_eq!(empty.syncSnapshot().unwrap().data,authority.data);
+    assert_eq!(sqlOperationCount(&empty_db),0);
+    let receipt = a.receipt().unwrap();
+    assert!(a.operationsSince(&receipt,&[],100).unwrap().is_empty());
+    let mut collision = first.clone(); collision.createdAt += 99;
+    assert!(a.applyOperation(&collision).is_err());
+    a.applyOperation(&first).unwrap(); assert_eq!(sqlOperationCount(&a_db),0);
+    AppDatabase::closeDatabase();
+}
+
+/// A restore supersedes larger and newer peers, rejects old lineage, and resumes ordinary edits.
+#[test]
+fn restored_database_baseline_overrides_peers_and_rejects_old_history() {
+    use crate::Transaction::{compare_manifests, Source};
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, restored_db, restored) = openTestStore("restore-authority");
+    let mut original = upsertOperation(1, "restored");
+    original.createdAt = i64::MAX - 10;
+    restored.applyOperation(&original).unwrap();
+    let old_snapshot = restored.syncSnapshot().unwrap();
+    restored.establishRestoreBaseline(None).unwrap();
+    assert_eq!(restored_db.store().queryScalar::<i64>("SELECT count(*) FROM _operit_transaction_initialization", vec![]).unwrap(), 0);
+    let baseline = restored.syncSnapshot().unwrap();
+    let initializers = restored.operationsSince(&SyncClock::empty(), &[], 100).unwrap();
+    assert_eq!(initializers.len(), 1);
+    assert_eq!(initializers[0].operation, "initialize");
+    assert_eq!(sqlOperationCount(&restored_db), 0);
+
+    let (_, peer_db, peer) = openTestStore("restore-peer");
+    peer.applyOperation(&original).unwrap();
+    let mut future = upsertOperation(2, "much larger remote history that must be replaced");
+    future.createdAt = i64::MAX - 1;
+    peer.applyOperation(&future).unwrap();
+    insertChatMessage(&peer_db, "remote-only", 3000, "must not survive restore");
+    peer.recordChatSnapshot("remote-only").unwrap();
+    let larger = peer.syncSnapshot().unwrap();
+    let a = baseline.manifest().unwrap();
+    let b = larger.manifest().unwrap();
+    assert!(a.contentBytes < b.contentBytes);
+    assert_eq!(compare_manifests(&a, &b).unwrap(), Source::Local);
+    assert_eq!(compare_manifests(&b, &a).unwrap(), Source::Remote);
+    let required = restored.operationsSince(&peer.receipt().unwrap(), &[], 100).unwrap();
+    assert_eq!(required, initializers);
+
+    peer.applyOperation(&initializers[0]).unwrap();
+    assert_eq!(peer.syncSnapshot().unwrap().data, baseline.data);
+    assert!(peer_db.chatDao().getChatById("remote-only").unwrap().is_none());
+    peer.applyOperation(&future).unwrap();
+    restored.applyOperation(&future).unwrap();
+    let stale_initializer = crate::Transaction::compaction::Initialization::from_snapshot(old_snapshot).operation(CHAT_SYNC_DOMAIN, false).unwrap();
+    peer.applyOperation(&stale_initializer).unwrap();
+    assert_eq!(peer.syncSnapshot().unwrap().data, baseline.data);
+    assert_eq!(restored.syncSnapshot().unwrap().data, baseline.data);
+
+    let receipt = restored.receipt().unwrap();
+    insertChatMessage(&peer_db, "chat-remote", 4000, "edit after receiving restored baseline");
+    peer.recordMessageSnapshot("chat-remote", 4000).unwrap();
+    let edits = peer.operationsSince(&receipt, &[], 100).unwrap();
+    assert!(edits.iter().any(|operation| operationRestoration(&operation.originDeviceId).unwrap() == baseline.data.restoration));
+    restored.applyOperations(&edits).unwrap();
+    assert_eq!(restored_db.messagePartDao().getPartsForMessage("chat-remote", 4000, 0).unwrap()[0].content, "edit after receiving restored baseline");
+    assert_eq!(SqlChatSyncStore::snapshotContentSummary(&restored.syncSnapshot().unwrap()).unwrap(),
+        SqlChatSyncStore::snapshotContentSummary(&peer.syncSnapshot().unwrap()).unwrap());
+
+    let previous = restored.restoration().unwrap();
+    restored_db.store().withDatabaseFile(|| Ok(())).unwrap();
+    assert_eq!(restored.restoration().unwrap(), previous);
+    restored.establishRestoreBaseline(previous.clone()).unwrap();
+    assert!(restored.restoration().unwrap() > previous);
+    assert_ne!(restored.operationsSince(&SyncClock::empty(), &[], 100).unwrap()[0].opId, initializers[0].opId);
+    AppDatabase::closeDatabase();
+}
+
+/// A newer desktop title edit cannot make its smaller chat database authoritative.
+#[test]
+fn correction_preserves_larger_phone_history_after_a_newer_desktop_edit() {
+    use crate::Transaction::{compare_manifests, Source};
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|e|e.into_inner());
+    let (_, phone_db, phone) = openTestStore("larger-phone");
+    let shared = upsertOperation(1, "shared message");
+    phone.applyOperation(&shared).unwrap();
+    insertChatMessage(&phone_db, "phone-only-chat", 3000, "phone history must survive");
+    phone.recordChatSnapshot("phone-only-chat").unwrap();
+    let phone_snapshot = phone.syncSnapshot().unwrap();
+    let (_, desktop_db, desktop) = openTestStore("newer-desktop");
+    desktop.applyOperation(&shared).unwrap();
+    let mut edited = desktop_db.chatDao().getChatById("chat-remote").unwrap().unwrap();
+    edited.title = "Edited on Windows".into();
+    desktop_db.chatDao().updateChats(vec![edited]).unwrap();
+    desktop.recordChatSnapshot("chat-remote").unwrap();
+    let desktop_snapshot = desktop.syncSnapshot().unwrap();
+    assert!(phone_snapshot.data.revision < desktop_snapshot.data.revision);
+    let phone_manifest = phone_snapshot.manifest_with_content(SqlChatSyncStore::snapshotContentSummary(&phone_snapshot).unwrap()).unwrap();
+    let desktop_manifest = desktop_snapshot.manifest_with_content(SqlChatSyncStore::snapshotContentSummary(&desktop_snapshot).unwrap()).unwrap();
+    assert_eq!(compare_manifests(&phone_manifest, &desktop_manifest).unwrap(), Source::Local);
+    assert_eq!(compare_manifests(&desktop_manifest, &phone_manifest).unwrap(), Source::Remote);
+    let mut baseline = phone_snapshot.clone();
+    baseline.covered.extend(desktop_snapshot.covered.iter().cloned());
+    for (store, db, before) in [(&phone, &phone_db, &phone_snapshot), (&desktop, &desktop_db, &desktop_snapshot)] {
+        assert!(store.repairSyncedSnapshot(&before.token().unwrap(), &baseline).unwrap());
+        assert!(db.chatDao().getChatById("phone-only-chat").unwrap().is_some());
+        assert_eq!(db.messagePartDao().getPartsForMessage("phone-only-chat", 3000, 0).unwrap()[0].content, "phone history must survive");
+        assert_eq!(db.messagePartDao().getPartsForMessage("chat-remote", 2000, 0).unwrap()[0].content, "shared message");
+    }
+    assert_eq!(phone.operationsSince(&SyncClock::empty(), &[], 100).unwrap(), desktop.operationsSince(&SyncClock::empty(), &[], 100).unwrap());
+    let receipt = phone.receipt().unwrap();
+    insertChatMessage(&desktop_db, "phone-only-chat", 4000, "new desktop reply");
+    desktop.recordMessageSnapshot("phone-only-chat", 4000).unwrap();
+    let newer = desktop.operationsSince(&receipt, &[], 100).unwrap();
+    assert!(!newer.is_empty());
+    phone.applyOperations(&newer).unwrap();
+    assert_eq!(phone_db.messagePartDao().getPartsForMessage("phone-only-chat", 4000, 0).unwrap()[0].content, "new desktop reply");
+    assert_eq!(SqlChatSyncStore::snapshotContentSummary(&phone.syncSnapshot().unwrap()).unwrap(), SqlChatSyncStore::snapshotContentSummary(&desktop.syncSnapshot().unwrap()).unwrap());
     AppDatabase::closeDatabase();
 }

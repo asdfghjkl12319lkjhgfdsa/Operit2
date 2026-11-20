@@ -1,11 +1,9 @@
 // ignore_for_file: file_names
 
-import 'dart:convert';
-import 'dart:typed_data';
-
 import 'package:flutter/material.dart';
 
 import 'MarkdownAudioRenderer.dart';
+import 'MarkdownRemoteImage.dart';
 import 'MarkdownVideoRenderer.dart';
 
 class MarkdownImageRenderer extends StatelessWidget {
@@ -14,11 +12,15 @@ class MarkdownImageRenderer extends StatelessWidget {
     required this.imageMarkdown,
     required this.textColor,
     this.maxImageHeight = 140,
+    this.onOpenLink,
+    this.enablePreview = true,
   });
 
   final String imageMarkdown;
   final Color textColor;
   final double maxImageHeight;
+  final bool enablePreview;
+  final void Function(String url)? onOpenLink;
 
   @override
   Widget build(BuildContext context) {
@@ -46,34 +48,37 @@ class MarkdownImageRenderer extends StatelessWidget {
       );
     }
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 1),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(8),
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: maxImageHeight),
-          child: _MarkdownImageBody(imageUrl: imageUrl, imageAlt: imageAlt),
-        ),
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Center(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: maxImageHeight),
+                child: MarkdownRemoteImage(
+                  url: imageUrl,
+                  alt: imageAlt,
+                  enablePreview: enablePreview,
+                ),
+              ),
+            ),
+          ),
+          if (imageAlt.trim().isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                imageAlt.trim(),
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: textColor.withValues(alpha: 0.7),
+                ),
+              ),
+            ),
+        ],
       ),
-    );
-  }
-}
-
-class _MarkdownImageBody extends StatelessWidget {
-  const _MarkdownImageBody({required this.imageUrl, required this.imageAlt});
-
-  final String imageUrl;
-  final String imageAlt;
-
-  @override
-  Widget build(BuildContext context) {
-    final dataBytes = _dataUriBytes(imageUrl);
-    if (dataBytes != null) {
-      return Image.memory(dataBytes, fit: BoxFit.contain);
-    }
-    return Image.network(
-      imageUrl,
-      fit: BoxFit.contain,
-      semanticLabel: imageAlt.isEmpty ? null : imageAlt,
     );
   }
 }
@@ -88,17 +93,19 @@ String extractMarkdownImageAlt(String imageContent) {
 }
 
 String extractMarkdownImageUrl(String imageContent) {
-  return RegExp(r'\]\(([^)]+)\)$').firstMatch(imageContent.trim())?.group(1) ??
-      '';
+  final destination =
+      RegExp(r'\]\(([^)]+)\)$').firstMatch(imageContent.trim())?.group(1) ?? '';
+  final url = destination
+      .replaceFirst(RegExp(r"""\s+(?:"[^"]*"|'[^']*'|\([^)]*\))\s*$"""), '')
+      .trim();
+  return url.startsWith('<') && url.endsWith('>')
+      ? url.substring(1, url.length - 1)
+      : url;
 }
 
-Uint8List? _dataUriBytes(String imageUrl) {
-  final match = RegExp(
-    r'^data:image/[^;]+;base64,(.+)$',
-    caseSensitive: false,
-  ).firstMatch(imageUrl);
-  if (match == null) {
-    return null;
-  }
-  return base64Decode(match.group(1)!);
+/// Whether the entire message is one still/animated image, not audio or video.
+bool isStandaloneMarkdownImage(String content) {
+  if (!isCompleteImageMarkdown(content)) return false;
+  final url = extractMarkdownImageUrl(content);
+  return url.isNotEmpty && !isLikelyVideoUrl(url) && !isLikelyAudioUrl(url);
 }

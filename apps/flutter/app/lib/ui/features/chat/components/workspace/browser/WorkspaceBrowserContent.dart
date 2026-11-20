@@ -6,6 +6,8 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../../../../common/layout/ApplicationZoom.dart';
+import '../../../../../common/layout/OverlayGeometry.dart';
 import '../../../../../theme/OperitGlassSurface.dart';
 import 'WorkspaceBrowserViewStore.dart';
 import 'bookmarks/WorkspaceBrowserBookmarkSheet.dart';
@@ -15,14 +17,14 @@ import 'chrome/WorkspaceBrowserUrlBar.dart';
 import 'downloads/WorkspaceBrowserDownloadSheet.dart';
 import 'history/WorkspaceBrowserHistorySheet.dart';
 import 'permissions/WorkspaceBrowserPermissionSheet.dart';
-import 'surface/WorkspaceBrowserCompositorSurface.dart';
-import 'surface/WorkspaceBrowserNativeSurface.dart';
+import 'surface/WorkspaceBrowserSurface.dart';
 import 'tabs/WorkspaceBrowserTabModels.dart';
 import 'userscripts/WorkspaceUserscriptSheet.dart';
 
 class WorkspaceBrowserContent extends StatefulWidget {
   const WorkspaceBrowserContent({
     super.key,
+    this.sessionId,
     this.initialUrl,
     this.initialUserAgent,
     this.initialHeaders,
@@ -34,10 +36,10 @@ class WorkspaceBrowserContent extends StatefulWidget {
     required this.onWriteWorkspaceFileBytes,
     required this.onOpenWorkspaceFile,
     required this.onOpenBrowserTab,
-    required this.onActivateRequested,
     required this.onCloseRequested,
   });
 
+  final String? sessionId;
   final String? initialUrl;
   final String? initialUserAgent;
   final Map<String, String>? initialHeaders;
@@ -55,7 +57,6 @@ class WorkspaceBrowserContent extends StatefulWidget {
     String? workspaceHtmlPath,
   })
   onOpenBrowserTab;
-  final VoidCallback onActivateRequested;
   final VoidCallback onCloseRequested;
 
   @override
@@ -74,43 +75,48 @@ class _WorkspaceBrowserContentState extends State<WorkspaceBrowserContent> {
   OverlayEntry? _panelPopupEntry;
   bool _initialized = false;
 
+  WorkspaceBrowserTabState? get _activeTab {
+    final explicitId = widget.sessionId;
+    if (explicitId != null && explicitId.isNotEmpty) {
+      final tab = _sessionStore.tabById(explicitId);
+      if (tab != null) {
+        return tab;
+      }
+    }
+    return _sessionStore.currentTab;
+  }
+
+  void _syncActiveSession() {
+    final explicitId = widget.sessionId;
+    if (explicitId != null && explicitId.isNotEmpty) {
+      if (_sessionStore.currentTab?.id != explicitId) {
+        try {
+          _sessionStore.selectSession(explicitId);
+        } catch (_) {}
+      }
+    }
+  }
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     _attachBrowserUi();
+    _syncActiveSession();
     if (_initialized) {
       return;
     }
     _initialized = true;
-    unawaited(_initialize());
+    if (widget.sessionId == null || widget.sessionId!.isEmpty) {
+      unawaited(_initialize());
+    }
   }
 
   @override
   void didUpdateWidget(covariant WorkspaceBrowserContent oldWidget) {
     super.didUpdateWidget(oldWidget);
     _attachBrowserUi();
-    if (oldWidget.initialUrl != widget.initialUrl &&
-        widget.initialUrl?.trim().isNotEmpty == true) {
-      unawaited(
-        _sessionStore.openTab(
-          url: widget.initialUrl!,
-          userAgent: widget.initialUserAgent,
-          headers: widget.initialHeaders,
-        ),
-      );
-    }
-    if (oldWidget.initialFilePath != widget.initialFilePath &&
-        widget.initialFilePath?.trim().isNotEmpty == true) {
-      unawaited(_sessionStore.openLocalFileTab(widget.initialFilePath!));
-    }
-    if (oldWidget.initialWorkspaceHtmlPath != widget.initialWorkspaceHtmlPath &&
-        widget.initialWorkspaceHtmlPath?.trim().isNotEmpty == true) {
-      unawaited(
-        _sessionStore.openWorkspaceHtmlTab(
-          widget.initialWorkspaceHtmlPath!,
-          initialUrl: widget.initialUrl,
-        ),
-      );
+    if (oldWidget.sessionId != widget.sessionId) {
+      _syncActiveSession();
     }
   }
 
@@ -129,7 +135,7 @@ class _WorkspaceBrowserContentState extends State<WorkspaceBrowserContent> {
     return AnimatedBuilder(
       animation: _sessionStore,
       builder: (context, child) {
-        final tab = _sessionStore.currentTab;
+        final tab = _activeTab;
         if (tab == null) {
           return const Center(child: CircularProgressIndicator());
         }
@@ -142,56 +148,74 @@ class _WorkspaceBrowserContentState extends State<WorkspaceBrowserContent> {
             final isBookmarked = _sessionStore.stores.bookmarks.contains(
               tab.url,
             );
-            return Focus(
-              focusNode: _browserFocusNode,
-              autofocus: true,
-              child: CallbackShortcuts(
-                bindings: <ShortcutActivator, VoidCallback>{
-                  const SingleActivator(
-                    LogicalKeyboardKey.minus,
-                    control: true,
-                  ): _sessionStore.zoomOut,
-                  const SingleActivator(
-                    LogicalKeyboardKey.numpadSubtract,
-                    control: true,
-                  ): _sessionStore.zoomOut,
-                  const SingleActivator(
-                    LogicalKeyboardKey.equal,
-                    control: true,
-                  ): _sessionStore.zoomIn,
-                  const SingleActivator(
-                    LogicalKeyboardKey.equal,
-                    control: true,
-                    shift: true,
-                  ): _sessionStore.zoomIn,
-                  const SingleActivator(
-                    LogicalKeyboardKey.numpadAdd,
-                    control: true,
-                  ): _sessionStore.zoomIn,
-                  const SingleActivator(
-                    LogicalKeyboardKey.digit0,
-                    control: true,
-                  ): _sessionStore.resetZoom,
-                  const SingleActivator(
-                    LogicalKeyboardKey.numpad0,
-                    control: true,
-                  ): _sessionStore.resetZoom,
-                },
-                child: Column(
-                  children: <Widget>[
-                    WorkspaceBrowserUrlBar(
-                      tab: tab,
-                      isBookmarked: isBookmarked,
-                      onSubmitted: _sessionStore.navigateCurrent,
-                      onToggleBookmark: _sessionStore.toggleBookmark,
-                      onBack: _sessionStore.goBack,
-                      onForward: _sessionStore.goForward,
-                      onRefreshOrStop: _sessionStore.refreshOrStop,
-                      onOpenMenu: _toggleMenuPopup,
-                      menuButtonKey: _menuButtonKey,
-                    ),
-                    Expanded(child: _buildBrowserSurface(tab)),
-                  ],
+            return ApplicationZoomExclusion(
+              child: Focus(
+                focusNode: _browserFocusNode,
+                autofocus: true,
+                child: CallbackShortcuts(
+                  bindings: <ShortcutActivator, VoidCallback>{
+                    const SingleActivator(
+                      LogicalKeyboardKey.minus,
+                      control: true,
+                    ): _sessionStore.zoomOut,
+                    const SingleActivator(
+                      LogicalKeyboardKey.numpadSubtract,
+                      control: true,
+                    ): _sessionStore.zoomOut,
+                    const SingleActivator(
+                      LogicalKeyboardKey.equal,
+                      control: true,
+                    ): _sessionStore.zoomIn,
+                    const SingleActivator(
+                      LogicalKeyboardKey.equal,
+                      control: true,
+                      shift: true,
+                    ): _sessionStore.zoomIn,
+                    const SingleActivator(
+                      LogicalKeyboardKey.numpadAdd,
+                      control: true,
+                    ): _sessionStore.zoomIn,
+                    const SingleActivator(
+                      LogicalKeyboardKey.digit0,
+                      control: true,
+                    ): _sessionStore.resetZoom,
+                    const SingleActivator(
+                      LogicalKeyboardKey.numpad0,
+                      control: true,
+                    ): _sessionStore.resetZoom,
+                  },
+                  child: Column(
+                    children: <Widget>[
+                      WorkspaceBrowserUrlBar(
+                        tab: tab,
+                        isBookmarked: isBookmarked,
+                        onSubmitted: (url) {
+                          _syncActiveSession();
+                          _sessionStore.navigateCurrent(url);
+                        },
+                        onToggleBookmark: () {
+                          _syncActiveSession();
+                          _sessionStore.toggleBookmark();
+                        },
+                        onBack: () {
+                          _syncActiveSession();
+                          _sessionStore.goBack();
+                        },
+                        onForward: () {
+                          _syncActiveSession();
+                          _sessionStore.goForward();
+                        },
+                        onRefreshOrStop: () {
+                          _syncActiveSession();
+                          _sessionStore.refreshOrStop();
+                        },
+                        onOpenMenu: _toggleMenuPopup,
+                        onNewTab: () => widget.onOpenBrowserTab(),
+                        menuButtonKey: _menuButtonKey,
+                      ),
+                      Expanded(child: _buildBrowserSurface(tab)),
+                    ],
+                  ),
                 ),
               ),
             );
@@ -203,13 +227,7 @@ class _WorkspaceBrowserContentState extends State<WorkspaceBrowserContent> {
 
   /// Builds the browser viewport for the active session.
   Widget _buildBrowserSurface(WorkspaceBrowserTabState tab) {
-    if (_sessionStore.usesNativeSurface) {
-      return WorkspaceBrowserNativeSurface(
-        key: ValueKey<String>('workspace-browser-native-surface-${tab.id}'),
-        sessionId: tab.id,
-      );
-    }
-    return WorkspaceBrowserCompositorSurface(
+    return WorkspaceBrowserSurface(
       key: ValueKey<String>('workspace-browser-surface-${tab.id}'),
       tab: tab,
       store: _sessionStore,
@@ -219,7 +237,6 @@ class _WorkspaceBrowserContentState extends State<WorkspaceBrowserContent> {
   void _attachBrowserUi() {
     _sessionStore.attachUi(
       delegate: WorkspaceBrowserViewDelegate(
-        onActivateRequested: widget.onActivateRequested,
         onCloseRequested: widget.onCloseRequested,
       ),
       onWriteWorkspaceFileBytes: widget.onWriteWorkspaceFileBytes,
@@ -250,13 +267,7 @@ class _WorkspaceBrowserContentState extends State<WorkspaceBrowserContent> {
     final overlay = Overlay.of(context);
     final mediaQuery = MediaQuery.of(context);
     final screenSize = mediaQuery.size;
-    final targetOffset = renderBox.localToGlobal(Offset.zero);
-    final targetRect = Rect.fromLTWH(
-      targetOffset.dx,
-      targetOffset.dy,
-      renderBox.size.width,
-      renderBox.size.height,
-    );
+    final targetRect = overlayTargetRectOf(context, renderBox);
     final horizontalPadding = 12.0 + mediaQuery.padding.left;
     final rightPadding = 12.0 + mediaQuery.padding.right;
     final availableWidth = screenSize.width - horizontalPadding - rightPadding;
@@ -298,9 +309,7 @@ class _WorkspaceBrowserContentState extends State<WorkspaceBrowserContent> {
                   return AnimatedBuilder(
                     animation: tab,
                     builder: (context, child) => OperitGlassSurface(
-                      color: Theme.of(
-                        context,
-                      ).colorScheme.surfaceContainer,
+                      color: Theme.of(context).colorScheme.surfaceContainer,
                       layer: OperitGlassSurfaceLayer.card,
                       transparentAlpha: 1,
                       enableBackdropFilter: false,
@@ -499,6 +508,7 @@ class _WorkspaceBrowserContentState extends State<WorkspaceBrowserContent> {
     _zoomPopupEntry = null;
   }
 
+  /// Positions a browser panel relative to its menu anchor inside the Overlay.
   void _showPanelPopup(Widget child, {double preferredWidth = 320}) {
     _dismissPanelPopup();
     final overlay = Overlay.of(context);
@@ -508,9 +518,10 @@ class _WorkspaceBrowserContentState extends State<WorkspaceBrowserContent> {
     final rightPadding = 12.0 + mediaQuery.padding.right;
     final renderBox =
         _menuButtonKey.currentContext?.findRenderObject() as RenderBox?;
-    final targetBottom = renderBox == null || !renderBox.attached
-        ? 0.0
-        : renderBox.localToGlobal(Offset.zero).dy + renderBox.size.height;
+    if (renderBox == null || !renderBox.attached || !renderBox.hasSize) {
+      throw StateError('Browser panel anchor is not laid out.');
+    }
+    final targetBottom = overlayTargetRectOf(context, renderBox).bottom;
     final top = math.max(12.0 + mediaQuery.padding.top, targetBottom + 24);
     final availableWidth = screenSize.width - horizontalPadding - rightPadding;
     final popupWidth = availableWidth < preferredWidth

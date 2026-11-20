@@ -12,7 +12,8 @@ class CursorStyleChatMessage extends StatelessWidget {
   const CursorStyleChatMessage({
     super.key,
     required this.message,
-    this.currentCharacterCardAvatarUri,
+    this.identityAvatarUri,
+    this.onIdentityTap,
     this.splitMarkdownContent,
     this.onDeleteMessage,
     this.onEditSummary,
@@ -20,7 +21,8 @@ class CursorStyleChatMessage extends StatelessWidget {
   });
 
   final ChatUiMessage message;
-  final String? currentCharacterCardAvatarUri;
+  final String? identityAvatarUri;
+  final VoidCallback? onIdentityTap;
   final MarkdownContentSplitter? splitMarkdownContent;
   final Future<void> Function(int timestamp)? onDeleteMessage;
   final ValueChanged<ChatUiMessage>? onEditSummary;
@@ -30,12 +32,15 @@ class CursorStyleChatMessage extends StatelessWidget {
   Widget build(BuildContext context) {
     switch (message.sender) {
       case 'user':
-        return UserMessageComposable(message: message, useBubbleStyle: false);
+        return UserMessageComposable(
+          message: message,
+          enableDialogs: enableDialogs,
+        );
       case 'ai':
         return AiMessageComposable(
           message: message,
-          useBubbleStyle: false,
-          avatarImagePath: currentCharacterCardAvatarUri,
+          avatarImagePath: identityAvatarUri,
+          onIdentityTap: enableDialogs ? onIdentityTap : null,
           splitMarkdownContent: splitMarkdownContent,
         );
       case 'summary':
@@ -46,6 +51,7 @@ class CursorStyleChatMessage extends StatelessWidget {
               : () => onDeleteMessage!(message.timestamp),
           onEdit: onEditSummary,
           enableDialog: enableDialogs,
+          splitMarkdownContent: splitMarkdownContent,
         );
     }
     return _SystemMessageComposable(message: message);

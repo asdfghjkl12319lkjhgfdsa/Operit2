@@ -1,3 +1,8 @@
+pub use operit_host_native_common::ServiceDiscovery::ServiceDiscoveryProvider as WindowsServiceDiscoveryHost;
+
+#[cfg(feature = "daemon")]
+pub mod daemon;
+
 pub mod bridge;
 #[path = "../../common/chromium_browser.rs"]
 pub mod chromium_browser;
@@ -5,8 +10,11 @@ pub mod chromium_browser;
 pub mod host_runtime_event;
 #[path = "plugin_sdk_ipc.rs"]
 pub mod plugin_sdk_ipc;
+mod process;
 pub mod registry;
 pub mod tools;
+#[path = "../../common/ui_automation.rs"]
+mod ui_automation;
 
 pub use host_runtime_event::WindowsHostRuntimeEventHost;
 pub use operit_host_native_common::NativeHostJavaScriptRuntimeHost as WindowsHostJavaScriptRuntimeHost;
@@ -33,12 +41,8 @@ pub fn createRuntimeHostManager(
     let archiveStagingHost = Arc::new(operit_host_native_common::NativeArchiveStagingHost::new(
         runtimeRoot.clone(),
     ));
-    let runtimeStorageWriteHost =
-        Arc::new(operit_host_native_common::NativeRuntimeStorageHost::new(
-            runtimeRoot.clone(),
-            workspaceRoot.clone(),
-        ));
     let runtimeStorageHost = Arc::new(WindowsRuntimeStorageHost::new(runtimeRoot, workspaceRoot));
+    let runtimeStorageWriteHost = runtimeStorageHost.clone();
     let runtimeSqliteHost = runtimeStorageHost.clone();
     let hostSecretStore = runtimeStorageHost.clone();
     HostManager::withFileSystemWebVisitSystemOperationAndManagedRuntimeHosts(
@@ -50,8 +54,15 @@ pub fn createRuntimeHostManager(
         runtimeStorageHost,
         runtimeSqliteHost,
     )
+    .withLocalInferenceHost(Arc::new(operit_host_local_inference::NativeLocalInferenceHost::new()))
+    .withUiAutomationHost(Arc::new(ui_automation::ScriptUiAutomationHost::new(
+        "powershell.exe",
+        &["-NoProfile", "-NonInteractive", "-STA", "-Command", include_str!("ui_automation.ps1")],
+    )))
     .withHostSecretStore(hostSecretStore)
     .withWebSocketHost(Arc::new(WindowsHttpHost::new()))
+    .withHttpServerHost(Arc::new(operit_host_native_common::NativeHttpServerHost))
+    .withTcpHost(Arc::new(operit_host_native_common::NativeTcpHost))
     .withSerialPortHost(Arc::new(operit_host_native_common::NativeSerialPortHost))
     .withArchiveStagingHost(archiveStagingHost)
     .withRuntimeStorageWriteHost(runtimeStorageWriteHost)

@@ -2,15 +2,16 @@ use std::collections::BTreeMap;
 
 use crate::output::CoreCommandOutput;
 use operit_host_api::HostManager::HostManager;
+use operit_host_api::{ManagedRuntimeProgram, RuntimePathAction, RuntimeProcessRequest};
 use operit_runtime::core::application::OperitApplication::OperitApplication;
 use operit_runtime::core::chat::ChatRuntimeSlot::ChatRuntimeSlot;
 use operit_runtime::services::ChatServiceCore::ChatServiceCore;
 use operit_runtime::ui::features::chat::webview::workspace::WorkspaceUtils;
-use operit_tools::files::PathMapper::PathMapper;
-use operit_tools::files::VisualFileSystem::VisualFileSystem;
 use operit_tools::tools::AIToolHandler::AIToolHandler;
 use operit_tools::ConversationMarkupManager::ToolResult;
 use operit_tools::ToolExecutionManager::{AITool, ToolParameter};
+use operit_vfs::VfsPath;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -27,7 +28,7 @@ fn with_main_chat_core<R>(
 }
 
 /// Runs workspace path, binding, shortcut, and workspace tool commands.
-pub fn run_workspace_command(
+pub async fn run_workspace_command(
     application: &mut OperitApplication,
     args: &[String],
     output: &mut CoreCommandOutput,
@@ -47,13 +48,113 @@ pub fn run_workspace_command(
         "chats" => list_workspace_chats(application, &args[1..], output),
         "commands" => list_workspace_commands(application, &args[1..], output),
         "commands-path" => list_workspace_commands_path(application, &args[1..], output),
-        "run" => run_workspace_shortcut(application, &args[1..], output),
-        "run-path" => run_workspace_shortcut_path(application, &args[1..], output),
+        "run" => run_workspace_shortcut(application, &args[1..], output).await,
+        "run-path" => run_workspace_shortcut_path(application, &args[1..], output).await,
+        "exec" => execute_workspace_program(application, &args[1..], output),
+        "resolve-path" => resolve_workspace_path(application, &args[1..], output),
+        "open-path" => open_workspace_path(application, &args[1..], output),
         _ => {
             print_workspace_usage(output);
             Ok(())
         }
     }
+}
+
+/// Dispatches an explicit external path intent after resolving its VFS locator.
+fn open_workspace_path(
+    application: &OperitApplication,
+    args: &[String],
+    output: &mut CoreCommandOutput,
+) -> Result<(), String> {
+    let (path, action) = match args {
+        [path, action] if action == "reveal" => (path, RuntimePathAction::Reveal),
+        [path, action] if action == "terminal" => (path, RuntimePathAction::Terminal),
+        [path, action, program, arguments @ ..] if action == "program" && !program.is_empty() =>
+            (path, RuntimePathAction::Application { program: program.clone(), args: arguments.to_vec() }),
+        _ => return Err("usage: operit2 workspace open-path <vfs-path> <reveal|terminal|program <name> [args...]>".to_string()),
+    };
+    let vfs = vfsForWorkspace(&application.hostManager)?;
+    let file = vfs.file(path)?;
+    let host = application
+        .hostManager
+        .managedRuntimeHost
+        .as_ref()
+        .ok_or("ManagedRuntimeHost is not registered for this runtime")?;
+    host.openFilePath(&file, action)
+        .map_err(|error| error.message)?;
+    output.setJsonStdout(json!({ "path": path, "opened": true }));
+    Ok(())
+}
+
+/// Resolves a public or native locator through the owning runtime's VFS mapper.
+fn resolve_workspace_path(
+    application: &OperitApplication,
+    args: &[String],
+    output: &mut CoreCommandOutput,
+) -> Result<(), String> {
+    let path = match args {
+        [path] => VfsPath::canonicalizeVfsPath(path)?,
+        [flag, path] if flag == "--native" => VfsPath::normalizeWorkspaceBindingPath(path)?,
+        [flag, base, path] if flag == "--from" => {
+            VfsPath::resolveWorkspaceResourcePath(base, path)?
+        }
+        _ => {
+            return Err(
+                "usage: operit2 workspace resolve-path [--native | --from <workspace>] <path>"
+                    .to_string(),
+            )
+        }
+    };
+    let vfs = vfsForWorkspace(&application.hostManager)?;
+    vfs.validatePath(&path, "path")?;
+    output.push_stdout_line(&path);
+    output.setJsonStdout(json!({ "vfsPath": path }));
+    Ok(())
+}
+
+/// Runs an argument-vector command in a VFS-resolved directory without a shell.
+fn execute_workspace_program(
+    application: &OperitApplication,
+    args: &[String],
+    output: &mut CoreCommandOutput,
+) -> Result<(), String> {
+    let workspace = args
+        .first()
+        .filter(|value| !value.is_empty())
+        .ok_or("usage: operit2 workspace exec <workspace-path> <program> [args...]")?;
+    let program = args
+        .get(1)
+        .filter(|value| !value.is_empty())
+        .ok_or("workspace exec requires a program")?;
+    let context = &application.hostManager;
+    let vfs = vfsForWorkspace(context)?;
+    let cwd = vfs.file(workspace)?;
+    let host = context
+        .managedRuntimeHost
+        .as_ref()
+        .ok_or("ManagedRuntimeHost is not registered for this runtime")?;
+    let result = host
+        .runRuntimeCommandAt(
+            RuntimeProcessRequest {
+                program: ManagedRuntimeProgram::Command(program.clone()),
+                executablePath: None,
+                args: args[2..].to_vec(),
+                cwd: None,
+                env: BTreeMap::new(),
+            },
+            &cwd,
+        )
+        .map_err(|error| error.message)?;
+    output.push_stdout(&result.stdout);
+    output.push_stderr(&result.stderr);
+    output.setJsonStdout(json!({
+        "workspacePath": workspace,
+        "workingDirectory": workspace,
+        "exitCode": result.exitCode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }));
+    Ok(())
 }
 
 /// Prints the default workspace path for one chat id.
@@ -65,7 +166,7 @@ fn default_workspace_path(
     let chatId = args
         .get(0)
         .ok_or_else(|| "usage: operit2 workspace default-path <chat-id>".to_string())?;
-    let path = PathMapper::workspacePath(chatId)?;
+    let path = VfsPath::workspacePath(chatId)?;
     output.push_stdout_line(format!("Default workspace path: {path}"));
     output.setJsonStdout(json!({
         "chatId": chatId,
@@ -137,7 +238,7 @@ fn bind_workspace(
         .cloned()
         .and_then(nonBlankString)
         .ok_or_else(|| "usage: operit2 workspace bind <chat-id> <workspace>".to_string())?;
-    let workspace = PathMapper::normalizeWorkspaceBindingPath(&workspace)?;
+    let workspace = VfsPath::normalizeWorkspaceBindingPath(&workspace)?;
     with_main_chat_core(application, |core| {
         core.bindChatToWorkspace(chatId.clone(), workspace.clone())
     })??;
@@ -253,12 +354,12 @@ fn list_workspace_commands_path(
         .cloned()
         .and_then(nonBlankString)
         .ok_or_else(|| "usage: operit2 workspace commands-path <workspace>".to_string())?;
-    let workspacePath = PathMapper::normalizeWorkspaceBindingPath(&workspacePath)?;
+    let workspacePath = VfsPath::normalizeWorkspaceBindingPath(&workspacePath)?;
     list_commands_at_path(&application.hostManager, None, &workspacePath, output)
 }
 
 /// Runs a configured workspace shortcut for a chat workspace.
-fn run_workspace_shortcut(
+async fn run_workspace_shortcut(
     application: &mut OperitApplication,
     args: &[String],
     output: &mut CoreCommandOutput,
@@ -270,11 +371,11 @@ fn run_workspace_shortcut(
         .get(1)
         .ok_or_else(|| "usage: operit2 workspace run <chat-id> <command-id>".to_string())?;
     let workspacePath = workspace_path_for_chat(application, chatId)?;
-    run_command_at_path(application, Some(chatId), &workspacePath, commandId, output)
+    run_command_at_path(application, Some(chatId), &workspacePath, commandId, output).await
 }
 
 /// Runs a configured workspace shortcut at an explicit workspace path.
-fn run_workspace_shortcut_path(
+async fn run_workspace_shortcut_path(
     application: &mut OperitApplication,
     args: &[String],
     output: &mut CoreCommandOutput,
@@ -284,11 +385,11 @@ fn run_workspace_shortcut_path(
         .cloned()
         .and_then(nonBlankString)
         .ok_or_else(|| "usage: operit2 workspace run-path <workspace> <command-id>".to_string())?;
-    let workspacePath = PathMapper::normalizeWorkspaceBindingPath(&workspacePath)?;
+    let workspacePath = VfsPath::normalizeWorkspaceBindingPath(&workspacePath)?;
     let commandId = args
         .get(1)
         .ok_or_else(|| "usage: operit2 workspace run-path <workspace> <command-id>".to_string())?;
-    run_command_at_path(application, None, &workspacePath, commandId, output)
+    run_command_at_path(application, None, &workspacePath, commandId, output).await
 }
 
 /// Resolves the workspace path currently bound to one chat.
@@ -311,23 +412,7 @@ fn workspace_path_for_chat(
 #[allow(non_snake_case)]
 /// Creates a visual filesystem rooted in the configured runtime and workspace storage.
 fn vfsForWorkspace(context: &HostManager) -> Result<VisualFileSystem, String> {
-    let runtimeStorageHost = context
-        .runtimeStorageHost
-        .as_ref()
-        .ok_or_else(|| "RuntimeStorageHost is not configured for workspace commands".to_string())?;
-    let runtimeStoreRoot = runtimeStorageHost.runtimeRootDir().ok_or_else(|| {
-        "RuntimeStorageHost runtime root is not configured for workspace commands".to_string()
-    })?;
-    let workspaceCollectionRoot = runtimeStorageHost.workspaceRootDir().ok_or_else(|| {
-        "RuntimeStorageHost workspace root is not configured for workspace commands".to_string()
-    })?;
-    Ok(VisualFileSystem::new(
-        context
-            .fileSystemHost
-            .clone()
-            .ok_or_else(|| "FileSystemHost is not registered for workspace commands".to_string())?,
-        PathMapper::new(runtimeStoreRoot, workspaceCollectionRoot),
-    ))
+    context.vfs()
 }
 
 /// Lists commands from one workspace configuration file.
@@ -361,7 +446,7 @@ fn list_commands_at_path(
 }
 
 /// Runs one command from a workspace configuration file.
-fn run_command_at_path(
+async fn run_command_at_path(
     application: &OperitApplication,
     chatId: Option<&str>,
     workspacePath: &str,
@@ -386,7 +471,8 @@ fn run_command_at_path(
             workspacePath,
             &toolName,
             output,
-        );
+        )
+        .await;
     }
 
     let commandText = command
@@ -405,7 +491,7 @@ fn run_command_at_path(
 }
 
 /// Executes one workspace command via the tool runtime.
-fn execute_workspace_tool(
+async fn execute_workspace_tool(
     mut handler: AIToolHandler,
     command: &CommandConfig,
     chatId: Option<&str>,
@@ -421,10 +507,12 @@ fn execute_workspace_tool(
         });
     }
 
-    let result = handler.executeTool(AITool {
-        name: toolName.to_string(),
-        parameters,
-    });
+    let result = handler
+        .executeTool(AITool {
+            name: toolName.to_string(),
+            parameters,
+        })
+        .await;
     print_tool_execution_result(&result, command, chatId, workspacePath, output)
 }
 
@@ -442,7 +530,17 @@ fn execute_workspace_shell_command(
         .clone()
         .ok_or_else(|| "TerminalHost is not registered for this runtime.".to_string())?;
     let vfs = vfsForWorkspace(context)?;
-    let workingDir = workspace_command_working_dir(&vfs, workspacePath, &command.workingDir)?;
+    let workingDir = workspace_command_working_dir(workspacePath, &command.workingDir)?;
+    let directory = operit_host_api::TerminalWorkingDirectory::resolveSessionDirectory(
+        terminalHost.as_ref(),
+        None,
+        &workingDir,
+        &|path| {
+            vfs.terminalDirectory(terminalHost.as_ref(), path)
+                .map_err(operit_host_api::HostError::new)
+        },
+    )
+    .map_err(|error| format!("failed to resolve workspace directory: {}", error.message))?;
     let sessionName = workspace_command_session_name(workspacePath, command);
     let session = terminalHost
         .createOrGetSession(&sessionName)
@@ -452,10 +550,21 @@ fn execute_workspace_shell_command(
                 error.message
             )
         })?;
-    let cdCommand = format!("cd {}", shell_quote(&workingDir));
-    terminalHost
-        .executeInSession(&session.sessionId, &cdCommand, 120000)
-        .map_err(|error| format!("failed to enter workspace directory: {}", error.message))?;
+    let entered = operit_host_api::TerminalWorkingDirectory::enterTerminalDirectory(
+        terminalHost.as_ref(),
+        &session.sessionId,
+        &session.terminalType,
+        &directory,
+    );
+    if let Err(error) = entered {
+        if session.isNewSession {
+            let _ = terminalHost.closeSession(&session.sessionId);
+        }
+        return Err(format!(
+            "failed to enter workspace directory: {}",
+            error.message
+        ));
+    }
     let commandOutput = terminalHost
         .executeInSession(&session.sessionId, commandText, 1800000)
         .map_err(|error| format!("failed to execute workspace command: {}", error.message))?;
@@ -513,15 +622,15 @@ fn resolve_workspace_tool_parameter_value(
 
     if startsWithHostDrivePath(trimmed) {
         return Err(format!(
-            "workspace tool parameter `{name}` must use a VFS path; use /mnt/windows/<drive>/... for Windows host paths"
+            "workspace tool parameter `{name}` must use a VFS path; use /virtual/windows/<drive>/... for Windows host paths"
         ));
     }
 
-    if PathMapper::normalizeVfsPath(trimmed).is_ok() {
+    if VfsPath::normalizeVfsPath(trimmed).is_ok() {
         return Ok(trimmed.to_string());
     }
 
-    PathMapper::joinVfsPath(workspacePath, trimmed)
+    VfsPath::joinVfsPath(workspacePath, trimmed)
 }
 
 /// Returns whether a tool parameter name represents a filesystem path.
@@ -596,11 +705,7 @@ fn print_tool_execution_result(
 }
 
 /// Resolves the physical working directory for a workspace command.
-fn workspace_command_working_dir(
-    vfs: &VisualFileSystem,
-    workspacePath: &str,
-    workingDir: &str,
-) -> Result<String, String> {
+fn workspace_command_working_dir(workspacePath: &str, workingDir: &str) -> Result<String, String> {
     let trimmed = workingDir.trim();
     let workingDirPath = if trimmed.is_empty() || trimmed == "." {
         workspacePath.to_string()
@@ -609,12 +714,12 @@ fn workspace_command_working_dir(
             "workspace command workingDir must use a VFS path or a path relative to the workspace"
                 .to_string(),
         );
-    } else if PathMapper::normalizeVfsPath(trimmed).is_ok() {
+    } else if VfsPath::normalizeVfsPath(trimmed).is_ok() {
         trimmed.to_string()
     } else {
-        PathMapper::joinVfsPath(workspacePath, trimmed)?
+        VfsPath::joinVfsPath(workspacePath, trimmed)?
     };
-    Ok(vfs.resolvePath(&workingDirPath)?.physicalPath)
+    VfsPath::normalizeVfsPath(&workingDirPath)
 }
 
 /// Builds the terminal session name for a workspace command.
@@ -634,11 +739,6 @@ fn workspace_command_session_name(workspacePath: &str, command: &CommandConfig) 
     } else {
         format!("Workspace: {name}")
     }
-}
-
-/// Quotes a path for the terminal shell used by workspace commands.
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Parses arguments shared by default workspace commands.
@@ -675,6 +775,9 @@ fn print_workspace_usage(output: &mut CoreCommandOutput) {
         "operit2 workspace commands-path <workspace>",
         "operit2 workspace run <chat-id> <command-id>",
         "operit2 workspace run-path <workspace> <command-id>",
+        "operit2 workspace exec <workspace-path> <program> [args...]",
+        "operit2 workspace resolve-path [--native | --from <workspace>] <path>",
+        "operit2 workspace open-path <vfs-path> <reveal|terminal|program <name> [args...]>",
     ];
     for line in lines {
         output.push_stdout_line(line);
@@ -835,7 +938,7 @@ impl WorkspaceConfigReader {
     /// Reads and parses a workspace config file.
     #[allow(non_snake_case)]
     fn readConfig(vfs: &VisualFileSystem, workspacePath: &str) -> Result<WorkspaceConfig, String> {
-        let configFile = PathMapper::joinVfsPath(workspacePath, ".operit/config.json")?;
+        let configFile = VfsPath::joinVfsPath(workspacePath, ".operit/config.json")?;
         let content = vfs
             .readFile(&configFile)
             .map_err(|error| format!("failed to read {configFile}: {error}"))?;

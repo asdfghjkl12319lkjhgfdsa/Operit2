@@ -127,15 +127,18 @@ impl CoreNodeBindingStore {
             .ok_or_else(|| format!("Binding does not exist: {key}"))
     }
 
-    /// Reads the current CoreNode selection when one opaque Binding key has a record.
+    /// Reads a committed Binding after its journal and shared cache have both been updated.
     #[allow(non_snake_case)]
     pub fn bindingOptional(&self, key: &str) -> Result<Option<CoreNodeBindingRecord>, String> {
+        let _lock = coreNodeBindingMutationLock()
+            .lock()
+            .map_err(|error| format!("Binding mutation lock poisoned: {error}"))?;
         self.bindingRecord(key)
     }
 
     /// Reports whether one opaque Binding key has a persisted current record.
     pub fn contains(&self, key: &str) -> Result<bool, String> {
-        Ok(self.bindingRecord(key)?.is_some())
+        Ok(self.bindingOptional(key)?.is_some())
     }
 
     /// Creates the initial Binding for one newly created business key.
@@ -161,13 +164,12 @@ impl CoreNodeBindingStore {
         self.create(key, &self.localNodeId)
     }
 
-    /// Deletes one Binding by appending an authoritative entity-state tombstone.
+    /// Retires a key even when its Binding has not arrived, without requiring its execution node.
     pub fn delete(&self, key: &str) -> Result<(), String> {
         let _lock = coreNodeBindingMutationLock()
             .lock()
             .map_err(|error| format!("Binding mutation lock poisoned: {error}"))?;
         validateBindingKey(key)?;
-        self.binding(key)?;
         self.appendBindingOperation(key, "delete", serde_json::Value::Null)?;
         self.removeCachedBinding(key)?;
         Ok(())
@@ -187,7 +189,8 @@ impl CoreNodeBindingStore {
         validateBindingKey(key)?;
         validateBindingNodeId(expectedNodeId)?;
         validateBindingNodeId(targetNodeId)?;
-        let current = self.binding(key)?;
+        let current = self.bindingRecord(key)?
+            .ok_or_else(|| format!("Binding does not exist: {key}"))?;
         if current.nodeId != expectedNodeId {
             return Err(format!(
                 "Binding conflict for {key}: expected {expectedNodeId}, actual {}",
@@ -205,6 +208,18 @@ impl CoreNodeBindingStore {
             nodeId: targetNodeId.to_string(),
             generation: current.generation + 1,
         })
+    }
+
+    /// Observes a received Binding batch without acknowledging owner application.
+    /// The journal retains originals and pending flags; per-owner replay reuses this clock.
+    /// Invalid records remain pending so their own owner reports the validation error.
+    #[allow(non_snake_case)]
+    pub fn prepareSyncedOperations(&self, operations: &[SyncOperation]) -> Result<(), String> {
+        let operations = operations.iter()
+            .filter(|operation| validateBindingOperation(operation).is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        self.syncOperationStore.appendOperations(&operations).map_err(|error| error.to_string())
     }
 
     /// Applies one synchronized Binding operation without creating another local operation.
@@ -241,6 +256,7 @@ impl CoreNodeBindingStore {
         if !shouldApply {
             return Ok(());
         }
+        self.applyOperationToCache(operation)?;
         if ignoreConflict {
             self.syncOperationStore
                 .recordBootstrapAppliedOperations(std::slice::from_ref(operation))
@@ -250,7 +266,6 @@ impl CoreNodeBindingStore {
                 .recordAppliedOperation(operation)
                 .map_err(|error| error.to_string())?;
         }
-        self.applyOperationToCache(operation)?;
         Ok(())
     }
     /// Applies one directly transported Binding operation without advancing persistence clocks.
@@ -270,10 +285,10 @@ impl CoreNodeBindingStore {
         if !shouldApply {
             return Ok(());
         }
+        self.applyOperationToCache(operation)?;
         self.syncOperationStore
             .recordAppliedOperation(operation)
             .map_err(|error| error.to_string())?;
-        self.applyOperationToCache(operation)?;
         Ok(())
     }
 

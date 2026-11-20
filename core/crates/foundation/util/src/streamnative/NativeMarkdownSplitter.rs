@@ -2,15 +2,13 @@ use std::collections::VecDeque;
 
 use crate::stream::plugins::StreamMarkdownPlugin::{
     StreamMarkdownBlockBracketLaTeXPlugin, StreamMarkdownBlockLaTeXPlugin,
-    StreamMarkdownBlockQuotePlugin, StreamMarkdownBoldPlugin, StreamMarkdownFencedCodeBlockPlugin,
-    StreamMarkdownHeaderPlugin, StreamMarkdownHorizontalRulePlugin, StreamMarkdownImagePlugin,
-    StreamMarkdownInlineCodePlugin, StreamMarkdownInlineLaTeXPlugin,
-    StreamMarkdownInlineParenLaTeXPlugin, StreamMarkdownItalicPlugin, StreamMarkdownLinkPlugin,
-    StreamMarkdownOrderedListPlugin, StreamMarkdownStrikethroughPlugin, StreamMarkdownTablePlugin,
-    StreamMarkdownUnderlinePlugin, StreamMarkdownUnorderedListPlugin,
+    StreamMarkdownBlockQuotePlugin, StreamMarkdownFencedCodeBlockPlugin,
+    StreamMarkdownFootnoteDefinitionPlugin, StreamMarkdownHeaderPlugin, StreamMarkdownImagePlugin,
+    StreamMarkdownOrderedListPlugin, StreamMarkdownTablePlugin, StreamMarkdownUnorderedListPlugin,
 };
 use crate::stream::plugins::StreamPlugin::{PluginState, StreamPlugin};
 use crate::stream::plugins::StreamXmlPlugin::StreamXmlPlugin;
+use crate::streamnative::MarkdownInlineStream::{InlineToken, MarkdownInlineStream};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[repr(i32)]
@@ -34,6 +32,8 @@ pub enum MarkdownProcessorType {
     InlineLatex = 16,
     PlainText = 17,
     HtmlBreak = 18,
+    FootnoteReference = 19,
+    FootnoteDefinition = 20,
 }
 
 impl MarkdownProcessorType {
@@ -58,6 +58,8 @@ impl MarkdownProcessorType {
             16 => Some(Self::InlineLatex),
             17 => Some(Self::PlainText),
             18 => Some(Self::HtmlBreak),
+            19 => Some(Self::FootnoteReference),
+            20 => Some(Self::FootnoteDefinition),
             _ => None,
         }
     }
@@ -68,6 +70,7 @@ pub struct MarkdownNodeStable {
     pub r#type: MarkdownProcessorType,
     pub content: String,
     pub children: Vec<MarkdownNodeStable>,
+    pub link_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -103,14 +106,85 @@ impl Default for RunState {
 
 #[derive(Debug, Clone, Copy)]
 struct WaitforPending {
+    c: char,
+    at_start_of_line: bool,
     global_index: usize,
     should_emit: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PendingChar {
+    at_start_of_line: bool,
     c: char,
     global_index: usize,
+}
+
+struct RulePrefix {
+    marker: Option<char>,
+    count: usize,
+    valid: bool,
+}
+impl Default for RulePrefix {
+    fn default() -> Self {
+        Self {
+            marker: None,
+            count: 0,
+            valid: true,
+        }
+    }
+}
+impl RulePrefix {
+    fn push(&mut self, ch: char) {
+        if !self.valid || matches!(ch, ' ' | '\t' | '\r' | '\n') {
+            return;
+        }
+        if !matches!(ch, '-' | '*' | '_') || self.marker.is_some_and(|marker| marker != ch) {
+            self.valid = false;
+        } else {
+            self.marker = Some(ch);
+            self.count += 1;
+        }
+    }
+    fn count(&self) -> Option<usize> {
+        if self.valid && self.marker.is_some() {
+            Some(self.count)
+        } else {
+            None
+        }
+    }
+}
+
+/// Tracks literal delimiters before block dispatch, without buffering code text.
+/// The inline renderer remains responsible for producing the semantic spans.
+#[derive(Default)]
+struct InlineLiteralGuard {
+    code_ticks: usize,
+    pending_ticks: usize,
+    escaped: bool,
+}
+
+impl InlineLiteralGuard {
+    fn push(&mut self, c: char) -> bool {
+        if c == '`' && (self.code_ticks != 0 || !self.escaped) {
+            self.pending_ticks += 1;
+            return true;
+        }
+        if self.pending_ticks != 0 {
+            if self.code_ticks == 0 {
+                self.code_ticks = self.pending_ticks;
+            } else if self.code_ticks == self.pending_ticks {
+                self.code_ticks = 0;
+            }
+            self.pending_ticks = 0;
+        }
+        if self.code_ticks != 0 {
+            self.escaped = false;
+            return true;
+        }
+        let escaped = self.escaped;
+        self.escaped = !escaped && c == '\\';
+        escaped
+    }
 }
 
 pub struct MarkdownSession {
@@ -121,6 +195,8 @@ pub struct MarkdownSession {
     active_tag: MarkdownProcessorType,
     eval_start_global: Option<usize>,
     evaluation_buffer: Vec<char>,
+    rule_prefix: RulePrefix,
+    inline_literal: InlineLiteralGuard,
     evaluation_emit_mask: Vec<u32>,
     waitfor_active: bool,
     waitfor_at_start_of_line: bool,
@@ -141,6 +217,8 @@ impl MarkdownSession {
             active_tag: MarkdownProcessorType::PlainText,
             eval_start_global: None,
             evaluation_buffer: Vec::new(),
+            rule_prefix: RulePrefix::default(),
+            inline_literal: InlineLiteralGuard::default(),
             evaluation_emit_mask: Vec::new(),
             waitfor_active: false,
             waitfor_at_start_of_line: false,
@@ -157,20 +235,44 @@ impl MarkdownSession {
         let mut i = 0usize;
 
         while i < chars.len() || !self.pending_chars.is_empty() {
-            let (c, forced_index) = if let Some(pending) = self.pending_chars.pop_front() {
-                (pending.c, Some(pending.global_index))
+            let (c, forced_index, sol) = if let Some(pending) = self.pending_chars.pop_front() {
+                (
+                    pending.c,
+                    Some(pending.global_index),
+                    pending.at_start_of_line,
+                )
             } else {
                 let c = chars[i];
                 i += 1;
-                (c, None)
+                (c, None, at_start_of_line)
             };
-
-            let sol = at_start_of_line;
             at_start_of_line = c == '\n';
             self.process_one(c, sol, forced_index, &mut out, &mut run);
         }
 
         self.at_start_of_line = at_start_of_line;
+        Self::flush_run(&mut out, &mut run);
+        out
+    }
+
+    pub fn finish(&mut self) -> Vec<Segment> {
+        let mut out = Vec::new();
+        let mut run = RunState::default();
+        if let Some(start) = self.eval_start_global {
+            let tag = if self.rule_prefix.count().is_some_and(|count| count >= 3) {
+                MarkdownProcessorType::HorizontalRule
+            } else {
+                MarkdownProcessorType::PlainText
+            };
+            for offset in 0..self.evaluation_buffer.len() {
+                Self::emit_index(&mut out, tag, start + offset, &mut run);
+            }
+        }
+        self.clear_evaluation();
+        for pending in self.waitfor_pending.drain(..) {
+            Self::emit_index(&mut out, self.active_tag, pending.global_index, &mut run);
+        }
+        self.waitfor_active = false;
         Self::flush_run(&mut out, &mut run);
         out
     }
@@ -203,6 +305,8 @@ impl MarkdownSession {
                 self.waitfor_active = true;
                 self.waitfor_at_start_of_line = c == '\n';
                 self.waitfor_pending.push(WaitforPending {
+                    c,
+                    at_start_of_line,
                     global_index,
                     should_emit,
                 });
@@ -240,6 +344,17 @@ impl MarkdownSession {
             .plugin
             .process_char(c, self.waitfor_at_start_of_line);
 
+        if self.plugins[active_index].plugin.state() == PluginState::WaitFor {
+            self.waitfor_pending.push(WaitforPending {
+                c,
+                at_start_of_line: self.waitfor_at_start_of_line,
+                global_index,
+                should_emit: next_should_emit,
+            });
+            self.waitfor_at_start_of_line = c == '\n';
+            return;
+        }
+
         if self.plugins[active_index].plugin.state() == PluginState::Processing {
             for pending in self.waitfor_pending.drain(..) {
                 if pending.should_emit {
@@ -253,14 +368,23 @@ impl MarkdownSession {
             return;
         }
 
+        let mut replay = Vec::new();
         for pending in self.waitfor_pending.drain(..) {
-            if pending.should_emit {
-                Self::emit_index(
-                    out,
-                    MarkdownProcessorType::PlainText,
-                    pending.global_index,
-                    run,
-                );
+            if pending.c == '\n' && replay.is_empty() {
+                if pending.should_emit {
+                    Self::emit_index(
+                        out,
+                        MarkdownProcessorType::PlainText,
+                        pending.global_index,
+                        run,
+                    );
+                }
+            } else {
+                replay.push(PendingChar {
+                    c: pending.c,
+                    global_index: pending.global_index,
+                    at_start_of_line: pending.at_start_of_line,
+                });
             }
         }
         self.waitfor_active = false;
@@ -272,8 +396,14 @@ impl MarkdownSession {
             entry.plugin.reset();
         }
 
-        self.pending_chars
-            .push_front(PendingChar { c, global_index });
+        self.pending_chars.push_front(PendingChar {
+            c,
+            global_index,
+            at_start_of_line: self.waitfor_at_start_of_line,
+        });
+        for pending in replay.into_iter().rev() {
+            self.pending_chars.push_front(pending);
+        }
     }
 
     fn process_evaluation(
@@ -286,14 +416,28 @@ impl MarkdownSession {
     ) {
         if self.eval_start_global.is_none() {
             self.eval_start_global = Some(global_index);
+            self.rule_prefix.valid = at_start_of_line;
         }
 
+        // Backticks in XML attributes belong to that candidate, not to Markdown.
+        let xml_pending = self.plugins.iter().any(|entry| {
+            entry.tag == MarkdownProcessorType::XmlBlock
+                && entry.plugin.state() == PluginState::Trying
+        });
+        let literal = !xml_pending && self.inline_literal.push(c);
         self.evaluation_buffer.push(c);
+        self.rule_prefix.push(c);
         let mut emit_mask = 0u32;
         let mut successful = None::<usize>;
 
         for (index, entry) in self.plugins.iter_mut().enumerate() {
-            let should_emit = entry.plugin.process_char(c, at_start_of_line);
+            let should_emit = if literal && c == '<' && entry.tag == MarkdownProcessorType::XmlBlock
+            {
+                entry.plugin.reset();
+                true
+            } else {
+                entry.plugin.process_char(c, at_start_of_line)
+            };
             if should_emit {
                 emit_mask |= 1u32 << index;
             }
@@ -307,21 +451,47 @@ impl MarkdownSession {
             }
         }
 
-        if Self::is_html_break_full_match(&self.evaluation_buffer) {
+        if !literal && Self::is_html_break_full_match(&self.evaluation_buffer) {
             let start = self.eval_start_global.unwrap_or(global_index);
             for index in 0..self.evaluation_buffer.len() {
                 Self::emit_index(out, MarkdownProcessorType::HtmlBreak, start + index, run);
             }
             self.clear_evaluation();
+            self.inline_literal = InlineLiteralGuard::default();
             for entry in &mut self.plugins {
                 entry.plugin.reset();
             }
             return;
         }
 
+        if let Some(count) = self.rule_prefix.count() {
+            if self.evaluation_buffer.last() == Some(&'\n') && count >= 3 {
+                let start = self.eval_start_global.unwrap_or(global_index);
+                for offset in 0..self.evaluation_buffer.len() {
+                    Self::emit_index(
+                        out,
+                        MarkdownProcessorType::HorizontalRule,
+                        start + offset,
+                        run,
+                    );
+                }
+                Self::emit_break(out, global_index + 1, run);
+                self.clear_evaluation();
+                self.inline_literal = InlineLiteralGuard::default();
+                for entry in &mut self.plugins {
+                    entry.plugin.reset();
+                }
+                return;
+            }
+            if self.evaluation_buffer.last() != Some(&'\n') {
+                return;
+            }
+        }
+
         if let Some(index) = successful {
             self.active_index = Some(index);
             self.active_tag = self.plugins[index].tag;
+            self.inline_literal = InlineLiteralGuard::default();
             Self::flush_run(out, run);
 
             let start = self.eval_start_global.unwrap_or(global_index);
@@ -340,7 +510,7 @@ impl MarkdownSession {
             return;
         }
 
-        if Self::is_html_break_prefix(&self.evaluation_buffer) {
+        if !literal && Self::is_html_break_prefix(&self.evaluation_buffer) {
             return;
         }
 
@@ -363,6 +533,7 @@ impl MarkdownSession {
 
     fn clear_evaluation(&mut self) {
         self.evaluation_buffer.clear();
+        self.rule_prefix = RulePrefix::default();
         self.evaluation_emit_mask.clear();
         self.eval_start_global = None;
     }
@@ -429,23 +600,15 @@ impl MarkdownSession {
     }
 
     fn matches_case_insensitive_prefix(buffer: &[char], pattern: &str) -> bool {
-        let pattern_chars = pattern.chars().collect::<Vec<_>>();
-        if buffer.len() > pattern_chars.len() {
-            return false;
-        }
-        buffer
-            .iter()
-            .zip(pattern_chars.iter())
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        buffer.len() <= pattern.len()
+            && buffer
+                .iter()
+                .zip(pattern.bytes())
+                .all(|(left, right)| left.eq_ignore_ascii_case(&(right as char)))
     }
 
     fn matches_case_insensitive_full(buffer: &[char], pattern: &str) -> bool {
-        let pattern_chars = pattern.chars().collect::<Vec<_>>();
-        buffer.len() == pattern_chars.len()
-            && buffer
-                .iter()
-                .zip(pattern_chars.iter())
-                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        buffer.len() == pattern.len() && Self::matches_case_insensitive_prefix(buffer, pattern)
     }
 }
 
@@ -459,8 +622,8 @@ impl NativeMarkdownSplitter {
     }
 
     /// Creates the inline Markdown parser session.
-    pub fn create_inline_session() -> MarkdownSession {
-        MarkdownSession::new(Self::get_inline_plugins())
+    pub fn create_inline_session() -> MarkdownInlineStream {
+        MarkdownInlineStream::default()
     }
 
     /// Creates a stream session that emits only an XML block's inner content.
@@ -473,6 +636,10 @@ impl NativeMarkdownSplitter {
 
     fn get_block_plugins() -> Vec<PluginEntry> {
         vec![
+            PluginEntry {
+                plugin: Box::new(StreamMarkdownFootnoteDefinitionPlugin::default()),
+                tag: MarkdownProcessorType::FootnoteDefinition,
+            },
             PluginEntry {
                 plugin: Box::new(StreamMarkdownHeaderPlugin::new(true)),
                 tag: MarkdownProcessorType::Header,
@@ -490,12 +657,8 @@ impl NativeMarkdownSplitter {
                 tag: MarkdownProcessorType::OrderedList,
             },
             PluginEntry {
-                plugin: Box::new(StreamMarkdownUnorderedListPlugin::new(false)),
+                plugin: Box::new(StreamMarkdownUnorderedListPlugin::new(true)),
                 tag: MarkdownProcessorType::UnorderedList,
-            },
-            PluginEntry {
-                plugin: Box::new(StreamMarkdownHorizontalRulePlugin::new(true)),
-                tag: MarkdownProcessorType::HorizontalRule,
             },
             PluginEntry {
                 plugin: Box::new(StreamMarkdownBlockLaTeXPlugin::new(false)),
@@ -520,66 +683,75 @@ impl NativeMarkdownSplitter {
         ]
     }
 
-    fn get_inline_plugins() -> Vec<PluginEntry> {
-        vec![
-            PluginEntry {
-                plugin: Box::new(StreamMarkdownBoldPlugin::new(false)),
-                tag: MarkdownProcessorType::Bold,
-            },
-            PluginEntry {
-                plugin: Box::new(StreamMarkdownItalicPlugin::new(false)),
-                tag: MarkdownProcessorType::Italic,
-            },
-            PluginEntry {
-                plugin: Box::new(StreamMarkdownInlineCodePlugin::new(false)),
-                tag: MarkdownProcessorType::InlineCode,
-            },
-            PluginEntry {
-                plugin: Box::new(StreamMarkdownLinkPlugin::default()),
-                tag: MarkdownProcessorType::Link,
-            },
-            PluginEntry {
-                plugin: Box::new(StreamMarkdownStrikethroughPlugin::new(false)),
-                tag: MarkdownProcessorType::Strikethrough,
-            },
-            PluginEntry {
-                plugin: Box::new(StreamMarkdownUnderlinePlugin::new(true)),
-                tag: MarkdownProcessorType::Underline,
-            },
-            PluginEntry {
-                plugin: Box::new(StreamMarkdownInlineLaTeXPlugin::new(false)),
-                tag: MarkdownProcessorType::InlineLatex,
-            },
-            PluginEntry {
-                plugin: Box::new(StreamMarkdownInlineParenLaTeXPlugin::new(true)),
-                tag: MarkdownProcessorType::InlineLatex,
-            },
-        ]
-    }
-
     pub fn parse_inline_to_stable_nodes(content: &str) -> Vec<MarkdownNodeStable> {
-        if content.is_empty() {
-            return Vec::new();
-        }
-        let mut session = Self::create_inline_session();
-        Self::segments_to_stable_nodes(content, session.push(content), false)
+        Self::native_markdown_split_by_inline(content)
     }
 
     pub fn native_markdown_split_by_block(content: &str) -> Vec<MarkdownNodeStable> {
         let mut session = Self::create_block_session();
-        Self::segments_to_stable_nodes(content, session.push(content), true)
+        let mut segments = session.push(content);
+        segments.extend(session.finish());
+        Self::segments_to_stable_nodes(content, segments, true)
     }
 
     pub fn native_markdown_split_by_inline(content: &str) -> Vec<MarkdownNodeStable> {
         let mut session = Self::create_inline_session();
-        Self::segments_to_stable_nodes(content, session.push(content), false)
+        let mut tokens = session.push(content);
+        tokens.extend(session.finish());
+        let mut stack = vec![MarkdownNodeStable {
+            r#type: MarkdownProcessorType::PlainText,
+            content: String::new(),
+            children: Vec::new(),
+            link_url: None,
+        }];
+        for token in tokens {
+            match token {
+                InlineToken::Open(kind, link_url) => stack.push(MarkdownNodeStable {
+                    r#type: kind.processor_type(),
+                    content: String::new(),
+                    children: Vec::new(),
+                    link_url,
+                }),
+                InlineToken::Close => {
+                    if stack.len() > 1 {
+                        let node = stack.pop().unwrap();
+                        stack.last_mut().unwrap().children.push(node);
+                    }
+                }
+                InlineToken::Text(kind, text) => {
+                    for parent in &mut stack {
+                        parent.content.push_str(&text);
+                    }
+                    let children = &mut stack.last_mut().unwrap().children;
+                    if let Some(last) = children.last_mut().filter(|last| {
+                        last.r#type == kind.processor_type() && last.children.is_empty()
+                    }) {
+                        last.content.push_str(&text);
+                    } else {
+                        children.push(MarkdownNodeStable {
+                            r#type: kind.processor_type(),
+                            content: text,
+                            children: Vec::new(),
+                            link_url: None,
+                        });
+                    }
+                }
+            }
+        }
+        stack.pop().unwrap().children
     }
 
+    /// Converts character-indexed parser segments into nodes in linear total slice work.
     fn segments_to_stable_nodes(
         content: &str,
         segments: Vec<Segment>,
         parse_inline_children: bool,
     ) -> Vec<MarkdownNodeStable> {
+        let charByteOffsets = content
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(content.len()))
+            .collect::<Vec<_>>();
         let mut nodes = Vec::new();
         for segment in segments {
             if segment.r#type < 0 {
@@ -587,13 +759,14 @@ impl NativeMarkdownSplitter {
             }
             let node_type = MarkdownProcessorType::from_ordinal(segment.r#type)
                 .unwrap_or(MarkdownProcessorType::PlainText);
-            if segment.start > segment.end || segment.end > content.chars().count() {
-                continue;
-            }
+            assert!(
+                segment.start <= segment.end && segment.end < charByteOffsets.len(),
+                "Markdown segment must have valid character offsets"
+            );
             let node_content = if node_type == MarkdownProcessorType::HtmlBreak {
                 "\n".to_string()
             } else {
-                char_slice(content, segment.start, segment.end)
+                content[charByteOffsets[segment.start]..charByteOffsets[segment.end]].to_string()
             };
             if node_content.is_empty() {
                 continue;
@@ -607,6 +780,7 @@ impl NativeMarkdownSplitter {
                 r#type: node_type,
                 content: node_content,
                 children,
+                link_url: None,
             });
         }
         nodes
@@ -614,16 +788,55 @@ impl NativeMarkdownSplitter {
 
     fn is_inline_container(block_type: MarkdownProcessorType) -> bool {
         block_type != MarkdownProcessorType::CodeBlock
+            && block_type != MarkdownProcessorType::Image
             && block_type != MarkdownProcessorType::BlockLatex
             && block_type != MarkdownProcessorType::Table
             && block_type != MarkdownProcessorType::XmlBlock
     }
 }
 
-fn char_slice(content: &str, start: usize, end: usize) -> String {
-    content
-        .chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_blocks_remain_literal_without_link_children() {
+        let image = "![](operit_art.jpg)";
+        let nodes = NativeMarkdownSplitter::native_markdown_split_by_block(image);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].r#type, MarkdownProcessorType::Image);
+        assert_eq!(nodes[0].content, image);
+        assert!(nodes[0].children.is_empty());
+    }
+
+    /// Extracts multibyte segments through character-aligned UTF-8 boundaries.
+    #[test]
+    fn stable_nodes_preserve_multibyte_segment_boundaries() {
+        let content = "a🌙汉e\u{301}**粗**";
+        let segments = vec![
+            Segment {
+                r#type: MarkdownProcessorType::PlainText as i32,
+                start: 0,
+                end: 2,
+            },
+            Segment {
+                r#type: MarkdownProcessorType::PlainText as i32,
+                start: 1,
+                end: 3,
+            },
+            Segment {
+                r#type: MarkdownProcessorType::PlainText as i32,
+                start: 7,
+                end: 10,
+            },
+        ];
+        let nodes = NativeMarkdownSplitter::segments_to_stable_nodes(content, segments, false);
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a🌙", "🌙汉", "粗**"]
+        );
+    }
 }

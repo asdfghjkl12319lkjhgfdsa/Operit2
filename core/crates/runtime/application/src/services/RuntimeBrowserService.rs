@@ -254,16 +254,17 @@ impl RuntimeBrowserService {
 
     /// Lists browser sessions currently owned by the owner host.
     #[allow(non_snake_case)]
-    pub fn listBrowserSessions(&self) -> Result<Vec<RuntimeBrowserSessionInfo>, String> {
+    pub async fn listBrowserSessions(&self) -> Result<Vec<RuntimeBrowserSessionInfo>, String> {
         self.browserSessionHost
             .listBrowserSessions()
+            .await
             .map(runtime_browser_session_infos)
             .map_err(|error| error.message)
     }
 
     /// Creates a browser session on the owner host.
     #[allow(non_snake_case)]
-    pub fn createBrowserSession(
+    pub async fn createBrowserSession(
         &self,
         initialUrl: String,
         userAgent: Option<String>,
@@ -272,6 +273,7 @@ impl RuntimeBrowserService {
         let session = self
             .browserSessionHost
             .createBrowserSession(&initialUrl, userAgent.as_deref(), headers)
+            .await
             .map(runtime_browser_session_info)
             .map_err(|error| error.message)?;
         browser_event_stream(&session.sessionId);
@@ -291,7 +293,7 @@ impl RuntimeBrowserService {
 
     /// Updates browser session metadata on the owner host.
     #[allow(non_snake_case)]
-    pub fn updateBrowserSession(
+    pub async fn updateBrowserSession(
         &self,
         sessionId: String,
         userAgent: Option<String>,
@@ -299,6 +301,7 @@ impl RuntimeBrowserService {
     ) -> Result<RuntimeBrowserSessionInfo, String> {
         self.browserSessionHost
             .updateBrowserSession(&sessionId, userAgent.as_deref(), headers)
+            .await
             .map(runtime_browser_session_info)
             .map_err(|error| error.message)
     }
@@ -311,7 +314,7 @@ impl RuntimeBrowserService {
 
     /// Submits one semantic browser command to the owner host.
     #[allow(non_snake_case)]
-    pub fn submitBrowserCommand(
+    pub async fn submitBrowserCommand(
         &self,
         command: RuntimeBrowserCommand,
     ) -> Result<RuntimeBrowserCommandResult, String> {
@@ -319,18 +322,20 @@ impl RuntimeBrowserService {
         let log_context = (command.action != BROWSER_RUNTIME_INTERACTION_ACTION)
             .then(|| (command.action.clone(), command.sessionId.clone()));
         if let Some((action, session_id)) = log_context.as_ref() {
-            AppLogger::i(
+            AppLogger::v_with_level(
                 BROWSER_RUNTIME_LOG_TAG,
                 &format!("command start action={} session={:?}", action, session_id),
+                operit_util::AppLogger::VERBOSE_LEVEL_3,
             );
         }
         let result = self
             .browserSessionHost
             .submitBrowserCommand(host_browser_session_command(command))
+            .await
             .map(runtime_browser_command_result)
             .map_err(|error| error.message)?;
         if let Some((action, session_id)) = log_context.as_ref() {
-            AppLogger::i(
+            AppLogger::v_with_level(
                 BROWSER_RUNTIME_LOG_TAG,
                 &format!(
                     "command done action={} session={:?} elapsedMs={}",
@@ -338,6 +343,7 @@ impl RuntimeBrowserService {
                     session_id,
                     currentTimeMillis() - startedAtMillis
                 ),
+                operit_util::AppLogger::VERBOSE_LEVEL_3,
             );
         }
         Ok(result)
@@ -350,22 +356,20 @@ impl RuntimeBrowserService {
         mut commands: ReverseStream<RuntimeBrowserCommand>,
     ) -> Result<(), String> {
         let mut interactionError = None;
-        commands
-            .collect(&mut |command| {
-                if interactionError.is_some() {
-                    return;
-                }
-                if command.action != BROWSER_RUNTIME_INTERACTION_ACTION {
-                    interactionError = Some(
-                        "browser interaction stream received a non-interaction command".to_string(),
-                    );
-                    return;
-                }
-                if let Err(error) = self.submitBrowserCommand(command) {
-                    interactionError = Some(error);
-                }
-            })
-            .await;
+        while let Some(command) = commands.recv().await {
+            if interactionError.is_some() {
+                continue;
+            }
+            if command.action != BROWSER_RUNTIME_INTERACTION_ACTION {
+                interactionError = Some(
+                    "browser interaction stream received a non-interaction command".to_string(),
+                );
+                continue;
+            }
+            if let Err(error) = self.submitBrowserCommand(command).await {
+                interactionError = Some(error);
+            }
+        }
         match interactionError {
             Some(error) => Err(error),
             None => Ok(()),
@@ -374,12 +378,13 @@ impl RuntimeBrowserService {
 
     /// Returns the latest browser session snapshot for a controller.
     #[allow(non_snake_case)]
-    pub fn getBrowserSessionSnapshot(
+    pub async fn getBrowserSessionSnapshot(
         &self,
         sessionId: String,
     ) -> Result<RuntimeBrowserSessionSnapshot, String> {
         self.browserSessionHost
             .getBrowserSessionSnapshot(&sessionId)
+            .await
             .map(runtime_browser_session_snapshot)
             .map_err(|error| error.message)
     }
@@ -395,10 +400,11 @@ impl RuntimeBrowserService {
 
     /// Explicitly closes a browser session on the owner host.
     #[allow(non_snake_case)]
-    pub fn closeBrowserSession(&self, sessionId: String) -> Result<(), String> {
+    pub async fn closeBrowserSession(&self, sessionId: String) -> Result<(), String> {
         let result = self
             .browserSessionHost
             .closeBrowserSession(&sessionId)
+            .await
             .map(runtime_browser_command_result)
             .map_err(|error| error.message)?;
         publish_browser_event(RuntimeBrowserSessionEvent {

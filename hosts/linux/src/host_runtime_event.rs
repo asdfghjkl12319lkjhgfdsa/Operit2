@@ -1,12 +1,12 @@
 #![allow(non_snake_case)]
 
+use operit_host_native_common::{scheduleNativeServiceTasks, NativeTaskHandle as JoinHandle};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
 };
-use std::thread::{self, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use operit_host_api::{
     logHostError, HostError, HostResult, HostRuntimeEventHost, HostRuntimeEventRegistration,
@@ -41,6 +41,8 @@ impl LinuxHostRuntimeEventHost {
 pub struct LinuxHostRuntimeEventRegistration {
     running: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
+    systemConnection: Option<Connection>,
+    sessionConnection: Option<Connection>,
 }
 
 impl HostRuntimeEventRegistration for LinuxHostRuntimeEventRegistration {}
@@ -48,13 +50,29 @@ impl HostRuntimeEventRegistration for LinuxHostRuntimeEventRegistration {}
 impl Drop for LinuxHostRuntimeEventRegistration {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        // Blocking workers park inside the message iterator until the next
+        // signal shows up, so closing each bus connection is what wakes them.
+        // A quiet bus can still leave a worker parked, so the join itself is
+        // bounded: no shutdown path may block process exit forever.
+        for connection in self
+            .systemConnection
+            .take()
+            .into_iter()
+            .chain(self.sessionConnection.take())
+        {
+            let _ = connection.close();
+        }
+        let workers = std::mem::take(&mut self.workers);
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        for worker in workers {
+            let _ =
+                worker.join_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
         }
     }
 }
 
 impl HostRuntimeEventHost for LinuxHostRuntimeEventHost {
+    /// Starts both bus readers as one admitted service group with owned shutdown.
     fn startHostRuntimeEventStream(
         &self,
         sink: HostRuntimeEventSink,
@@ -64,55 +82,64 @@ impl HostRuntimeEventHost for LinuxHostRuntimeEventHost {
         let sessionRunning = running.clone();
         let systemSink = sink.clone();
         let sessionSink = sink.clone();
-        let (systemSender, systemReceiver) = mpsc::channel::<Result<(), String>>();
-        let (sessionSender, sessionReceiver) = mpsc::channel::<Result<(), String>>();
-        let systemWorker = thread::Builder::new()
-            .name("operit-linux-host-runtime-event-system".to_string())
-            .spawn(move || run_system_dbus_event_loop(systemSink, systemRunning, systemSender))
-            .map_err(|error| {
-                HostError::new(format!("spawn linux system event worker failed: {error}"))
-            })?;
-        let sessionWorker = thread::Builder::new()
-            .name("operit-linux-host-runtime-event-session".to_string())
-            .spawn(move || run_session_dbus_event_loop(sessionSink, sessionRunning, sessionSender))
-            .map_err(|error| {
-                HostError::new(format!("spawn linux session event worker failed: {error}"))
-            })?;
+        let (systemSender, systemReceiver) = mpsc::channel::<Result<Connection, String>>();
+        let (sessionSender, sessionReceiver) = mpsc::channel::<Result<Connection, String>>();
+        let systemConnection = Connection::system()
+            .map_err(|error| HostError::new(format!("connect system dbus failed: {error}")))?;
+        let sessionConnection = Connection::session()
+            .map_err(|error| HostError::new(format!("connect session dbus failed: {error}")))?;
+        let systemReader = systemConnection.clone();
+        let sessionReader = sessionConnection.clone();
+        let workers = scheduleNativeServiceTasks(
+            "linux-host-runtime-events",
+            vec![
+                Box::new(move || {
+                    run_system_dbus_event_loop(
+                        systemSink,
+                        systemRunning,
+                        systemSender,
+                        systemReader,
+                    )
+                }),
+                Box::new(move || {
+                    run_session_dbus_event_loop(
+                        sessionSink,
+                        sessionRunning,
+                        sessionSender,
+                        sessionReader,
+                    )
+                }),
+            ],
+        )?;
+        let registration = LinuxHostRuntimeEventRegistration {
+            running,
+            workers,
+            systemConnection: Some(systemConnection),
+            sessionConnection: Some(sessionConnection),
+        };
         systemReceiver
             .recv()
             .map_err(|error| {
-                HostError::new(format!(
-                    "receive linux system event init result failed: {error}"
-                ))
+                HostError::new(format!("receive system event initialization: {error}"))
             })?
             .map_err(HostError::new)?;
         sessionReceiver
             .recv()
             .map_err(|error| {
-                HostError::new(format!(
-                    "receive linux session event init result failed: {error}"
-                ))
+                HostError::new(format!("receive session event initialization: {error}"))
             })?
             .map_err(HostError::new)?;
-        Ok(Box::new(LinuxHostRuntimeEventRegistration {
-            running,
-            workers: vec![systemWorker, sessionWorker],
-        }))
+        Ok(Box::new(registration))
     }
 }
 
+/// Receives one system bus signal stream on admitted Host service capacity.
 fn run_system_dbus_event_loop(
     sink: HostRuntimeEventSink,
     running: Arc<AtomicBool>,
-    init: mpsc::Sender<Result<(), String>>,
+    init: mpsc::Sender<Result<Connection, String>>,
+    connection: Connection,
 ) {
-    let connection = match Connection::system() {
-        Ok(connection) => connection,
-        Err(error) => {
-            let _ = init.send(Err(format!("connect system dbus failed: {error}")));
-            return;
-        }
-    };
     let rule = MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .build();
@@ -125,13 +152,21 @@ fn run_system_dbus_event_loop(
             return;
         }
     };
-    let _ = init.send(Ok(()));
+    let _ = init.send(Ok(connection.clone()));
+    emit_network_state(&sink, &connection);
     while running.load(Ordering::SeqCst) {
         let Some(message) = iterator.next() else {
             break;
         };
         match message {
             Ok(message) => {
+                if message
+                    .header()
+                    .path()
+                    .is_some_and(|path| path.as_str() == "/org/freedesktop/NetworkManager")
+                {
+                    emit_network_state(&sink, &connection);
+                }
                 let path = message
                     .header()
                     .path()
@@ -157,18 +192,13 @@ fn run_system_dbus_event_loop(
     }
 }
 
+/// Receives one system bus signal stream on admitted Host service capacity.
 fn run_session_dbus_event_loop(
     sink: HostRuntimeEventSink,
     running: Arc<AtomicBool>,
-    init: mpsc::Sender<Result<(), String>>,
+    init: mpsc::Sender<Result<Connection, String>>,
+    connection: Connection,
 ) {
-    let connection = match Connection::session() {
-        Ok(connection) => connection,
-        Err(error) => {
-            let _ = init.send(Err(format!("connect session dbus failed: {error}")));
-            return;
-        }
-    };
     let rule = MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .build();
@@ -181,7 +211,7 @@ fn run_session_dbus_event_loop(
             return;
         }
     };
-    let _ = init.send(Ok(()));
+    let _ = init.send(Ok(connection.clone()));
     while running.load(Ordering::SeqCst) {
         let Some(message) = iterator.next() else {
             break;
@@ -364,18 +394,6 @@ fn handle_network_manager_changed(
     path: &str,
     changed: &HashMap<String, OwnedValue>,
 ) {
-    if let Some(state) = prop_u64(changed, "State") {
-        emit(
-            sink,
-            "system.network.changed",
-            serde_json::json!({
-                "connected": state >= 50,
-                "networkType": if state >= 50 { "other" } else { "none" },
-                "metered": null,
-                "interfaceName": null,
-            }),
-        );
-    }
     let wirelessEnabled = prop_bool(changed, "WirelessEnabled");
     let wwanEnabled = prop_bool(changed, "WwanEnabled");
     if let (Some(wirelessEnabled), Some(wwanEnabled)) = (wirelessEnabled, wwanEnabled) {
@@ -387,6 +405,49 @@ fn handle_network_manager_changed(
             }),
         );
     }
+}
+
+/// Resolves the active NetworkManager transport and explicit connection cost.
+fn emit_network_state(sink: &HostRuntimeEventSink, connection: &Connection) {
+    let snapshot = || -> zbus::Result<(bool, String, Option<bool>)> {
+        let manager = zbus::blocking::Proxy::new(
+            connection,
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager",
+            NETWORK_MANAGER_INTERFACE,
+        )?;
+        let connected = manager.get_property::<u32>("State")? == 70;
+        if !connected {
+            return Ok((false, "none".into(), None));
+        }
+        let path = manager.get_property::<OwnedObjectPath>("PrimaryConnection")?;
+        let active = zbus::blocking::Proxy::new(
+            connection,
+            "org.freedesktop.NetworkManager",
+            path.as_str(),
+            "org.freedesktop.NetworkManager.Connection.Active",
+        )?;
+        let transport = match active.get_property::<String>("Type")?.as_str() {
+            "802-11-wireless" => "wifi",
+            "802-3-ethernet" => "ethernet",
+            "gsm" | "cdma" => "cellular",
+            "vpn" | "wireguard" => "vpn",
+            _ => "other",
+        };
+        let metered = match manager.get_property::<u32>("Metered")? {
+            1 | 4 => Some(false),
+            2 | 3 => Some(true),
+            _ => None,
+        };
+        Ok((true, transport.into(), metered))
+    };
+    let payload = match snapshot() {
+        Ok((connected, transport, metered)) => serde_json::json!({
+            "connected": connected, "networkType": transport, "metered": metered,
+        }),
+        Err(_) => serde_json::json!({"connected": false, "networkType": "none", "metered": null}),
+    };
+    emit(sink, "system.network.changed", payload);
 }
 
 fn handle_screensaver_active_changed(

@@ -256,6 +256,8 @@ pub struct ComposeGeneratedLazyColumnProps {
 }
 /// Properties configuring a horizontally scrolling lazy list that composes visible child content.
 pub struct ComposeGeneratedLazyRowProps {
+    /// Optional viewport protocol supplied by lazyItems for generated content.
+    pub viewport: Option<ComposeLazyViewport>,
     /// Common layout, sizing, semantics, and modifier properties applied to this node.
     pub base_compose_common_props: ComposeCommonProps,
     /// Child nodes rendered inside the component.
@@ -1533,6 +1535,8 @@ pub struct ComposeGeneratedImageProps {
     pub base_compose_common_props: ComposeCommonProps,
     /// Opacity applied to the rendered node, from transparent to fully opaque.
     pub alpha: Option<f64>,
+    /// Playback identity for an animated VFS resource; change it to restart decoding from the first frame. Keep it stable across unrelated renders.
+    pub animationKey: Option<String>,
     /// Alignment used to position child content within the available bounds.
     pub contentAlignment: Option<ComposeAlignment>,
     /// Accessible description announced for non-text visual content.

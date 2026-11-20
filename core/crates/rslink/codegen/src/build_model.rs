@@ -61,6 +61,7 @@ pub enum ObjectAccess {
     ContextRefGetInstanceArcMutexConstruct,
     CoreProxyConstruct,
     CoreNodeLocalRuntimeConstruct,
+    ResultCoreNodeLocalRuntimeConstruct,
     StorePathsConstruct,
     ResultStorePathsConstruct,
     FactoryMethodConstruct {
@@ -91,6 +92,7 @@ impl ObjectAccess {
                 | ObjectAccess::ContextRefGetInstanceArcMutexConstruct
                 | ObjectAccess::CoreProxyConstruct
                 | ObjectAccess::CoreNodeLocalRuntimeConstruct
+                | ObjectAccess::ResultCoreNodeLocalRuntimeConstruct
                 | ObjectAccess::StorePathsConstruct
                 | ObjectAccess::ResultStorePathsConstruct
                 | ObjectAccess::FactoryMethodConstruct { .. }
@@ -214,6 +216,8 @@ pub struct SourceMethod {
     pub args: Vec<SourceArg>,
     pub rust_return_type: String,
     pub is_async: bool,
+    /// Marks a synchronous capture method returning an explicitly owned future.
+    pub returns_owned_future: bool,
     pub cfg_attrs: Vec<String>,
     pub doc_lines: Vec<String>,
     pub protocol: MethodProtocol,

@@ -25,25 +25,17 @@ DIST_DIR = SCRIPT_DIR / "dist"
 WORK_DIR = SCRIPT_DIR / "work"
 SECRETS_DIR = SCRIPT_DIR / "secrets"
 FLUTTER_APP_DIR = REPO_ROOT / "apps" / "flutter" / "app"
-WEB_ACCESS_BUNDLE_DIR = REPO_ROOT / "apps" / "web_access" / "build" / "bundle"
-WEB_ACCESS_EMBEDDED_ASSETS_DIR = FLUTTER_APP_DIR / "assets" / "web_access"
-WEB_ACCESS_ASSET_DECLARATION_PREFIX = "    - path: assets/web_access/"
-WEB_ACCESS_VERSION_FILE = "web_access_version.json"
-WEB_ACCESS_REQUIRED_FILES = (
-    "index.html",
-    "main.dart.js",
-    "operit_flutter_bridge.js",
-    "operit_flutter_bridge_bg.wasm",
-    "sql-wasm.js",
-    "sql-wasm.wasm",
-    WEB_ACCESS_VERSION_FILE,
-)
 PUBSPEC_PATH = FLUTTER_APP_DIR / "pubspec.yaml"
 ANDROID_DIR = FLUTTER_APP_DIR / "android"
 ANDROID_LOCAL_PROPERTIES = ANDROID_DIR / "local.properties"
 CLI_MANIFEST = REPO_ROOT / "apps" / "cli" / "Cargo.toml"
 RUNTIME_MANIFEST = REPO_ROOT / "core" / "crates" / "runtime" / "application" / "Cargo.toml"
 BUILD_SCRIPTS_DIR = REPO_ROOT / "tools" / "build_scripts"
+sys.path.insert(0, str(BUILD_SCRIPTS_DIR))
+from common import prepare_plugin_assets, verify_cli_plugin_assets
+from cargo_build import cargo_build_environment
+from models_dev_bundle import prepare_build_catalog
+from release_artifacts import release_asset_name, validate_release_assets
 DEFAULT_GITHUB_ENV = SECRETS_DIR / "github.env"
 DEFAULT_RELEASE_REPO = "AAswordman/Operit2"
 SEMVER_RE = re.compile(
@@ -127,11 +119,6 @@ class CliArchMode(ValueEnum):
     ALL = "all"
 
 
-class CliWebAssetMode(ValueEnum):
-    EMBEDDED = "embedded"
-    EXTERNAL = "external"
-
-
 @dataclass(frozen=True)
 class CliBuildTarget:
     platform: HostPlatform
@@ -148,7 +135,6 @@ CLI_RUST_TARGETS = {
     (HostPlatform.MACOS, "aarch64"): "aarch64-apple-darwin",
 }
 CLI_RELEASE_ARCHES = ("x86_64", "aarch64")
-CLI_WEB_ASSET_MODES = tuple(item.value for item in CliWebAssetMode)
 CLI_ALL_TARGETS = tuple(
     CliBuildTarget(platform=plat, arch=arch, rust_target=CLI_RUST_TARGETS[(plat, arch)])
     for plat in HostPlatform
@@ -158,6 +144,9 @@ CLI_ALL_TARGETS = tuple(
 
 def run(command, cwd=REPO_ROOT, env=None):
     print(">> " + " ".join(str(part) for part in command), flush=True)
+    if Path(command[0]).name.lower() in ("cargo", "cargo.exe"):
+        prepare_build_catalog(command)
+        env = cargo_build_environment(command, os.environ if env is None else env, cwd=cwd)
     subprocess.run([str(part) for part in command], cwd=cwd, env=env, check=True)
 
 
@@ -308,41 +297,6 @@ def reset_dir(path):
     path.mkdir(parents=True, exist_ok=True)
     for child in list(path.iterdir()):
         remove_release_path(child)
-
-
-# Verifies the shared Web Access bundle has been generated.
-def require_web_access_bundle():
-    missing_files = [
-        name for name in WEB_ACCESS_REQUIRED_FILES if not (WEB_ACCESS_BUNDLE_DIR / name).is_file()
-    ]
-    if missing_files:
-        raise RuntimeError(
-            "Web Access bundle is incomplete at "
-            f"{WEB_ACCESS_BUNDLE_DIR}; missing: {', '.join(missing_files)}. "
-            "Run tools/build_scripts/build_flutter_web_access.py before building this product."
-        )
-
-    if WEB_ACCESS_EMBEDDED_ASSETS_DIR.is_symlink():
-        WEB_ACCESS_EMBEDDED_ASSETS_DIR.unlink()
-    elif WEB_ACCESS_EMBEDDED_ASSETS_DIR.exists():
-        shutil.rmtree(WEB_ACCESS_EMBEDDED_ASSETS_DIR)
-    WEB_ACCESS_EMBEDDED_ASSETS_DIR.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(WEB_ACCESS_BUNDLE_DIR, WEB_ACCESS_EMBEDDED_ASSETS_DIR)
-
-    declared_paths = []
-    for line in PUBSPEC_PATH.read_text(encoding="utf-8").splitlines():
-        if line.startswith(WEB_ACCESS_ASSET_DECLARATION_PREFIX):
-            relative_path = line.removeprefix("    - path: ").rstrip("/")
-            declared_paths.append(FLUTTER_APP_DIR / Path(relative_path))
-    if not declared_paths:
-        raise RuntimeError(f"No Web Access asset directories are declared in {PUBSPEC_PATH}")
-
-    missing_directories = [path for path in declared_paths if not path.is_dir()]
-    if missing_directories:
-        raise RuntimeError(
-            "Embedded Web Access asset directories declared in pubspec.yaml are missing: "
-            + ", ".join(str(path) for path in missing_directories)
-        )
 
 
 def remove_release_path(path):
@@ -566,16 +520,13 @@ def copy_required_file(source, destination):
     shutil.copy2(source, destination)
 
 
+# Creates a ZIP archive while preserving the complete versioned filename.
 def compress_zip(source_dir, destination):
     if not source_dir.exists():
         raise RuntimeError(f"Expected build directory not found: {source_dir}")
     if destination.exists():
         destination.unlink()
     shutil.make_archive(str(destination.with_suffix("")), "zip", source_dir)
-    produced = destination.with_suffix("")
-    produced = produced.with_suffix(".zip")
-    if produced != destination:
-        produced.replace(destination)
 
 
 def compress_tar_gz(source_dir, destination):
@@ -736,36 +687,15 @@ def cli_archive_extension(target_platform):
     return "zip" if target_platform == HostPlatform.WINDOWS else "tar.gz"
 
 
-# Returns the package name suffix for the selected Web Access asset mode.
-def cli_web_asset_package_suffix(web_assets):
-    web_assets = CliWebAssetMode(web_assets)
-    if web_assets == CliWebAssetMode.EMBEDDED:
-        return ""
-    if web_assets == CliWebAssetMode.EXTERNAL:
-        return "-external-web"
-    raise RuntimeError(f"Unsupported CLI Web Access asset mode: {web_assets}")
-
-
-# Returns the cargo feature arguments for the selected Web Access asset mode.
-def cli_web_asset_cargo_args(web_assets):
-    web_assets = CliWebAssetMode(web_assets)
-    if web_assets == CliWebAssetMode.EMBEDDED:
-        return []
-    if web_assets == CliWebAssetMode.EXTERNAL:
-        return ["--no-default-features"]
-    raise RuntimeError(f"Unsupported CLI Web Access asset mode: {web_assets}")
-
-
 # Returns the working directory for one packaged CLI target.
-def cli_package_dir(target, web_assets=CliWebAssetMode.EMBEDDED):
-    return WORK_DIR / f"cli-{target.platform}-{target.arch}{cli_web_asset_package_suffix(web_assets)}"
+def cli_package_dir(target):
+    return WORK_DIR / f"cli-{target.platform}-{target.arch}"
 
 
 # Returns the release archive path for one packaged CLI target.
-def cli_package_path(target, web_assets=CliWebAssetMode.EMBEDDED):
-    return DIST_DIR / (
-        f"operit2-cli-{target.platform}-{target.arch}"
-        f"{cli_web_asset_package_suffix(web_assets)}.{cli_archive_extension(target.platform)}"
+def cli_package_path(target):
+    return DIST_DIR / release_asset_name(
+        "cli", str(target.platform), target.arch, cli_archive_extension(target.platform)
     )
 
 
@@ -878,8 +808,8 @@ def wsl_single_quote(value):
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+# Builds the Linux App in WSL with the shared versioned release filename.
 def build_wsl_linux_app(distro, build_name, build_number):
-    require_web_access_bundle()
     if not wsl_check_command(distro, "dart"):
         raise RuntimeError(
             "WSL Linux app build requires Dart on PATH to start FVM."
@@ -890,6 +820,7 @@ def build_wsl_linux_app(distro, build_name, build_number):
     dist = shlex.quote(windows_path_to_wsl(DIST_DIR))
     build_name_arg = shlex.quote(build_name)
     build_number_arg = shlex.quote(build_number)
+    package = shlex.quote(windows_path_to_wsl(DIST_DIR / release_asset_name("app", "linux", "x86_64", "tar.gz")))
     script = f"""
 set -e
 cd {repo}
@@ -901,8 +832,8 @@ rm -rf build/linux/x64/release
 fvm flutter build linux --release --no-pub --build-name {build_name_arg} --build-number {build_number_arg}
 cd {repo}
 mkdir -p {dist}
-rm -f {dist}/operit2-app-linux-x86_64.tar.gz
-tar -czf {dist}/operit2-app-linux-x86_64.tar.gz -C apps/flutter/app/build/linux/x64/release/bundle .
+rm -f {package}
+tar -czf {package} -C apps/flutter/app/build/linux/x64/release/bundle .
 """
     wsl_run(distro, script)
 
@@ -914,7 +845,8 @@ def build_wsl_linux_cli(distro):
 
 
 def wsl_build_cli_target(distro, target):
-    require_web_access_bundle()
+    # Generate the generated ToolPkg assets on the Windows host so the WSL build needs no Node.
+    prepare_plugin_assets()
     dist = shlex.quote(windows_path_to_wsl(DIST_DIR))
     work = shlex.quote(windows_path_to_wsl(cli_package_dir(target)))
     package = shlex.quote(windows_path_to_wsl(cli_package_path(target)))
@@ -958,7 +890,7 @@ set -e
 cd {repo}
 {dependency_check}
 rustup target add {triple}
-cargo build --release --target {triple} --manifest-path apps/cli/Cargo.toml
+python3 tools/build_scripts/cargo_build.py cargo build --release --target {triple} --manifest-path apps/cli/Cargo.toml
 rm -rf {work}
 mkdir -p {work} {dist}
 cp apps/cli/target/{triple}/release/{binary_name} {work}/{binary_name}
@@ -1036,6 +968,23 @@ def build_android_app(build_name, build_number):
     )
 
 
+# Builds the module application directory and versioned KernelSU installer archive.
+def build_android_module(build_name, build_number):
+    run(
+        [
+            sys.executable,
+            BUILD_SCRIPTS_DIR / "build_android_module_release.py",
+            "--build-name",
+            build_name,
+            "--build-number",
+            build_number,
+            "--enforce-lockfile",
+            "--dist-dir",
+            DIST_DIR,
+        ],
+    )
+
+
 # Builds the OpenHarmony Flutter application package.
 def build_ohos_app(build_name, build_number):
     run(
@@ -1048,16 +997,11 @@ def build_ohos_app(build_name, build_number):
             build_number,
             "--enforce-lockfile",
             "--output",
-            DIST_DIR / "operit2-app-ohos-arm64.hap",
+            DIST_DIR / release_asset_name("app", "ohos", "arm64", "hap"),
         ],
     )
 
-
-# Builds the shared Web Access bundle consumed by app and CLI packages.
-def build_web_access_bundle():
-    run([sys.executable, BUILD_SCRIPTS_DIR / "build_flutter_web_access.py", "--base-href", "/"])
-
-
+# Builds the host App using the shared versioned release filename.
 def build_host_app(build_name, build_number):
     current_platform = host_platform()
     current_arch = host_arch()
@@ -1072,8 +1016,8 @@ def build_host_app(build_name, build_number):
                 "--build-number",
                 build_number,
                 "--enforce-lockfile",
-                "--archive-path",
-                DIST_DIR / f"operit2-app-windows-{current_arch}.zip",
+                "--installer-path",
+                DIST_DIR / release_asset_name("app", "windows", current_arch, "msi"),
             ]
         )
         return
@@ -1089,25 +1033,25 @@ def build_host_app(build_name, build_number):
                 build_number,
                 "--enforce-lockfile",
                 "--archive-path",
-                DIST_DIR / f"operit2-app-linux-{current_arch}.tar.gz",
+                DIST_DIR / release_asset_name("app", "linux", current_arch, "tar.gz"),
             ]
         )
         return
 
     if current_platform == HostPlatform.MACOS:
-        run(
-            [
-                sys.executable,
-                BUILD_SCRIPTS_DIR / "build_flutter_macos.py",
-                "--build-name",
-                build_name,
-                "--build-number",
-                build_number,
-                "--enforce-lockfile",
-                "--archive-path",
-                DIST_DIR / "operit2-app-macos-universal.zip",
-            ]
-        )
+        for build_type in ("sandbox", "unsandbox"):
+            run(
+                [
+                    sys.executable,
+                    BUILD_SCRIPTS_DIR / "build_flutter_macos.py",
+                    "--type", build_type,
+                    "--build-name", build_name,
+                    "--build-number", build_number,
+                    "--enforce-lockfile",
+                    "--archive-path",
+                    DIST_DIR / release_asset_name("app", "macos", "universal", "zip", build_type),
+                ]
+            )
         return
 
     raise RuntimeError(f"Unsupported host app platform: {current_platform}")
@@ -1169,7 +1113,7 @@ def vs_dev_env(vcvars_path, arch):
 
 def build_cli_target(target, use_default_target=False):
     require_command("cargo")
-    require_web_access_bundle()
+    prepare_plugin_assets()
     binary_name = cli_binary_name(target.platform)
     package_dir = cli_package_dir(target)
     package_path = cli_package_path(target)
@@ -1197,6 +1141,7 @@ def build_cli_target(target, use_default_target=False):
         run(["cargo", "build", "--release", "--target", target.rust_target, "--manifest-path", CLI_MANIFEST], env=build_env)
         binary_source = cli_target_binary_path(target)
 
+    verify_cli_plugin_assets(binary_source)
     reset_dir(package_dir)
     copy_required_file(binary_source, package_dir / binary_name)
     write_cli_installer_files(package_dir, target.platform)
@@ -1234,7 +1179,7 @@ def check_release_environment(products, cli_arches, no_wsl, wsl_distro):
         environment_products = "all"
     command = [
         sys.executable,
-        BUILD_SCRIPTS_DIR / "check_environment.py",
+        BUILD_SCRIPTS_DIR / "check_build_environment.py",
         "--products",
         environment_products,
         "--cli-arches",
@@ -1246,10 +1191,12 @@ def check_release_environment(products, cli_arches, no_wsl, wsl_distro):
     run(command)
 
 
+# Publishes only files matching the current versioned release specification.
 def publish_release(tag, repo_value, draft, prerelease, auth):
     assets = sorted(path for path in DIST_DIR.iterdir() if path.is_file())
     if not assets:
         raise RuntimeError("No release assets were produced")
+    validate_release_assets(assets)
 
     repo = parse_github_repo(repo_value)
     tag_path = "/releases/tags/" + urllib.parse.quote(tag, safe="")
@@ -1385,11 +1332,9 @@ def main():
         DIST_DIR.mkdir(parents=True, exist_ok=True)
     reset_dir(WORK_DIR)
 
-    if ReleaseProduct.APP in products or ReleaseProduct.CLI in products:
-        build_web_access_bundle()
-
     if ReleaseProduct.APP in products:
         build_android_app(platform_version.build_name, platform_version.build_number)
+        build_android_module(platform_version.build_name, platform_version.build_number)
         build_ohos_app(platform_version.build_name, platform_version.build_number)
         build_host_app(platform_version.build_name, platform_version.build_number)
 

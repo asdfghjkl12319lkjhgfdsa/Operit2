@@ -3,14 +3,34 @@ use crate::ServiceDiscovery::ServiceDiscoveryHost;
 
 use crate::{
     ArchiveStagingHost, AudioPlaybackHost, BluetoothHost, BrowserAutomationHost,
-    BrowserSessionHost, ComposeDslWebViewHost, DeviceIoHost, FileSystemHost,
+    BrowserAutomationHostFactory,
+    BrowserSessionHost, ClipboardHost, ComposeDslWebViewHost, DeviceIoHost, FileSystemHost,
     HostEnvironmentDescriptor, HostJavaScriptRuntimeHost, HostRuntimeEventHost,
     HostRuntimeEventSchedulerHost, HostRuntimeTaskSchedulerHost, HostSecretStore, HttpHost,
     LocalInferenceHost, ManagedRuntimeHost, PluginSdkIpc::PluginSdkIpcHost, RobotFaceHost,
     RuntimeSqliteHost, RuntimeStorageHost, RuntimeStorageWriteHost, SystemOperationHost,
     TerminalHost, ToastHost, TtsPlaybackHost, TtsSynthesisHost, WebSocketHost, WebVisitHost,
-    SerialPortHost,
+    SerialPortHost, TcpHost,
 };
+
+static DEFAULT_HTTP_SERVER_HOST: OnceLock<Arc<dyn crate::HttpServer::HttpServerHost>> = OnceLock::new();
+pub fn setDefaultHttpServerHost(host: Arc<dyn crate::HttpServer::HttpServerHost>) {
+    let _ = DEFAULT_HTTP_SERVER_HOST.set(host);
+}
+pub fn defaultHttpServerHost() -> crate::HostResult<Arc<dyn crate::HttpServer::HttpServerHost>> {
+    DEFAULT_HTTP_SERVER_HOST.get().cloned()
+        .ok_or_else(|| crate::HostError::new("The active Host has not registered an HTTP server provider"))
+}
+static DEFAULT_TCP_HOST: OnceLock<Arc<dyn TcpHost>> = OnceLock::new();
+
+pub fn setDefaultTcpHost(host: Arc<dyn TcpHost>) {
+    let _ = DEFAULT_TCP_HOST.set(host);
+}
+
+pub fn defaultTcpHost() -> crate::HostResult<Arc<dyn TcpHost>> {
+    DEFAULT_TCP_HOST.get().cloned()
+        .ok_or_else(|| crate::HostError::new("The active Host has not registered a TCP provider"))
+}
 
 static DEFAULT_HTTP_HOST: OnceLock<Arc<dyn HttpHost>> = OnceLock::new();
 static DEFAULT_SERIAL_PORT_HOST: OnceLock<Arc<dyn SerialPortHost>> = OnceLock::new();
@@ -45,7 +65,14 @@ pub fn defaultServiceDiscoveryHost() -> crate::HostResult<Arc<dyn ServiceDiscove
 }
 
 /// Command callback used by hosts that expose core operations as argv-style calls.
-pub type CoreCommandExecutor = Arc<dyn Fn(Vec<String>) -> Result<String, String> + Send + Sync>;
+pub type CoreCommandExecutor = Arc<
+    dyn Fn(
+            Vec<String>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'static>,
+        > + Send
+        + Sync,
+>;
 
 /// Registers the HTTP host shared by services that are not passed an explicit context.
 #[allow(non_snake_case)]
@@ -110,17 +137,22 @@ pub fn defaultHostRuntimeTaskSchedulerHost() -> Arc<dyn HostRuntimeTaskScheduler
 /// Bundles host-provided capabilities that the runtime can call through stable traits.
 #[derive(Clone, Default)]
 pub struct HostManager {
+    pub uiAutomationHost: Option<Arc<dyn crate::UiAutomation::UiAutomationHost>>,
     pub serviceDiscoveryHost: Option<Arc<dyn ServiceDiscoveryHost>>,
+    pub httpServerHost: Option<Arc<dyn crate::HttpServer::HttpServerHost>>,
+    pub tcpHost: Option<Arc<dyn TcpHost>>,
     pub serialPortHost: Option<Arc<dyn SerialPortHost>>,
     pub fileSystemHost: Option<Arc<dyn FileSystemHost>>,
     pub webVisitHost: Option<Arc<dyn WebVisitHost>>,
     pub browserAutomationHost: Option<Arc<dyn BrowserAutomationHost>>,
     pub browserSessionHost: Option<Arc<dyn BrowserSessionHost>>,
+    pub floatingWindowHost: Option<Arc<dyn crate::FloatingWindowHost>>,
     pub composeDslWebViewHost: Option<Arc<dyn ComposeDslWebViewHost>>,
     pub httpHost: Option<Arc<dyn HttpHost>>,
     pub webSocketHost: Option<Arc<dyn WebSocketHost>>,
     pub systemOperationHost: Option<Arc<dyn SystemOperationHost>>,
     pub toastHost: Option<Arc<dyn ToastHost>>,
+    pub clipboardHost: Option<Arc<dyn ClipboardHost>>,
     pub audioPlaybackHost: Option<Arc<dyn AudioPlaybackHost>>,
     pub bluetoothHost: Option<Arc<dyn BluetoothHost>>,
     pub deviceIoHost: Option<Arc<dyn DeviceIoHost>>,
@@ -145,6 +177,18 @@ pub struct HostManager {
 }
 
 impl HostManager {
+    /// Installs the platform-owned accessibility and input provider.
+    pub fn withUiAutomationHost(mut self, host: Arc<dyn crate::UiAutomation::UiAutomationHost>) -> Self {
+        self.uiAutomationHost = Some(host);
+        self
+    }
+    /// Returns this runtime's VFS without exposing path resolution to its consumers.
+    pub fn vfs(&self) -> Result<operit_vfs::VisualFileSystem::VisualFileSystem, String> {
+        let storage = self.runtimeStorageHost.clone().ok_or("RuntimeStorageHost is required for VFS")?;
+        let backend = self.fileSystemHost.clone().ok_or("FileSystemHost is required for VFS")?;
+        operit_vfs::VisualFileSystem::VisualFileSystem::fromStorage(backend, storage)
+    }
+
     /// Installs the host-owned service discovery capability.
     pub fn withServiceDiscoveryHost(mut self, host: Arc<dyn ServiceDiscoveryHost>) -> Self {
         self.serviceDiscoveryHost = Some(host);
@@ -154,17 +198,22 @@ impl HostManager {
     /// Creates a context with no host integrations and the default Android descriptor.
     pub fn new() -> Self {
         Self {
+            uiAutomationHost: None,
             fileSystemHost: None,
             webVisitHost: None,
             browserAutomationHost: None,
             browserSessionHost: None,
+            floatingWindowHost: None,
             composeDslWebViewHost: None,
             httpHost: None,
             webSocketHost: None,
+            httpServerHost: None,
+            tcpHost: None,
             serialPortHost: None,
             serviceDiscoveryHost: None,
             systemOperationHost: None,
             toastHost: None,
+            clipboardHost: None,
             audioPlaybackHost: None,
             bluetoothHost: None,
             deviceIoHost: None,
@@ -194,17 +243,22 @@ impl HostManager {
     pub fn withFileSystemHost(host: Arc<dyn FileSystemHost>) -> Self {
         let hostEnvironment = host.environmentDescriptor();
         Self {
+            uiAutomationHost: None,
             fileSystemHost: Some(host),
             webVisitHost: None,
             browserAutomationHost: None,
             browserSessionHost: None,
+            floatingWindowHost: None,
             composeDslWebViewHost: None,
             httpHost: None,
             webSocketHost: None,
+            httpServerHost: None,
+            tcpHost: None,
             serialPortHost: None,
             serviceDiscoveryHost: None,
             systemOperationHost: None,
             toastHost: None,
+            clipboardHost: None,
             audioPlaybackHost: None,
             bluetoothHost: None,
             deviceIoHost: None,
@@ -237,17 +291,22 @@ impl HostManager {
     ) -> Self {
         let hostEnvironment = fileSystemHost.environmentDescriptor();
         Self {
+            uiAutomationHost: None,
             fileSystemHost: Some(fileSystemHost),
             webVisitHost: Some(webVisitHost),
             browserAutomationHost: None,
             browserSessionHost: None,
+            floatingWindowHost: None,
             composeDslWebViewHost: None,
             httpHost: None,
             webSocketHost: None,
+            httpServerHost: None,
+            tcpHost: None,
             serialPortHost: None,
             serviceDiscoveryHost: None,
             systemOperationHost: None,
             toastHost: None,
+            clipboardHost: None,
             audioPlaybackHost: None,
             bluetoothHost: None,
             deviceIoHost: None,
@@ -281,17 +340,22 @@ impl HostManager {
     ) -> Self {
         let hostEnvironment = fileSystemHost.environmentDescriptor();
         Self {
+            uiAutomationHost: None,
             fileSystemHost: Some(fileSystemHost),
             webVisitHost: Some(webVisitHost),
             browserAutomationHost: None,
             browserSessionHost: None,
+            floatingWindowHost: None,
             composeDslWebViewHost: None,
             httpHost: None,
             webSocketHost: None,
+            httpServerHost: None,
+            tcpHost: None,
             serialPortHost: None,
             serviceDiscoveryHost: None,
             systemOperationHost: Some(systemOperationHost),
             toastHost: None,
+            clipboardHost: None,
             audioPlaybackHost: None,
             bluetoothHost: None,
             deviceIoHost: None,
@@ -316,6 +380,13 @@ impl HostManager {
         }
     }
 
+    /// Installs HTTP independently of the full desktop runtime.
+    #[allow(non_snake_case)]
+    pub fn withHttpHost(mut self, host: Arc<dyn HttpHost>) -> Self {
+        self.httpHost = Some(host);
+        self
+    }
+
     /// Creates the standard full runtime context used by managed desktop and mobile hosts.
     #[allow(non_snake_case)]
     pub fn withFileSystemWebVisitSystemOperationAndManagedRuntimeHosts(
@@ -329,17 +400,22 @@ impl HostManager {
     ) -> Self {
         let hostEnvironment = fileSystemHost.environmentDescriptor();
         Self {
+            uiAutomationHost: None,
             fileSystemHost: Some(fileSystemHost),
             webVisitHost: Some(webVisitHost),
             browserAutomationHost: None,
             browserSessionHost: None,
+            floatingWindowHost: None,
             composeDslWebViewHost: None,
             httpHost: Some(httpHost),
             webSocketHost: None,
+            httpServerHost: None,
+            tcpHost: None,
             serialPortHost: None,
             serviceDiscoveryHost: None,
             systemOperationHost: Some(systemOperationHost),
             toastHost: None,
+            clipboardHost: None,
             audioPlaybackHost: None,
             bluetoothHost: None,
             deviceIoHost: None,
@@ -378,6 +454,13 @@ impl HostManager {
         self
     }
 
+    /// Adds frontend-owned system clipboard writing.
+    #[allow(non_snake_case)]
+    pub fn withClipboardHost(mut self, clipboardHost: Arc<dyn ClipboardHost>) -> Self {
+        self.clipboardHost = Some(clipboardHost);
+        self
+    }
+
     /// Replaces the host environment descriptor used by runtime capability queries.
     #[allow(non_snake_case)]
     pub fn withHostEnvironment(mut self, hostEnvironment: HostEnvironmentDescriptor) -> Self {
@@ -392,9 +475,25 @@ impl HostManager {
         self
     }
 
+    pub fn withHttpServerHost(mut self, host: Arc<dyn crate::HttpServer::HttpServerHost>) -> Self {
+        self.httpServerHost = Some(host);
+        self
+    }
+    pub fn withTcpHost(mut self, host: Arc<dyn TcpHost>) -> Self {
+        self.tcpHost = Some(host);
+        self
+    }
+
     /// Installs the platform serial device/accessory provider.
     pub fn withSerialPortHost(mut self, host: Arc<dyn SerialPortHost>) -> Self {
         self.serialPortHost = Some(host);
+        self
+    }
+
+    /// Installs the host-owned virtual runtime storage used by node-local state.
+    #[allow(non_snake_case)]
+    pub fn withRuntimeStorageHost(mut self, host: Arc<dyn RuntimeStorageHost>) -> Self {
+        self.runtimeStorageHost = Some(host);
         self
     }
 
@@ -494,6 +593,16 @@ impl HostManager {
         self
     }
 
+    /// Constructs a browser automation host with this runtime's file-system capability.
+    #[allow(non_snake_case)]
+    pub fn withBrowserAutomationHostFactory(self, factory: BrowserAutomationHostFactory) -> Self {
+        let fileSystemHost = self
+            .fileSystemHost
+            .clone()
+            .expect("FileSystemHost must be configured before constructing a browser host");
+        self.withBrowserAutomationHost(factory(fileSystemHost))
+    }
+
     /// Adds a browser session host for interactive browser sessions.
     #[allow(non_snake_case)]
     pub fn withBrowserSessionHost(
@@ -558,6 +667,14 @@ impl HostManager {
     #[allow(non_snake_case)]
     pub fn withPluginSdkIpcHost(mut self, pluginSdkIpcHost: Arc<dyn PluginSdkIpcHost>) -> Self {
         self.pluginSdkIpcHost = Some(pluginSdkIpcHost);
+        self
+    }
+}
+
+impl HostManager {
+    /// Registers the owner responsible for creating and controlling floating surfaces.
+    pub fn withFloatingWindowHost(mut self, host: Arc<dyn crate::FloatingWindowHost>) -> Self {
+        self.floatingWindowHost = Some(host);
         self
     }
 }
